@@ -29,7 +29,7 @@ cargo run --release -p loom-cli -- render examples/patches/subtractive.ron -o /t
 - **Signals** (ADR-0007). Every cable is `f32` at the sample rate. Types are hints only. Pitch is 0.1 per octave, 0.0 = middle C. Gates are high above 0.5. "1.0 = 10 V" for Eurorack users.
 - **Patches** (ADR-0008) are RON files, loaded by `loom-patch`.
 
-Before finishing a change, run fmt, clippy (with `-D warnings`), and tests. CI runs the full list in CONTRIBUTING.md.
+Before finishing a change, run `prek run --all-files` (fmt, clippy, typos, file checks) and `cargo test --workspace`. CI runs the full list in CONTRIBUTING.md. Never bypass the hooks with `--no-verify`; fix the cause instead.
 
 ## Hard rules
 

@@ -23,6 +23,22 @@ cargo fmt --all --check
 cargo bench -p loom-modules          # optional, takes a few minutes
 ```
 
+### Git hooks (recommended)
+
+The repository uses [prek](https://prek.j178.dev) to run quick checks before each commit, so you hear about problems while the change is fresh. Tools come from [mise](https://mise.jdx.dev):
+
+```sh
+mise install    # Rust, prek, typos, cargo-deny (from mise.toml)
+prek install    # installs the pre-commit and pre-push hooks
+```
+
+| When | Checks |
+|---|---|
+| Every commit (a few seconds) | Whitespace, line endings, TOML/YAML syntax, large files, private keys, `cargo fmt`, `cargo clippy`, `typos`, and no direct commits to `main` |
+| Before push | `cargo test`, `cargo deny check` |
+
+`cargo fmt` and the whitespace hooks fix files for you. When they do, the commit stops: review the changes, stage them, and commit again. Run everything by hand with `prek run --all-files`. The configuration is in `prek.toml`.
+
 ### What CI checks
 
 Every pull request runs these jobs. All must pass before merging (the "CI success" check).
