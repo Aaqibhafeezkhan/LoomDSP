@@ -1,0 +1,4 @@
+# Spell-check configuration for the `typos` CI job.
+[files]
+# Generated files: hashes and crate names, not prose.
+extend-exclude = ["*.lock", "*.png", "target/"]

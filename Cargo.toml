@@ -16,6 +16,7 @@ rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/brylie/LoomDSP"
 authors = ["LoomDSP contributors"]
+readme = "README.md"
 
 [workspace.dependencies]
 loom-rt = { path = "crates/loom-rt", version = "0.1.0" }
@@ -39,7 +40,27 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "allow"
 
+# Clippy lint groups, set explicitly so the policy is visible and versioned.
+# Groups use priority -1 so single lints below can override them.
+# Locally these are warnings (fast feedback while editing); CI runs with
+# `-D warnings`, so nothing reaches main with a warning.
 [workspace.lints.clippy]
+# Code that is outright wrong. Always an error, even locally.
+correctness = { level = "deny", priority = -1 }
+# Code that is very likely wrong or useless.
+suspicious = { level = "warn", priority = -1 }
+# Code that does something simple in a complex way.
+complexity = { level = "warn", priority = -1 }
+# Code that could run faster. Matters on the audio thread.
+perf = { level = "warn", priority = -1 }
+# Code that is not idiomatic Rust.
+style = { level = "warn", priority = -1 }
+# Cargo.toml hygiene: metadata needed for publishing, no wildcard versions.
+cargo = { level = "warn", priority = -1 }
+# Duplicate versions come from deep inside third-party crates (cpal, midir),
+# where we cannot fix them. `cargo deny check` still reports them.
+multiple_crate_versions = "allow"
+# Every `unsafe` block needs a `// SAFETY:` comment (AGENTS.md rule 7).
 undocumented_unsafe_blocks = "warn"
 
 [profile.release]
