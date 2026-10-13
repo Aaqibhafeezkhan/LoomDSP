@@ -20,12 +20,14 @@ The audio thread has a hard deadline. At 48 kHz with a 128-sample buffer, each b
 
 ## Performance (`PERF`)
 
+**Reference machine.** The maintainer's laptop: Apple M1-family GPU with the built-in Retina display, measured at full window size. Why a laptop: it is the most likely machine on stage, and its Retina display needs four times the pixels of a 1x monitor at the same window size, so it is the hardest target. Record the exact model in benchmark results.
+
 | ID | Requirement | Priority | Rationale |
 |---|---|---|---|
 | NFR-PERF-01 | Reference patch (about 100 modules, 8 voices) at 48 kHz/128 samples uses under 25% of one core on the reference machine *(proposal)*. | Must | Leaves headroom for the host and other plugins. |
 | NFR-PERF-02 | Per-module overhead (scheduling, port handling) is under 1% of a simple module's own DSP cost at 128 samples *(proposal)*. | Should | Modular designs fail when overhead dominates small modules. |
 | NFR-PERF-03 | Polyphonic voices are processed with SIMD where possible (for example 4 voices per f32x4). | Should | Voices are naturally parallel. This gives large throughput gains on native and WASM SIMD. |
-| NFR-PERF-04 | The UI renders at 60 fps with a 300-module patch visible *(proposal)*. | Must | Smooth canvas interaction is part of the product feel. |
+| NFR-PERF-04 | The patch canvas holds 60 fps while panning and zooming, at full window size on the reference laptop, with 100 modules visible and 300 in the patch *(proposal)*. An idle patch with no live views does not redraw. | Must | Smooth canvas interaction is part of the product feel. The laptop's Retina display is the hardest target we have measured: rendering cost follows physical pixels (ADR-0009). |
 | NFR-PERF-05 | Applying a graph edit (add module or cable) takes under 20 ms from user action to audible result *(proposal)*. | Must | Patching should feel immediate. |
 | NFR-PERF-06 | Benchmarks run in CI and report regressions. | Should | Performance is a feature and needs protection. |
 | NFR-PERF-07 | Incoming MIDI events are applied in the next audio buffer, with timestamps preserved inside the buffer where the driver provides them. | Must | Controller response must feel immediate and timing must stay tight. |
@@ -44,7 +46,7 @@ The audio thread has a hard deadline. At 48 kHz with a 128-sample buffer, each b
 
 | ID | Requirement | Priority | Rationale |
 |---|---|---|---|
-| NFR-PORT-01 | The engine core compiles to `wasm32-unknown-unknown`. CI checks this on every change. | Should | Cheap to keep from the start, expensive to retrofit. Keeps the optional web target (P5) possible. |
+| NFR-PORT-01 | The engine core compiles to `wasm32-unknown-unknown`. CI checks this on every change. | Should | Cheap to keep from the start, expensive to retrofit. Keeps the optional, deferred web target possible. |
 | NFR-PORT-02 | The engine core does not depend on threads, the file system, or a specific audio API. Those live in host adapters. | Must | Same core for the desktop app, plugins, and any future target. |
 | NFR-PORT-03 | Desktop targets: macOS (Apple Silicon), Windows 10+, Linux (x86_64, with ALSA/PipeWire/JACK). | Must | Covers the main music production platforms. |
 | NFR-PORT-04 | Browser targets: current Chrome, Firefox, and Safari with WebGPU. | Could | Only if the optional web target goes ahead. |
@@ -52,7 +54,7 @@ The audio thread has a hard deadline. At 48 kHz with a 128-sample buffer, each b
 
 ## Web runtime (`WEB`), optional
 
-These apply only if the optional web target (P5) goes ahead.
+These apply only if the optional, deferred web target goes ahead.
 
 | ID | Requirement | Priority | Rationale |
 |---|---|---|---|
@@ -74,7 +76,7 @@ These apply only if the optional web target (P5) goes ahead.
 
 | ID | Requirement | Priority | Rationale |
 |---|---|---|---|
-| NFR-SEC-01 | Loading a patch never executes code. Patches contain only data. | Must | Safe sharing. See principle 6. |
+| NFR-SEC-01 | Loading a patch never executes code. Patches contain only data. | Must | Safe sharing. See principle 7 in the vision. |
 | NFR-SEC-02 | Resource limits on patches (maximum modules, delay length, voices) prevent a patch from exhausting memory. | Should | A shared patch should not crash a host. |
 
 ## Usability and accessibility (`UX`)

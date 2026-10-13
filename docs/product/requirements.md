@@ -5,9 +5,9 @@ Priorities: **Must**, **Should**, **Could**, **Won't (now)**. Phases refer to th
 - P0 Engine foundations
 - P1 Desktop patcher and live basics
 - P2 Encapsulation, panels, performance
-- P3 Native export (CLAP, VST3, standalone)
-- P4 Ecosystem
-- P5 Optional web target
+- P3 Living systems (loopers, groups, logic, scenes, sequencers)
+- P4 Sharing and ecosystem
+- Later: not scheduled. Plugin and standalone export, and the web target. Revisit after P3.
 
 Each requirement has a short rationale. If the rationale stops being true, the requirement should be reviewed.
 
@@ -39,7 +39,7 @@ See ADR-0007 for the full signal model.
 | FR-GRAPH-05 | New or removed connections fade over a short time (for example 5 ms) to avoid clicks. | Should | P1 | Hard switches create clicks on stage. |
 | FR-GRAPH-06 | The engine can render offline, faster than real time, to a file or buffer. | Must | P0 | Needed for tests, sound parity checks, and bouncing. |
 | FR-GRAPH-07 | The engine supports sample rates from 44.1 kHz to 192 kHz and any host buffer size. | Must | P0 | Plugins and audio interfaces vary. |
-| FR-GRAPH-08 | Modules can report their latency. The engine sums path latency and reports total latency to the host. | Should | P3 | Hosts need it for delay compensation. |
+| FR-GRAPH-08 | Modules can report their latency. The engine sums path latency and reports total latency to the host. | Should | Later | Hosts need it for delay compensation. |
 | FR-GRAPH-09 | Modules that are not connected to an output are not processed. | Should | P1 | Saves CPU in large patches. |
 
 ## 3. Polyphony and voices (`VOICE`)
@@ -79,6 +79,25 @@ The first library should be small and composable. Phase 1 needs enough to build 
 | FR-LIB-10 | Spectral: FFT-based modules. | Could | P4 | Higher complexity and latency. |
 | FR-LIB-11 | Every built-in module has a help page with a short description, port list, and example patch. | Must | P1 | Discoverability is essential for learners. |
 
+### Library scope: everything is a module (ADR-0011)
+
+LoomDSP is a grid for building living musical systems: patches that play, evolve, and arrange themselves through modulation, randomness, texture, sequencing, looping, and logic. The long-term library covers the breadth of Bitwig Studio's Grid modules, [modulators](https://www.bitwig.com/userguide/latest/modulator/), and [devices](https://www.bitwig.com/userguide/latest/device_descriptions/), all as modules in one grid. It grows by phase and through the module SDK.
+
+| ID | Requirement | Priority | Phase | Rationale |
+|---|---|---|---|---|
+| FR-LIB-12 | Modulators as modules, covering the same families as Bitwig's modulators: audio-driven (envelope follower, audio-rate), envelopes (ADSR, AHDSR, drawn multi-segment curves, ramps), interface (macros, buttons, XY and vector pads), LFOs (tempo-synced, drawn curves, random, wavetable), modifiers (math, quantise, sample and hold, curve shaping), note-driven (expressions, note counter, keytracking, per-pitch-class), and sequence (step, per-step parameter sequences, multi-stage loops). | Must | P2 to P4 | Modulation and randomness are how living systems move. As modules, every modulator connects like anything else. |
+| FR-LIB-13 | Note and MIDI effects as modules: arpeggiator, strum, echo, harmonise, humanise, randomise, latch, note length, note repeats, quantise, transpose and transpose maps, velocity curve, multi-note, and novel ones such as bouncing-ball and stepwise generators. | Should | P3 to P4 | Note effects are central to generative and live work. Depends on how notes travel on cables (OQ-16). |
+| FR-LIB-14 | Sequencers as modules, including polymetric multi-output step sequencers: several lanes of different lengths, rates, and directions in one module, each lane with its own pitch, gate, and modulation outputs. Patterns are stored as module data. | Must | P3 | Polymetric sequencing is a core way to build evolving patterns. Several outputs per module let one sequencer drive notes and modulation at once. |
+| FR-LIB-15 | Device-style processors as modules: EQ, dynamics (compressor, limiter, gate, transient control), reverb, delays, modulation effects (chorus, flanger, phaser, tremolo), distortion, filters (comb, resonator bank), pitch and frequency shifting, spectral splitting, sampler, granular. | Should | P2 to P4 | Users expect finished-sounding tools, not only primitives. Some are built from primitives, others as optimised single modules. |
+| FR-LIB-16 | Clock and transport modules, and modulation curves that run over bars or sections, so patches can shape themselves over time. There is no arranger timeline. | Must | P3 | Arrangement happens inside the grid (ADR-0011). In plugins, the host transport drives the clock. |
+| FR-LIB-17 | Display modules: oscilloscope, spectrum, level meter, XY scope, value readout, drawn live inside the module on the canvas. | Should | P1 to P2 | Seeing signals is part of patching. Bitwig's Grid shows small live displays inside modules. |
+| FR-LIB-18 | A module can declare a custom view drawn inside its tile on the canvas (scope, step grid, Euclidean ring, envelope shape, looper waveform), fed by engine telemetry or module data. | Must | P1 | Rich module views are what make the grid feel like an instrument. Infrastructure first (P1), individual views follow their modules. |
+| FR-LIB-19 | Modules can store data beyond parameters (patterns, loops, wavetables, samples). It is saved in the patch, covered by undo, and handed to the engine without breaking real-time rules. | Must | P2 | Sequencers, loopers, and samplers cannot work without it (OQ-17). |
+| FR-LIB-20 | Circular audio and MIDI loopers as modules: record, overdub, play, and clear, with loop length in bars, synced to the clock. Recording goes into pre-allocated memory. | Must | P3 | Looping is how live layers build up, as in Bitwig's clip launcher. Memory recording keeps the audio thread real-time safe (OQ-15). |
+| FR-LIB-21 | Groups and next actions: loopers (and other playable modules) can be grouped. A group chooses which member plays next (round robin, random, sequential, or by input), and outputs a trigger when a member finishes a loop and when the group completes a round. | Must | P3 | Like the clip launcher's next actions, but as patchable modules, so logic can control them. |
+| FR-LIB-22 | Counters and arrangement logic as modules: counters, comparators, "trigger after N", probability gates, and simple state machines. Example: after group A plays round robin N times, start group B. | Must | P3 | This form of arrangement is not possible in a timeline or a fixed clip launcher. It is what makes LoomDSP grid-centred from the start. |
+| FR-LIB-23 | Scenes as modules: a scene stores the state of a chosen set of modules (parameters, active groups, sequencer patterns) and recalls it on a trigger, with an optional morph time. | Should | P3 | Scenes change sections of a piece in one move, and logic can trigger them. |
+
 ## 6. Encapsulation (`ENCAP`)
 
 | ID | Requirement | Priority | Phase | Rationale |
@@ -103,6 +122,10 @@ The first library should be small and composable. Phase 1 needs enough to build 
 | FR-CANVAS-06 | Keyboard navigation and shortcuts for common actions. | Should | P1 | Speed, and part of accessibility. |
 | FR-CANVAS-07 | Comments and colour groups on the canvas. | Should | P2 | Documentation inside the patch. |
 | FR-CANVAS-08 | Insert a module onto an existing cable by dropping it there. | Could | P2 | Common workflow in Bitwig Grid. |
+| FR-CANVAS-09 | Our own canvas widget (ADR-0010): compact module tiles on a snap grid, ports on tile edges, signal flowing left to right. | Must | P1 | The canvas is the centre of the product. Its look and speed must be ours to control. |
+| FR-CANVAS-10 | An inspector panel shows every parameter of the selected module. Tiles show only their key controls and live view. | Must | P1 | Keeps the canvas readable and cheap to draw, as in Bitwig's Grid. |
+| FR-CANVAS-11 | Level of detail: when zoomed out, modules draw as simple tiles without text or live views. | Should | P1 | Large patches stay fast and readable. |
+| FR-CANVAS-12 | Cable styles show meaning: colour by signal type, thicker for stereo and polyphonic signals, a visible mark where the engine inserted a 1-sample delay. | Should | P2 | Users should read signal flow from the cables alone. |
 
 ## 8. Visual feedback (`VIS`)
 
@@ -159,8 +182,8 @@ Live performance is the top priority after the core patcher works.
 | ID | Requirement | Priority | Phase | Rationale |
 |---|---|---|---|---|
 | FR-APP-01 | Desktop app for macOS, Windows, and Linux with audio device and MIDI device selection. | Must | P1 | The main product. |
-| FR-APP-02 | Browser version of the app, with patching, example patches, and sub-patch inspection. | Could | P5 | Lets educators share a link so students can patch with no install (persona P5). Pursue only if the UI framework and WASM build perform well in browsers. |
-| FR-APP-05 | Open a patch from a URL in the browser version. | Could | P5 | Teachers share example patches as links. |
+| FR-APP-02 | Browser version of the app, with patching, example patches, and sub-patch inspection. | Could | Later | Lets educators share a link so students can patch with no install (Sanna, the educator). Pursue only if the UI framework and WASM build perform well in browsers. |
+| FR-APP-05 | Open a patch from a URL in the browser version. | Could | Later | Teachers share example patches as links. |
 | FR-APP-03 | Audio input processing (use LoomDSP as a live effect). | Must | P1 | Effects are half of the use cases. |
 | FR-APP-04 | Audio device loss (unplugged interface) is handled without a crash. The app shows a clear message and can reconnect. | Must | P1 | Hardware problems happen on stage. |
 
@@ -178,40 +201,52 @@ See ADR-0008.
 | FR-FILE-06 | A patch can embed assets (wavetables, samples, panel images) or reference them. | Should | P2 | Exported plugins and shared patches must be self-contained. |
 | FR-FILE-07 | A JSON export of the patch format, for tools outside the Rust world. | Could | P4 | Only if third-party tools ask for it. |
 
-## 14. Native export (`NATIVE`)
+## 14. Native export (`NATIVE`), deferred
 
-Export comes after the live instrument works.
+Not scheduled (phase "Later"). LoomDSP first focuses on generative live performance and sharing patches, as VCV Rack does. Plugin and standalone export will be revisited after living systems (P3) are proven. The requirements below record the intent for when they are.
 
 | ID | Requirement | Priority | Phase | Rationale |
 |---|---|---|---|---|
-| FR-NATIVE-01 | Export a patch as a CLAP instrument or effect for macOS, Windows, and Linux. | Must | P3 | CLAP is an open, permissively licensed standard. |
-| FR-NATIVE-02 | Export a patch as a VST3 plugin. | Must | P3 | VST3 has the widest DAW support. The SDK is MIT-licensed since 3.8. We build our own adapter (FR-SDK-06). |
-| FR-NATIVE-03 | Exported plugins expose parameters, report latency, support state save/restore, and receive MIDI. | Must | P3 | Basic plugin contract. |
-| FR-NATIVE-04 | Exported plugins show the patch front panel as their GUI. | Must | P3 | The panel is the product. |
-| FR-NATIVE-05 | Export does not require a Rust toolchain on the user's machine. | Must | P3 | Most users are not developers. See ADR-0004. |
-| FR-NATIVE-06 | A LoomDSP host plugin can load any patch inside a DAW. | Should | P3 | Lets users patch directly inside their DAW. |
+| FR-NATIVE-01 | Export a patch as a CLAP instrument or effect for macOS, Windows, and Linux. | Must | Later | CLAP is an open, permissively licensed standard. |
+| FR-NATIVE-02 | Export a patch as a VST3 plugin. | Must | Later | VST3 has the widest DAW support. The SDK is MIT-licensed since 3.8. We build our own adapter (FR-SDK-06). |
+| FR-NATIVE-03 | Exported plugins expose parameters, report latency, support state save/restore, and receive MIDI. | Must | Later | Basic plugin contract. |
+| FR-NATIVE-04 | Exported plugins show the patch front panel as their GUI. | Must | Later | The panel is the product. |
+| FR-NATIVE-05 | Export does not require a Rust toolchain on the user's machine. | Must | Later | Most users are not developers. See ADR-0004. |
+| FR-NATIVE-06 | A LoomDSP host plugin can load any patch inside a DAW. | Should | Later | Lets users patch directly inside their DAW. |
 | FR-NATIVE-07 | AU (Audio Unit) export. | Won't (now) | | Possible later via a CLAP-to-AU wrapper. |
-| FR-NATIVE-08 | Export a patch as a standalone app that opens straight into its front panel. | Should | P3 | Lets performers use an instrument without learning LoomDSP. |
-| FR-NATIVE-09 | Exported plugins include the Apache-2.0 licence and NOTICE for the runtime. The patch author chooses the licence for their patch. | Must | P3 | Meets Apache-2.0 attribution terms. Patch authors keep their rights. |
+| FR-NATIVE-08 | Export a patch as a standalone app that opens straight into its front panel. | Should | Later | Lets performers use an instrument without learning LoomDSP. |
+| FR-NATIVE-09 | Exported plugins include the Apache-2.0 licence and NOTICE for the runtime. The patch author chooses the licence for their patch. | Must | Later | Meets Apache-2.0 attribution terms. Patch authors keep their rights. |
 
 ## 15. Web export (`WAM`), optional
 
-Only pursued if the UI and WASM build perform well in browsers (see P5 and ADR-0003).
+Only pursued if the UI and WASM build perform well in browsers (deferred; see the roadmap and ADR-0003).
 
 | ID | Requirement | Priority | Phase | Rationale |
 |---|---|---|---|---|
-| FR-WAM-01 | Export a patch as a WAM2 package: descriptor, JS glue, AudioWorklet processor, WASM engine, patch data, and panel GUI. | Could | P5 | Opens the browser plugin ecosystem. |
-| FR-WAM-02 | The whole patch runs inside one AudioWorkletProcessor and one WASM instance. | Must (if web) | P5 | Separate Web Audio nodes add 128-sample delays and break feedback. |
-| FR-WAM-03 | Exposed panel parameters become WAM2 parameters. MIDI and automation events are sample-accurate. State save/restore works. | Must (if web) | P5 | Basic WAM2 contract. |
-| FR-WAM-04 | Works without cross-origin isolation, with reduced visual update quality. | Should (if web) | P5 | Many hosts cannot set COOP/COEP headers. |
+| FR-WAM-01 | Export a patch as a WAM2 package: descriptor, JS glue, AudioWorklet processor, WASM engine, patch data, and panel GUI. | Could | Later | Opens the browser plugin ecosystem. |
+| FR-WAM-02 | The whole patch runs inside one AudioWorkletProcessor and one WASM instance. | Must (if web) | Later | Separate Web Audio nodes add 128-sample delays and break feedback. |
+| FR-WAM-03 | Exposed panel parameters become WAM2 parameters. MIDI and automation events are sample-accurate. State save/restore works. | Must (if web) | Later | Basic WAM2 contract. |
+| FR-WAM-04 | Works without cross-origin isolation, with reduced visual update quality. | Should (if web) | Later | Many hosts cannot set COOP/COEP headers. |
 
-## 16. Module SDK and published crates (`SDK`)
+## 16. Sharing (`SHARE`)
+
+The sharing model follows VCV Rack: patches are files that people swap, and an ecosystem of modules grows around the core. No accounts or hosted marketplace in v1 (see the vision's non-goals).
+
+| ID | Requirement | Priority | Phase | Rationale |
+|---|---|---|---|---|
+| FR-SHARE-01 | A patch can be saved as one self-contained file that includes its assets (loops, samples, wavetables, panel images). | Must | P4 | Sharing a living system means sharing its recorded loops too. One file is easy to send, post, and archive. |
+| FR-SHARE-02 | Opening a patch that uses modules this build does not have lists the missing modules, with their version and where they come from, and keeps their data (FR-FILE-05). | Must | P4 | Shared patches will travel between people with different module sets. |
+| FR-SHARE-03 | Record the live output to an audio file while performing. | Should | P3 | Sharing results matters as much as sharing patches. Recording must not risk the audio thread. |
+| FR-SHARE-04 | Browse and open example and community patches from inside the app. The library is a public git repository, so there are no accounts. | Could | P4 | Lowers the barrier to learning from others. A git repository is free to host and easy to contribute to. |
+| FR-SHARE-05 | Third-party modules can be distributed and installed without rebuilding LoomDSP from source. | Should | P4 | VCV Rack's ecosystem depends on this. How to do it safely is open (OQ-18). |
+
+## 17. Module SDK and published crates (`SDK`)
 
 | ID | Requirement | Priority | Phase | Rationale |
 |---|---|---|---|---|
 | FR-SDK-01 | A public Rust trait for modules: describe ports and parameters, process a block, process one sample, reset, report latency. | Must | P0 | Built-in modules use the same API. This keeps it honest. |
 | FR-SDK-02 | A test harness: render a module with given inputs and compare to reference output. | Must | P1 | Quality and regression safety. |
 | FR-SDK-03 | Module template, examples, and contributor guide. | Must | P4 | Lowers the barrier for module developers. |
-| FR-SDK-04 | Third-party modules are compiled into the main build. No runtime loading of native code in v1. | Must | P4 | Keeps patches safe and portable. |
+| FR-SDK-04 | Third-party modules can be compiled into the main build from source, at least until OQ-18 is decided. | Must | P4 | The simplest safe and portable way to start an ecosystem. |
 | FR-SDK-05 | Import Faust DSP code as a module. | Could | P4 | Large existing library of DSP code. Check Faust's licence terms for generated code first. |
-| FR-SDK-06 | Reusable primitives are separate crates with their own docs and semver, and are published to crates.io when stable. Candidates: real-time queues, VST3 adapter, CLAP adapter, plugin GUI embedding, node-graph widget extensions. | Should | P3 | Gives back to the Rust audio ecosystem and gives contributors smaller, self-contained projects. |
+| FR-SDK-06 | Reusable primitives are separate crates with their own docs and semver, and are published to crates.io when stable. Candidates: real-time queues, VST3 adapter, CLAP adapter, plugin GUI embedding, node-graph widget extensions. | Should | Later | Gives back to the Rust audio ecosystem and gives contributors smaller, self-contained projects. |

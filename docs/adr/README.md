@@ -25,4 +25,6 @@ Why we use them: contributors (human and AI) need to know *why* the code looks t
 | [0006](0006-dependency-and-licence-policy.md) | Dependency and licence policy | Accepted |
 | [0007](0007-polymorphic-signal-model.md) | Polymorphic signal model | Proposed |
 | [0008](0008-patch-format-ron.md) | Patch format in RON | Accepted |
-| [0009](0009-ui-stack-iced.md) | UI stack: Iced with iced_nodegraph | Proposed (P0 spike) |
+| [0009](0009-ui-stack-iced.md) | UI stack: Iced (canvas decided in ADR-0010) | Accepted in part |
+| [0010](0010-own-patch-canvas.md) | Our own patch canvas, built as an Iced widget | Proposed |
+| [0011](0011-everything-is-a-module.md) | Everything is a module | Proposed |

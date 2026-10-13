@@ -6,7 +6,8 @@ Each open item lists the options and a current leaning. Close an item by writing
 
 | ID | Question | Decision | Where recorded |
 |---|---|---|---|
-| OQ-01 | Desktop first or browser first? | Desktop first. The browser is an optional later target (P5). | Vision, roadmap |
+| OQ-01 | Desktop first or browser first? | Desktop first. The browser is an optional target, deferred. | Vision, roadmap |
+| OQ-02 | UI framework and node editor | Iced for the application UI. Our own patch canvas as an Iced widget, after spikes with iced_nodegraph (GPU fill-rate bound on Retina) and egui-snarl (poor look). | ADR-0009, ADR-0010 |
 | OQ-03 | Stereo on every cable? | No. Channel count is inferred per cable. Stereo flows where audio needs it. | FR-SIG-07, ADR-0007 |
 | OQ-04 | Pitch and value conventions | Our own documented conventions, following the Eurorack and Bitwig Grid idea of "patch anything to anything". | FR-SIG-03, 05, ADR-0007 |
 | OQ-05 | Patch file format | RON, because it keeps Serde's full data model (enums, structs, tuples). | FR-FILE-01, ADR-0008 |
@@ -15,15 +16,9 @@ Each open item lists the options and a current leaning. Close an item by writing
 | OQ-08 | Exported plugin licence | The runtime is Apache-2.0, with its licence and NOTICE included in every export. The patch author chooses the licence for their patch. | FR-NATIVE-09 |
 | OQ-09 | Block vs. per-sample processing | Hybrid: blocks for acyclic parts, per sample inside feedback loops. Validate with benchmarks in P0. | ADR-0002, NFR-PERF-08 |
 | OQ-10 | Project name | "LoomDSP" appears to be free (informal search). Do a formal trademark check before a 1.0 release. | |
+| OQ-12 | Maturity of `iced_nodegraph` | Not used for the canvas. Findings reported upstream as a courtesy. | ADR-0010 |
 
 ## Open
-
-### OQ-02. UI framework and node editor
-
-- **Leaning:** Iced, with `iced_nodegraph` for the patching canvas. See ADR-0009.
-- **To confirm in the P0 spike:** frame time with 300 nodes and live scopes; how easy it is to draw custom port shapes and cable colours; whether we can build the panel editor with the same tools.
-- **Fallback:** fork `iced_nodegraph`, or write our own canvas widget on Iced's wgpu renderer.
-- **Spike (2026-10-13):** works well; see ADR-0009 "Spike results". Remaining: GPU frame rate on real hardware.
 
 ### OQ-11. Desktop audio and MIDI I/O
 
@@ -35,37 +30,69 @@ Each open item lists the options and a current leaning. Close an item by writing
 - **Leaning:** option 3. Writing audio backends for three platforms is a large project, and not where LoomDSP adds value early on. The adapter trait (NFR-PORT-02) keeps it replaceable.
 - Same review needed for MIDI I/O (`midir`, which is outside the RustAudio organisation; check its licence and contribution policy).
 
-### OQ-12. Maturity of `iced_nodegraph`
-
-- It fits our needs on paper: typed pins, nested graphs, GPU-rendered cables, a 500-node stress test, MIT licence. Its repository also includes AI agent context files, which suggests it is open to AI-assisted work.
-- But it is young and small (about 22 GitHub stars, a small team). It targets a specific Iced version.
-- **Options:** depend on it directly; depend on it and contribute upstream; fork it into a LoomDSP crate.
-- **Leaning:** depend on it, contribute upstream, and wrap it behind our own canvas API so a fork stays possible.
-
 ### OQ-13. Embedding Iced in plugin windows
 
 - Plugins draw inside a window owned by the DAW. Iced normally creates its own window through `winit`.
 - `nice-plug-iced` shows this is possible, but it sits inside RustAudio and its AI policy.
-- **Action:** research before P3. A small "embed Iced in a parent window" crate could be another published primitive (FR-SDK-06).
+- **Action:** research when plugin export is scheduled (deferred). A small "embed Iced in a parent window" crate could be another published primitive (FR-SDK-06).
 
 ### OQ-14. Iced version churn
 
 - Iced is pre-1.0 and has breaking changes between releases. `iced_nodegraph` must keep up.
 - **Leaning:** pin versions. Upgrade once per Iced release, in a dedicated issue.
 
+### OQ-15. Looper recording
+
+- Loopers record audio and MIDI (FR-LIB-20). Recording on the audio thread must not allocate or touch the disk.
+- **Leaning:** record into memory allocated when the looper is created or resized (on the control thread), with a maximum loop length per looper. Saving loops to disk, and loading them, happens on a control thread. Long-form recording to disk is out of scope for now.
+- Decide the maximum lengths and memory budget in P3.
+
+### OQ-16. How notes travel on cables
+
+Note effects (arpeggiators, chords, quantise) need notes to move between modules (ADR-0011). Triggers such as "loop finished" are already gate signals and need no new cable kind.
+
+| Option | For | Against |
+|---|---|---|
+| Per-voice signals (pitch, gate, velocity as polyphonic audio-rate signals), as in Bitwig's Grid | Fits the "patch anything" signal model (ADR-0007). Anything can modulate notes. | Chords and arpeggios need voice allocation in every note module. Note timing is tied to voice slots. |
+| Event cables: a new cable kind carrying sample-timestamped note events | Exact timing, any number of notes, natural for MIDI effects and the timeline. | A second kind of cable. Breaks "every cable is f32" and needs its own scheduling. |
+| Both, with converter modules (events to voices and back) | Each module uses the natural form. | More concepts for users to learn. |
+
+- **Leaning:** both, with event cables shown as their own colour and automatic conversion where an event output meets a signal input. Needs a design spike in P2, before note effects are built in P3.
+
+### OQ-17. Module data beyond parameters
+
+- Patterns, clips, wavetables, and samples are module state, not parameters (FR-LIB-19).
+- **Questions:** the patch format (RON for small data, separate asset files for audio?), undo for large edits, and handing new data to the audio thread without allocation there (same pattern as schedule swaps, ADR-0001).
+- **Leaning:** a per-module `data` field in the patch for small structured data, asset references for audio. Decide in P2.
+
+### OQ-18. How third-party modules are distributed
+
+VCV Rack's ecosystem works because people can install modules without building the program (FR-SHARE-05). Our current rule is "compile modules in, no runtime loading of native code" (FR-SDK-04), for safety and portability.
+
+| Option | For | Against |
+|---|---|---|
+| Compile in from source (curated list) | Safe, portable, simple. | Users cannot add modules without a new LoomDSP build. Slow for the ecosystem. |
+| Native dynamic libraries (like VCV Rack) | Full speed. Proven model. | Rust has no stable ABI, so modules must match the exact compiler and LoomDSP version. Untrusted native code runs with full access. Builds needed for every platform. |
+| WebAssembly modules, run in a sandbox | Safe (sandboxed), one build for all platforms, any language that compiles to WASM. | Slower than native. Real-time safety of the WASM runtime (no allocation or JIT pauses on the audio thread) must be proven. |
+
+- **Leaning:** compile in for now. Spike WebAssembly modules in P4: measure the cost of a filter and an oscillator as WASM against native, and check the runtime's real-time behaviour. Decide before announcing a module SDK.
+
 ## Risks
 
 | ID | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R-01 | UI work is much larger than DSP work, and the project stalls on the canvas and panel editor. | High | High | UI spike in P0. Reuse `iced_nodegraph`. Ship the headless engine and CLI early so progress stays visible. |
+| R-01 | UI work is much larger than DSP work, and the project stalls on the canvas and panel editor. | High | High | Own canvas with a small first version and performance gates (ADR-0010). Ship the headless engine and CLI early so progress stays visible. |
 | R-02 | Per-sample feedback regions are too slow for large patches. | Medium | High | Benchmark in P0 (NFR-PERF-08). Limit per-sample mode to cycle regions only. |
 | R-04 | A dependency's licence blocks permissive plugin export. | Medium | High | `cargo-deny` in CI from P0 with an allow list (ADR-0006). |
-| R-05 | Scope creep toward a full DAW. | Medium | Medium | Non-goals in the vision document. Review new requests against them. |
+| R-05 | Scope creep: features that do not fit the grid (separate DAW views, mixers, track lists). | Medium | Medium | Everything new must be a module (ADR-0011). Non-goals in the vision document. |
 | R-06 | Single maintainer, limited time. | High | High | Small phases with usable results. Public backlog with contributor labels. AI-assisted development. |
 | R-07 | macOS signing and notarisation makes export hard for non-developers. | High | Medium | Document the process. Consider unsigned builds with clear instructions. |
 | R-08 | Building our own primitives (VST3 adapter, GUI embedding) adds maintenance load. | High | Medium | Only build what has no acceptable alternative. Keep each crate small, documented, and tested so others can help maintain it. |
-| R-09 | A key young dependency (`iced_nodegraph`) is abandoned. | Medium | Medium | Wrap behind our own API. Fork if needed. |
+| R-09 | Building our own canvas (ADR-0010) takes much longer than estimated. | Medium | High | Iced keeps text, windowing, and ordinary widgets. Build a measured prototype first, with performance gates on the reference laptop. Keep the scope of the first version small. |
 | R-10 | Strict dependency rules leave a gap with no acceptable crate. | Medium | Medium | Licence rules are strict (Must). AI-policy preference is soft (Should). We can use a permissive crate even if we cannot contribute to it. |
+| R-11 | "Everything is a module" makes the library very large, and the project spreads thin. | High | High | Grow by phase. Prioritise modules for live performance. Make the module SDK good enough that the community can add modules. |
+| R-12 | Note handling (OQ-16) is decided late and forces rework in modules already built. | Medium | High | Design spike before the first note effect. Keep MIDI note input behind one module until then. |
+| R-13 | No way to install third-party modules without rebuilding slows the community (OQ-18). | Medium | Medium | Ship a strong built-in library first. Decide OQ-18 early in P4. |
 
 ## Notes on the background research
 

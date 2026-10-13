@@ -4,7 +4,7 @@
 
 An open-source modular audio environment written in Rust, for musical experimentation and live performance.
 
-Build instruments and effects by connecting small DSP modules. Hide the wiring behind a front panel. Play it live with MIDI controllers. Later, export it as a plugin (CLAP, VST3) or a standalone app.
+Build living musical systems by connecting small modules: oscillators and filters, but also modulators, sequencers, loopers, and logic that arranges the music as it plays. Hide the wiring behind a front panel, play it live with MIDI controllers, and share your patches with others.
 
 **Status: Phase 0 (engine foundations).** There is no graphical editor yet. The engine, the module library, the patch format, and a command-line player work today. See the [roadmap](docs/product/roadmap.md).
 
