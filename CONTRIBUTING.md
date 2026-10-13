@@ -57,7 +57,7 @@ Every pull request runs these jobs. All must pass before merging (the "CI succes
 
 Why warnings fail CI but not your local build: a warning while you are still editing is noise, but a warning on `main` is a problem someone else inherits.
 
-The UI spike in `spikes/` builds in a separate workflow, only when its files change. Dependabot opens weekly pull requests for dependency updates.
+Dependabot opens weekly pull requests for dependency updates.
 
 ## Rules for audio code
 

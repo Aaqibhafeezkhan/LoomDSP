@@ -65,7 +65,7 @@ Each new non-trivial dependency gets a short note in its pull request:
 | Plugin framework | nih-plug, nice-plug | Not used | Contribution policies conflict with our AI-assisted workflow. nice-plug follows the RustAudio community AI policy. |
 | VST3 adapter | Our own crate on `vst3` | Build | Candidate for publishing (FR-SDK-06). |
 | UI | Iced | Use | MIT. See ADR-0009. |
-| Node editor | `iced_nodegraph` | Use, pending spike | MIT. See OQ-12. |
+| Node editor | `iced_nodegraph` | Not used | MIT. Tested in a P0 spike; the canvas will be our own (ADR-0010). |
 | Audio I/O | `cpal` | Use, with caveat | Apache-2.0. RustAudio AI policy limits upstream contributions. Behind our own host trait. See OQ-11. |
 | Patch format | `serde`, `ron` | Use | MIT/Apache-2.0. |
 

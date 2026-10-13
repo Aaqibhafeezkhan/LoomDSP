@@ -1,5 +1,0 @@
-target/
-*.saved.ron
-generated-*.ron
-# Profiler output (samply)
-profile.json*

@@ -1,12 +1,24 @@
-# UI spike: Iced + iced_nodegraph
+# Phase 0 UI Spikes
 
-Phase 0 spike for [ADR-0009](../../docs/adr/0009-ui-stack-iced.md). The question: can Iced with `iced_nodegraph` carry LoomDSP's patching canvas?
+Two throwaway spikes answered ADR-0009's question: can a ready-made node editor carry LoomDSP's patch canvas? The outcome: Iced for the application UI, and our own canvas as an Iced widget ([ADR-0010](../adr/0010-own-patch-canvas.md)).
+
+The spike code was removed from the repository after the decision. It is still in git history: the last commit containing it is `4b057de`. To look at it again:
+
+```sh
+git checkout 4b057de -- spikes/
+```
+
+The write-ups below are kept as they were, so the evidence behind the ADRs stays readable. Commands in them refer to the removed `spikes/` folder.
+
+## Iced + iced_nodegraph
+
+Phase 0 spike for [ADR-0009](../adr/0009-ui-stack-iced.md). The question: can Iced with `iced_nodegraph` carry LoomDSP's patching canvas?
 
 This is throwaway code. It answers questions; it is not the start of the real UI.
 
 It is a standalone Cargo project (not part of the main workspace), so its large GUI dependency tree does not slow down engine builds and CI.
 
-## Run it
+### Run it
 
 ```sh
 cd spikes/ui-nodegraph
@@ -20,11 +32,11 @@ If a MIDI input is connected, it plays from your keyboard. Without one, use the 
 
 Controls: drag between pins to connect, click a connected pin to unplug, drag nodes to move, right-drag to pan, scroll to zoom, Delete to remove selected modules, Home to frame everything. **Save** writes `<patch>.saved.ron` with node positions.
 
-![FM feedback patch in the spike](screenshots/fm-feedback.png)
+![FM feedback patch in the spike](images/spike-iced-fm-feedback.png)
 
-![300-module stress graph](screenshots/generated-300.png)
+![300-module stress graph](images/spike-iced-generated-300.png)
 
-## What it proves
+### What it proves
 
 | Question (ADR-0009) | Result |
 |---|---|
@@ -37,7 +49,7 @@ Controls: drag between pins to connect, click a connected pin to unplug, drag no
 | Nested graphs, minimap, box select, delete, clone | Provided by `iced_nodegraph`. Minimap shown. Nesting not tried yet. |
 | 300 nodes | Renders correctly. Canvas CPU work (layout, geometry, edges) measured **about 5.5 ms per frame** for 298 modules and 371 cables on a 2-vCPU cloud VM. |
 
-## Still to measure on real hardware
+### Still to measure on real hardware
 
 The cloud VM has no GPU. It rendered with a software Vulkan driver at 2 to 7 fps, which says nothing about real performance. On the reference machine, record from the status bar:
 
@@ -130,7 +142,7 @@ To confirm:
 
 If `--plain` reaches 60 fps, the cost is the widgets inside nodes, and the fix is in our node design (for example, draw parameter controls only for nodes on screen or at readable zoom). If `--plain` is still slow, the cost is in the canvas or its GPU path, and we should compare with the `500_nodes` demo in the iced_nodegraph repository and talk to its maintainer before accepting ADR-0009.
 
-## Findings and follow-ups
+### Findings and follow-ups
 
 - **Auto-layout matters.** Patches without saved positions need a layout that handles feedback loops. The spike uses layering with cycle breaking. The real editor should save positions in the patch (the format already supports `position`).
 - **Parameter sliders are linear.** Cutoff needs a logarithmic mapping (FR-PANEL-04). This belongs in the LoomDSP widget crate, not in the node editor.
@@ -138,9 +150,53 @@ If `--plain` reaches 60 fps, the cost is the widgets inside nodes, and the fix i
 - **Plugin window embedding** (OQ-13) is untested. Iced runs through `winit`; plugins need to draw into a host window. Research when plugin export is scheduled (deferred).
 - **Version pinning.** The spike pins `iced = 0.14` and `iced_nodegraph = 0.5`. Upgrade both together (OQ-14).
 
-## Conclusion (2026-10-13)
+### Conclusion (2026-10-13)
 
 - Iced performed well. Its own costs were small once the spike's per-pin styling was cached.
 - iced_nodegraph is limited by GPU fill rate on Retina displays: 24 fps with 300 modules and 40 fps with 8, at full window size on the reference laptop.
-- Decision: Iced is accepted for the application UI. The patch canvas will be our own Iced widget ([ADR-0010](../../docs/adr/0010-own-patch-canvas.md)), so we control rendering cost, look, and module views.
+- Decision: Iced is accepted for the application UI. The patch canvas will be our own Iced widget ([ADR-0010](../adr/0010-own-patch-canvas.md)), so we control rendering cost, look, and module views.
 - The remaining check rows above were not needed for the decision.
+
+## egui + egui-snarl
+
+Comparison spike for [ADR-0009](../adr/0009-ui-stack-iced.md). It mirrors [spikes/ui-nodegraph](#iced--iced_nodegraph) (Iced + iced_nodegraph) as closely as the libraries allow: the same patch loader and 300-module generator, live engine edits, typed and coloured ports, parameter sliders, and the same stats line. Both render through wgpu (Metal on macOS) with vsync.
+
+The question: does a renderer that tessellates shapes into triangles (egui) avoid the per-pixel GPU cost we measured in iced_nodegraph's signed-distance-field renderer on a Retina display?
+
+Throwaway code, standalone Cargo project (not in the main workspace).
+
+### Run it
+
+```sh
+cd spikes/ui-snarl
+cargo run --release -- ../../examples/patches/fm-feedback.ron
+cargo run --release -- --generate 300 --no-audio
+cargo run --release -- --generate 300 --no-audio --plain   # nodes without sliders
+```
+
+Controls: drag between pins to connect, right-click a pin to unplug, drag nodes to move, drag the background to pan, scroll or pinch to zoom, right-click a node to remove it.
+
+Differences from the Iced spike:
+- egui-snarl keeps its own copy of the graph, so the spike mirrors every edit into both the snarl and the engine `Controller`.
+- egui-snarl starts zoomed to fit the whole graph, so all 300 modules are on screen at once. The Iced spike showed only part of the graph.
+- No dashed wires: inputs with an inserted 1-sample delay are labelled "(delay)".
+- The stats line shows "ui build" (time in the app's `ui()` function) and "egui CPU" (eframe's own CPU time for the last frame, including tessellation).
+
+![FM feedback patch in the egui-snarl spike](images/spike-snarl-fm-feedback.png)
+
+### Results
+
+Measure on the same Mac, same display, same window size as the Iced spike:
+
+| Run | Display | fps | frame avg | ui build | egui CPU |
+|---|---|---|---|---|---|
+| fm-feedback.ron (no audio) | Laptop (Retina) | | | | |
+| `--generate 300 --no-audio` | Laptop (Retina) | | | | |
+| `--generate 300 --no-audio --plain` | Laptop (Retina) | | | | |
+| `--generate 300 --no-audio` | External | | | | |
+
+Early sign from a CPU-only VM (software rendering, not comparable in fps): with all 300 modules on screen, `ui()` took about 11 ms and egui's CPU time about 20 ms per frame. egui lays out every node every frame (immediate mode), so its cost is on the CPU side, the opposite of iced_nodegraph.
+
+### Conclusion (2026-10-13)
+
+Rejected on look before the real-hardware measurement: egui's stock widgets and spacing are far from the polish we want (the Bitwig Grid is the reference), and egui-snarl keeps its own copy of the graph, which fits our `Controller` poorly. The patch canvas will be our own Iced widget ([ADR-0010](../adr/0010-own-patch-canvas.md)). Whether triangle-based drawing avoids the per-pixel cost will be measured on that canvas's first prototype instead.

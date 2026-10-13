@@ -46,7 +46,7 @@ If the spike fails on 1 or 2, try `egui-snarl` next, then a custom renderer.
 
 ## Spike results (2026-10-13)
 
-See [spikes/ui-nodegraph](../../spikes/ui-nodegraph/README.md).
+See [p0-ui-spikes.md](../benchmarks/p0-ui-spikes.md).
 
 1. **Frame time:** canvas CPU work is about 5.5 ms per frame for 298 modules and 371 cables on a 2-vCPU VM. GPU frame rate is not measured yet (no GPU on the build machine). To do on the reference machine.
 2. **Port shapes and cable colours:** yes. Per-signal colours, gradient cables, square pins for pitch and gate.
@@ -87,4 +87,4 @@ Decision:
 - **Rejected for the patch canvas:** iced_nodegraph and egui-snarl.
 - **The canvas** will be our own Iced widget (ADR-0010).
 
-Full measurements and profiles: [spikes/ui-nodegraph](../../spikes/ui-nodegraph/README.md), [spikes/ui-snarl](../../spikes/ui-snarl/README.md).
+Full measurements and profiles: [p0-ui-spikes.md](../benchmarks/p0-ui-spikes.md).

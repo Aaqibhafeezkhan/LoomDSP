@@ -82,14 +82,6 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
-id = "cargo-fmt-spike"
-name = "cargo fmt (UI spike)"
-entry = "cargo fmt --manifest-path spikes/ui-nodegraph/Cargo.toml"
-language = "system"
-files = "^spikes/ui-nodegraph/.*\\.rs$"
-pass_filenames = false
-
-[[repos.hooks]]
 id = "cargo-clippy"
 name = "cargo clippy"
 # Same lint policy as CI (workspace Cargo.toml), with warnings as errors.
