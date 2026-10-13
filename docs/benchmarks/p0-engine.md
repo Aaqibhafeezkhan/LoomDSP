@@ -67,7 +67,19 @@ The real P0 exit criterion is the **live** test on a desktop machine:
 cargo run --release -p loom-cli -- stress examples/patches/subtractive.ron --seconds 600
 ```
 
-It plays through the real audio device with real-time scheduling and reports overruns. Record the result here when it has been run on the reference machine.
+It plays through the real audio device with real-time scheduling and reports overruns.
+
+### Live result (2026-10-13)
+
+Run on the maintainer's Mac (default output device). The device ran at 44.1 kHz with 512-frame buffers (11.6 ms per buffer), worked out from 51,680 callbacks in 600 s.
+
+| Patch | Duration | Edits | Schedule swaps | Max load | Overruns | Stream errors | Leaks | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `subtractive.ron` | 600 s | 11,026 | 11,027 | 4.1% | 0 | 0 | 0 | **PASS** |
+
+The P0 exit criterion ("zero dropouts over 10 minutes of edits") is met.
+
+Follow-up: repeat with `--buffer 128` (2.9 ms per buffer). Smaller buffers are what live performers use for low latency, and they leave less room for timing jitter.
 
 ## How to reproduce
 

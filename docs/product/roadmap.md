@@ -41,8 +41,8 @@ Scope:
 - Repository basics: `CONTRIBUTING.md`, AI contribution policy, agent context file, issue templates.
 
 Exit criteria:
-- [x] A patch file plays through the default audio device with live MIDI input. (`loom play`; confirm on the reference machine.)
-- [ ] Adding and removing modules from a test script while audio plays causes zero dropouts over 10 minutes. (`loom stress --seconds 600`; offline version passes, live run on the reference machine pending.)
+- [x] A patch file plays through the default audio device with live MIDI input. (`loom play`.)
+- [x] Adding and removing modules from a test script while audio plays causes zero dropouts over 10 minutes. (`loom stress --seconds 600`: 11,026 edits, 0 overruns, max load 4.1%. See [p0-engine.md](../benchmarks/p0-engine.md).)
 - [x] Feedback benchmark results recorded. ADR-0002 confirmed ([p0-engine.md](../benchmarks/p0-engine.md)).
 - [x] Offline renders are bit-identical across runs, and across host buffer sizes.
 - [ ] UI spike results recorded. ADR-0009 accepted or revised. (Spike done; GPU frame rate on the reference machine pending.)
