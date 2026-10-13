@@ -17,3 +17,8 @@ loom-core = { path = "../../crates/loom-core" }
 loom-modules = { path = "../../crates/loom-modules" }
 loom-patch = { path = "../../crates/loom-patch" }
 loom-host-desktop = { path = "../../crates/loom-host-desktop" }
+
+# Keep function names and line numbers in release builds, so profilers
+# (samply, Instruments) can show readable stack traces.
+[profile.release]
+debug = "line-tables-only"

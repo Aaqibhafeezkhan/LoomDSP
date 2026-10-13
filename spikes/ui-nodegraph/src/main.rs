@@ -14,6 +14,8 @@
 //!   cargo run --release -- ../../examples/patches/fm-feedback.ron
 //!   cargo run --release -- --generate 300          # stress test: 300 modules
 //!   cargo run --release -- --generate 300 --no-audio
+//!   cargo run --release -- --generate 300 --no-audio --plain   # nodes without sliders
+//!   cargo run --release -- --generate 300 --no-audio --no-minimap
 //!
 //! This is throwaway code to answer questions, not the start of the real UI.
 
@@ -67,6 +69,11 @@ struct Args {
     patch: Option<PathBuf>,
     generate: Option<usize>,
     audio: bool,
+    /// Nodes show ports only, no parameter sliders. Isolates the cost of
+    /// widgets inside nodes from the cost of the canvas itself.
+    plain: bool,
+    /// Turn off the minimap (a second rendering pass).
+    minimap: bool,
 }
 
 fn parse_args() -> Args {
@@ -74,12 +81,16 @@ fn parse_args() -> Args {
         patch: None,
         generate: None,
         audio: true,
+        plain: false,
+        minimap: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--generate" => args.generate = it.next().and_then(|n| n.parse().ok()),
             "--no-audio" => args.audio = false,
+            "--plain" => args.plain = true,
+            "--no-minimap" => args.minimap = false,
             path => args.patch = Some(PathBuf::from(path)),
         }
     }
@@ -113,8 +124,19 @@ struct App {
     audio_note: String,
     kinds: Vec<String>,
     picked: Option<String>,
+    plain: bool,
+    minimap: bool,
     frames: VecDeque<Instant>,
+    frames_seen: u64,
     worst_frame: Duration,
+    /// Time spent building the widget tree in `view()`. A `Cell` because
+    /// `view` only gets `&self`.
+    view_time: std::cell::Cell<Duration>,
+    /// Theme-derived default styles, computed once per status instead of
+    /// once per pin or edge per frame. The defaults convert colours through
+    /// OKLab, which profiling showed was about a quarter of the main thread.
+    pin_styles: StyleCache<PinStatus, PinStyle>,
+    edge_styles: StyleCache<EdgeStatus, EdgeStyle>,
     graph_cpu: Duration,
 }
 
@@ -193,8 +215,14 @@ impl App {
             audio_note,
             kinds: loom_modules::registry().iter().map(|d| d.id.to_string()).collect(),
             picked: None,
+            plain: args.plain,
+            minimap: args.minimap,
             frames: VecDeque::new(),
+            frames_seen: 0,
             worst_frame: Duration::ZERO,
+            view_time: std::cell::Cell::new(Duration::ZERO),
+            pin_styles: StyleCache::default(),
+            edge_styles: StyleCache::default(),
             graph_cpu: Duration::ZERO,
         };
         app.report();
@@ -260,11 +288,11 @@ impl App {
                 let _ = self.controller.set_param(ModuleId(module), index, value);
             }
             Message::Frame(now) => {
+                self.frames_seen += 1;
                 if let Some(&last) = self.frames.back() {
-                    let gap = now - last;
-                    if self.frames.len() > 30 {
-                        // Skip the first frames, which include start-up work.
-                        self.worst_frame = self.worst_frame.max(gap);
+                    // Skip the first frames, which include start-up work.
+                    if self.frames_seen > 10 {
+                        self.worst_frame = self.worst_frame.max(now - last);
                     }
                 }
                 self.frames.push_back(now);
@@ -311,6 +339,7 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let view_started = Instant::now();
         let graph = self.controller.graph();
         let inserted: BTreeSet<InputRef> = self
             .controller
@@ -331,15 +360,19 @@ impl App {
                 stroke_color: ColorQuad::arc(colour(*pin.info()), colour(*pin.info())),
                 ..default_edge_style(theme, EdgeStatus::Idle)
             })
-            .minimap(iced_nodegraph::Minimap::default())
             .width(Length::Fill)
             .height(Length::Fill);
+
+        if self.minimap {
+            canvas = canvas.minimap(iced_nodegraph::Minimap::default());
+        }
 
         for (id, node) in graph.nodes() {
             let pos = self.positions.get(&id.0).copied().unwrap_or(Point::ORIGIN);
             canvas = canvas.push_node(self.module_node(id, node, pos));
         }
 
+        let edge_styles = &self.edge_styles;
         canvas = canvas.edges(graph.cables().map(|(from, to)| {
             let dashed = inserted.contains(&to);
             edge(
@@ -350,7 +383,7 @@ impl App {
             .style(move |theme, status, start, end| {
                 let mut style = EdgeStyle {
                     stroke_color: ColorQuad::arc(colour(*start.info()), colour(*end.info())),
-                    ..default_edge_style(theme, status)
+                    ..edge_styles.get(status, || default_edge_style(theme, status))
                 };
                 if dashed {
                     style.pattern = Pattern::dashed(style.pattern.thickness, 10.0, 6.0);
@@ -360,6 +393,15 @@ impl App {
         }));
 
         let fps = self.frames.len();
+        // Average and longest frame over the last second.
+        let gaps: Vec<Duration> = self
+            .frames
+            .iter()
+            .zip(self.frames.iter().skip(1))
+            .map(|(a, b)| *b - *a)
+            .collect();
+        let avg = gaps.iter().sum::<Duration>().as_secs_f64() * 1000.0 / gaps.len().max(1) as f64;
+        let max_recent = gaps.iter().max().copied().unwrap_or_default().as_secs_f64() * 1000.0;
         let audio = self.audio_stats.as_ref().map_or(self.audio_note.clone(), |s| {
             let s = s.snapshot();
             format!(
@@ -370,10 +412,12 @@ impl App {
             )
         });
         let stats = text(format!(
-            "{} modules, {} cables | {fps} fps | worst frame {:.1} ms | canvas CPU {:.2} ms | {audio}",
+            "{} modules, {} cables{} | {fps} fps | frame avg {avg:.1} ms, max {max_recent:.1} ms (1 s), worst {:.1} ms | view build {:.2} ms | canvas CPU {:.2} ms | {audio}",
             graph.len(),
             graph.cables().count(),
+            if self.plain { " (plain)" } else { "" },
             self.worst_frame.as_secs_f64() * 1000.0,
+            self.view_time.get().as_secs_f64() * 1000.0,
             self.graph_cpu.as_secs_f64() * 1000.0,
         ))
         .size(13);
@@ -391,12 +435,16 @@ impl App {
                 .push(button(if self.holding { "Release note" } else { "Hold note" }).on_press(Message::HoldNote));
         }
 
-        column![
+        let element = column![
             container(toolbar).padding(8),
             canvas,
             container(column![stats, text(&self.status).size(13)].spacing(2)).padding(8),
         ]
-        .into()
+        .into();
+        // Note: this measures building the widget tree only. Layout and
+        // drawing happen later, inside Iced, and show up in frame time.
+        self.view_time.set(view_started.elapsed());
+        element
     }
 
     fn module_node<'a>(
@@ -419,7 +467,8 @@ impl App {
                 port.signal
             ));
         }
-        for (index, spec) in d.params.iter().enumerate() {
+        let params = if self.plain { &[][..] } else { d.params };
+        for (index, spec) in params.iter().enumerate() {
             let value = node.params[index];
             let module = id.0;
             body = body.push(
@@ -458,9 +507,31 @@ impl App {
                     SignalType::Gate | SignalType::Pitch => PinShape::Square,
                     _ => PinShape::Circle,
                 },
-                ..default_pin_style(theme, status)
+                ..self.pin_styles.get(status, || default_pin_style(theme, status))
             }
         })
+    }
+}
+
+/// A tiny memo table for styles keyed by a status enum (two variants), so a
+/// linear search is fastest. The theme never changes in the spike; a real
+/// app would clear this when the theme changes.
+struct StyleCache<K, V>(std::cell::RefCell<Vec<(K, V)>>);
+
+impl<K, V> Default for StyleCache<K, V> {
+    fn default() -> Self {
+        Self(std::cell::RefCell::new(Vec::new()))
+    }
+}
+
+impl<K: Copy + PartialEq, V: Clone> StyleCache<K, V> {
+    fn get(&self, key: K, make: impl FnOnce() -> V) -> V {
+        if let Some((_, value)) = self.0.borrow().iter().find(|(k, _)| *k == key) {
+            return value.clone();
+        }
+        let value = make();
+        self.0.borrow_mut().push((key, value.clone()));
+        value
     }
 }
 
