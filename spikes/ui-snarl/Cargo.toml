@@ -1,0 +1,21 @@
+[package]
+name = "loom-spike-ui-snarl"
+description = "P0 UI comparison spike: LoomDSP patch canvas on egui + egui-snarl (ADR-0009)."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+egui-snarl = "0.12"
+loom-core = { path = "../../crates/loom-core" }
+loom-modules = { path = "../../crates/loom-modules" }
+loom-patch = { path = "../../crates/loom-patch" }
+loom-host-desktop = { path = "../../crates/loom-host-desktop" }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+
+# Keep function names and line numbers in release builds, for profilers.
+[profile.release]
+debug = "line-tables-only"
