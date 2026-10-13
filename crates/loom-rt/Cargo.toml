@@ -1,0 +1,12 @@
+[package]
+name = "loom-rt"
+description = "Real-time audio helpers for LoomDSP: denormal handling and parameter smoothing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/loom-rt",
+    "crates/loom-core",
+    "crates/loom-modules",
+    "crates/loom-patch",
+    "crates/loom-host-desktop",
+    "crates/loom-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/brylie/LoomDSP"
+authors = ["LoomDSP contributors"]
+
+[workspace.dependencies]
+loom-rt = { path = "crates/loom-rt", version = "0.1.0" }
+loom-core = { path = "crates/loom-core", version = "0.1.0" }
+loom-modules = { path = "crates/loom-modules", version = "0.1.0" }
+loom-patch = { path = "crates/loom-patch", version = "0.1.0" }
+loom-host-desktop = { path = "crates/loom-host-desktop", version = "0.1.0" }
+
+rtrb = "0.4"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+hound = "3.5"
+cpal = "0.18"
+midir = "0.11"
+clap = { version = "4.6", features = ["derive"] }
+assert_no_alloc = "1.1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = 1
+
+[profile.bench]
+debug = 1

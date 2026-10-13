@@ -1,6 +1,6 @@
 # ADR-0009: UI stack: Iced with iced_nodegraph
 
-- **Status:** Proposed, pending the P0 UI spike
+- **Status:** Proposed. P0 spike done (see Spike results); GPU frame-rate measurement on real hardware still pending.
 - **Date:** 2026-10-13
 - **Related requirements:** FR-CANVAS-*, FR-PANEL-*, FR-VIS-*, NFR-PERF-04, OQ-02, OQ-12, OQ-13, OQ-14
 
@@ -43,6 +43,20 @@ Use Iced for all UI, with `iced_nodegraph` for the patching canvas.
 5. Rough idea of how to embed Iced in a parent window (for OQ-13).
 
 If the spike fails on 1 or 2, try `egui-snarl` next, then a custom renderer.
+
+## Spike results (2026-10-13)
+
+See [spikes/ui-nodegraph](../../spikes/ui-nodegraph/README.md).
+
+1. **Frame time:** canvas CPU work is about 5.5 ms per frame for 298 modules and 371 cables on a 2-vCPU VM. GPU frame rate is not measured yet (no GPU on the build machine). To do on the reference machine.
+2. **Port shapes and cable colours:** yes. Per-signal colours, gradient cables, square pins for pitch and gate.
+3. **Nested graph navigation:** not tried yet. `iced_nodegraph` supports graphs inside node bodies.
+4. **Knob effort:** not built. Sliders inside nodes work. A knob with modulation range display is a custom widget, planned for P1.
+5. **Embedding:** not tried (OQ-13).
+
+Extra finding: the widget is stateless and renders straight from `Controller::graph()`. Every gesture becomes a controller edit and a schedule swap while audio plays. This fits ADR-0005 (one data model) very well.
+
+Decision: proceed with Iced and `iced_nodegraph` for P1, unless the real-hardware frame-rate test fails.
 
 ## Consequences
 

@@ -23,6 +23,7 @@ Each open item lists the options and a current leaning. Close an item by writing
 - **Leaning:** Iced, with `iced_nodegraph` for the patching canvas. See ADR-0009.
 - **To confirm in the P0 spike:** frame time with 300 nodes and live scopes; how easy it is to draw custom port shapes and cable colours; whether we can build the panel editor with the same tools.
 - **Fallback:** fork `iced_nodegraph`, or write our own canvas widget on Iced's wgpu renderer.
+- **Spike (2026-10-13):** works well; see ADR-0009 "Spike results". Remaining: GPU frame rate on real hardware.
 
 ### OQ-11. Desktop audio and MIDI I/O
 

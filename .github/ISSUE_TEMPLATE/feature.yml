@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a new feature or a change.
+labels: [feature]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the musical or practical need first, then any idea for a solution.
+    validations:
+      required: true
+  - type: input
+    id: requirement
+    attributes:
+      label: Related requirement IDs
+      description: For example FR-MIDI-02. See docs/product/requirements.md.
+  - type: textarea
+    id: idea
+    attributes:
+      label: Possible solution

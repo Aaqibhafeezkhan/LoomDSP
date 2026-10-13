@@ -1,0 +1,353 @@
+//! The control-thread side of the engine.
+
+use crate::compile::{CompileReport, compile};
+use crate::descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole};
+use crate::engine::{Command, Engine, EngineConfig, EngineStats, Garbage};
+use crate::error::LoomError;
+use crate::graph::{Graph, InputRef, ModuleId, Node, OutputRef};
+use crate::midi::MidiEvent;
+use crate::registry::Registry;
+use rtrb::{Consumer, Producer, RingBuffer};
+use std::sync::Arc;
+
+/// The three handles returned by [`create_engine`].
+pub struct EngineParts {
+    /// Edits the graph. Keep it on a control thread.
+    pub controller: Controller,
+    /// Renders audio. Move it to the audio thread.
+    pub engine: Engine,
+    /// Sends MIDI to the engine. Move it to the MIDI input thread.
+    pub midi: MidiSender,
+}
+
+/// Creates a connected controller, engine, and MIDI sender.
+pub fn create_engine(registry: Arc<Registry>, config: EngineConfig) -> EngineParts {
+    let (command_tx, command_rx) = RingBuffer::new(config.command_capacity);
+    // Every command can produce at most one piece of garbage, so a garbage
+    // queue as large as the command queue cannot overflow as long as the
+    // controller drains it before sending more commands.
+    let (garbage_tx, garbage_rx) = RingBuffer::new(config.command_capacity);
+    let (midi_tx, midi_rx) = RingBuffer::new(config.midi_capacity);
+    let stats = Arc::new(EngineStats::default());
+    let engine = Engine::new(config, command_rx, garbage_tx, midi_rx, stats.clone());
+    let controller = Controller {
+        registry,
+        graph: Graph::default(),
+        commands: command_tx,
+        garbage: garbage_rx,
+        free_slots: (0..config.max_modules).rev().collect(),
+        pending_removals: Vec::new(),
+        next_id: 1,
+        dirty: false,
+        last_report: CompileReport::default(),
+        config,
+        stats,
+    };
+    EngineParts {
+        controller,
+        engine,
+        midi: MidiSender { tx: midi_tx },
+    }
+}
+
+/// Sends MIDI events to the engine from any single thread.
+pub struct MidiSender {
+    tx: Producer<MidiEvent>,
+}
+
+impl MidiSender {
+    /// Queues an event. Returns false if the queue is full (event dropped).
+    pub fn send(&mut self, event: MidiEvent) -> bool {
+        self.tx.push(event).is_ok()
+    }
+}
+
+/// Edits the graph and keeps the engine in sync.
+///
+/// Structural edits (add, remove, connect, disconnect) take effect when you
+/// call [`Controller::commit`]. Batch several edits, then commit once.
+/// Parameter changes take effect immediately.
+pub struct Controller {
+    registry: Arc<Registry>,
+    graph: Graph,
+    commands: Producer<Command>,
+    garbage: Consumer<Garbage>,
+    free_slots: Vec<usize>,
+    pending_removals: Vec<usize>,
+    next_id: u32,
+    dirty: bool,
+    last_report: CompileReport,
+    config: EngineConfig,
+    stats: Arc<EngineStats>,
+}
+
+impl Controller {
+    /// The module registry.
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
+    }
+
+    /// The current graph (including uncommitted edits).
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Engine settings.
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// Engine counters.
+    pub fn stats(&self) -> &Arc<EngineStats> {
+        &self.stats
+    }
+
+    /// The report from the last successful [`Controller::commit`].
+    pub fn last_report(&self) -> &CompileReport {
+        &self.last_report
+    }
+
+    /// True if there are structural edits not yet committed.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        self.dirty
+    }
+
+    /// Adds a module by kind (`"id@version"` or `"id"`). Returns its new ID.
+    pub fn add_module(&mut self, kind: &str) -> Result<ModuleId, LoomError> {
+        let descriptor = self.registry.resolve(kind)?;
+        let id = ModuleId(self.next_id);
+        self.add_descriptor(id, descriptor)?;
+        Ok(id)
+    }
+
+    /// Adds a module with a specific ID, for example when loading a patch.
+    pub fn add_module_with_id(&mut self, id: ModuleId, kind: &str) -> Result<(), LoomError> {
+        let descriptor = self.registry.resolve(kind)?;
+        self.add_descriptor(id, descriptor)
+    }
+
+    fn add_descriptor(&mut self, id: ModuleId, descriptor: &'static ModuleDescriptor) -> Result<(), LoomError> {
+        if self.graph.nodes.contains_key(&id) {
+            return Err(LoomError::DuplicateModuleId(id));
+        }
+        self.collect_garbage();
+        let slot = match descriptor.role {
+            ModuleRole::Dsp(factory) => {
+                let slot = self
+                    .free_slots
+                    .pop()
+                    .ok_or(LoomError::TooManyModules(self.config.max_modules))?;
+                let mut module = factory(&ModuleConfig {
+                    sample_rate: self.config.sample_rate,
+                    max_block: self.config.max_block,
+                });
+                for (index, param) in descriptor.params.iter().enumerate() {
+                    module.set_param(index, param.default);
+                }
+                // The new slot is not in the running schedule yet, so
+                // inserting it now is harmless and spreads the work out.
+                if let Err(rtrb::PushError::Full(_)) = self.commands.push(Command::InsertModule { slot, module }) {
+                    self.free_slots.push(slot);
+                    return Err(LoomError::QueueFull);
+                }
+                Some(slot)
+            }
+            ModuleRole::UnitDelay | ModuleRole::AudioOutput => None,
+        };
+        self.graph.nodes.insert(
+            id,
+            Node {
+                descriptor,
+                params: descriptor.default_params(),
+                slot,
+            },
+        );
+        self.next_id = self.next_id.max(id.0 + 1);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Removes a module and every cable touching it.
+    pub fn remove_module(&mut self, id: ModuleId) -> Result<(), LoomError> {
+        let node = self.graph.nodes.remove(&id).ok_or(LoomError::UnknownModule(id))?;
+        self.graph
+            .cables
+            .retain(|to, from| to.module != id && from.module != id);
+        if let Some(slot) = node.slot {
+            // The running schedule still uses this slot. The instance is
+            // removed after the next schedule swap (see `commit`).
+            self.pending_removals.push(slot);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Connects an output to an input. Any cable already on that input is
+    /// replaced and returned.
+    pub fn connect(&mut self, from: OutputRef, to: InputRef) -> Result<Option<OutputRef>, LoomError> {
+        self.check_output(from)?;
+        self.check_input(to)?;
+        self.dirty = true;
+        Ok(self.graph.cables.insert(to, from))
+    }
+
+    /// Connects ports by name.
+    pub fn connect_named(
+        &mut self,
+        from: ModuleId,
+        output: &str,
+        to: ModuleId,
+        input: &str,
+    ) -> Result<Option<OutputRef>, LoomError> {
+        let from = self.output_ref(from, output)?;
+        let to = self.input_ref(to, input)?;
+        self.connect(from, to)
+    }
+
+    /// Removes the cable on an input. Returns where it came from.
+    pub fn disconnect(&mut self, to: InputRef) -> Result<Option<OutputRef>, LoomError> {
+        self.check_input(to)?;
+        let removed = self.graph.cables.remove(&to);
+        if removed.is_some() {
+            self.dirty = true;
+        }
+        Ok(removed)
+    }
+
+    /// Resolves an output port by name.
+    pub fn output_ref(&self, module: ModuleId, name: &str) -> Result<OutputRef, LoomError> {
+        let node = self.node(module)?;
+        let port = node
+            .descriptor
+            .output_index(name)
+            .ok_or_else(|| LoomError::NoSuchPort {
+                module,
+                direction: "output",
+                port: name.to_string(),
+            })?;
+        Ok(OutputRef { module, port })
+    }
+
+    /// Resolves an input port by name.
+    pub fn input_ref(&self, module: ModuleId, name: &str) -> Result<InputRef, LoomError> {
+        let node = self.node(module)?;
+        let port = node.descriptor.input_index(name).ok_or_else(|| LoomError::NoSuchPort {
+            module,
+            direction: "input",
+            port: name.to_string(),
+        })?;
+        Ok(InputRef { module, port })
+    }
+
+    /// Sets a parameter by index. Takes effect at the next buffer.
+    /// The value is clamped to the parameter's range.
+    pub fn set_param(&mut self, module: ModuleId, index: usize, value: f32) -> Result<f32, LoomError> {
+        let node = self
+            .graph
+            .nodes
+            .get_mut(&module)
+            .ok_or(LoomError::UnknownModule(module))?;
+        let spec = node
+            .descriptor
+            .params
+            .get(index)
+            .ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: index.to_string(),
+            })?;
+        let value = spec.clamp(value);
+        node.params[index] = value;
+        if let Some(slot) = node.slot
+            && self.commands.push(Command::SetParam { slot, index, value }).is_err()
+        {
+            return Err(LoomError::QueueFull);
+        }
+        Ok(value)
+    }
+
+    /// Sets a parameter by name.
+    pub fn set_param_named(&mut self, module: ModuleId, name: &str, value: f32) -> Result<f32, LoomError> {
+        let index = self
+            .node(module)?
+            .descriptor
+            .param_index(name)
+            .ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: name.to_string(),
+            })?;
+        self.set_param(module, index, value)
+    }
+
+    /// Clears a module's internal state.
+    pub fn reset_module(&mut self, module: ModuleId) -> Result<(), LoomError> {
+        if let Some(slot) = self.node(module)?.slot {
+            self.commands
+                .push(Command::ResetModule { slot })
+                .map_err(|_| LoomError::QueueFull)?;
+        }
+        Ok(())
+    }
+
+    /// Compiles the graph and sends it to the engine. The engine switches to
+    /// it at the start of its next buffer, with no dropout (FR-GRAPH-02).
+    pub fn commit(&mut self) -> Result<&CompileReport, LoomError> {
+        self.collect_garbage();
+        if !self.dirty {
+            return Ok(&self.last_report);
+        }
+        // Make sure the swap and every removal fit before sending anything,
+        // so the engine never sees half an update.
+        if self.commands.slots() < 1 + self.pending_removals.len() {
+            return Err(LoomError::QueueFull);
+        }
+        let (schedule, report) = compile(&self.graph, self.config.max_block);
+        // Order matters: swap first (the new schedule no longer uses the
+        // removed slots), then remove the instances.
+        let pushed = self.commands.push(Command::SwapSchedule(Box::new(schedule))).is_ok()
+            && self
+                .pending_removals
+                .iter()
+                .all(|&slot| self.commands.push(Command::RemoveModule { slot }).is_ok());
+        debug_assert!(pushed, "capacity was checked above");
+        self.free_slots.append(&mut self.pending_removals);
+        self.dirty = false;
+        self.last_report = report;
+        Ok(&self.last_report)
+    }
+
+    /// Frees memory the engine has handed back. Called automatically by
+    /// edits and commits. Call it now and then when idle.
+    pub fn collect_garbage(&mut self) {
+        while let Ok(garbage) = self.garbage.pop() {
+            drop(garbage);
+        }
+    }
+
+    fn node(&self, id: ModuleId) -> Result<&Node, LoomError> {
+        self.graph.nodes.get(&id).ok_or(LoomError::UnknownModule(id))
+    }
+
+    fn check_output(&self, output: OutputRef) -> Result<(), LoomError> {
+        let node = self.node(output.module)?;
+        if output.port >= node.descriptor.outputs.len() {
+            return Err(LoomError::NoSuchPort {
+                module: output.module,
+                direction: "output",
+                port: output.port.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_input(&self, input: InputRef) -> Result<(), LoomError> {
+        let node = self.node(input.module)?;
+        if input.port >= node.descriptor.inputs.len() {
+            return Err(LoomError::NoSuchPort {
+                module: input.module,
+                direction: "input",
+                port: input.port.to_string(),
+            });
+        }
+        Ok(())
+    }
+}

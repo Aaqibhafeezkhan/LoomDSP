@@ -17,8 +17,8 @@ Why we use them: contributors (human and AI) need to know *why* the code looks t
 | ADR | Title | Status |
 |---|---|---|
 | [0000](0000-template.md) | Template | n/a |
-| [0001](0001-lock-free-control-audio-boundary.md) | Lock-free boundary between control and audio threads | Proposed |
-| [0002](0002-graph-execution-and-feedback.md) | Graph execution model and sample-accurate feedback | Accepted (confirm in P0) |
+| [0001](0001-lock-free-control-audio-boundary.md) | Lock-free boundary between control and audio threads | Accepted |
+| [0002](0002-graph-execution-and-feedback.md) | Graph execution model and sample-accurate feedback | Accepted |
 | [0003](0003-single-worklet-web-runtime.md) | One WASM instance per patch in a single AudioWorklet | Deferred (web target) |
 | [0004](0004-export-as-runtime-plus-patch-data.md) | Export plugins as a prebuilt runtime plus patch data | Proposed |
 | [0005](0005-rust-end-to-end.md) | Rust end to end | Accepted |

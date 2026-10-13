@@ -1,0 +1,19 @@
+[package]
+name = "loom-host-desktop"
+description = "Desktop audio and MIDI host for the LoomDSP engine (cpal, midir)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-rt.workspace = true
+cpal.workspace = true
+midir.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

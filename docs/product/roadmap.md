@@ -37,16 +37,16 @@ Scope:
 - Offline renderer (FR-GRAPH-06).
 - CLI: `loom play patch.ron`, `loom render patch.ron out.wav`.
 - CI: tests, `assert_no_alloc`, WASM build check, `cargo-deny` licence check.
-- UI spike (OQ-02): Iced with `iced_nodegraph`, 100 nodes, cables, pan and zoom, a live scope.
+- UI spike (OQ-02): Iced with `iced_nodegraph`, 100 nodes, cables, pan and zoom, a live scope. (Done without the scope, which needs the P1 telemetry path.)
 - Repository basics: `CONTRIBUTING.md`, AI contribution policy, agent context file, issue templates.
 
 Exit criteria:
-- [ ] A patch file plays through the default audio device with live MIDI input.
-- [ ] Adding and removing modules from a test script while audio plays causes zero dropouts over 10 minutes.
-- [ ] Feedback benchmark results recorded. ADR-0002 confirmed or revised.
-- [ ] Offline renders are bit-identical across runs.
-- [ ] UI spike results recorded. ADR-0009 accepted or revised.
-- [ ] NFR *(proposal)* numbers reviewed against real benchmarks.
+- [x] A patch file plays through the default audio device with live MIDI input. (`loom play`; confirm on the reference machine.)
+- [ ] Adding and removing modules from a test script while audio plays causes zero dropouts over 10 minutes. (`loom stress --seconds 600`; offline version passes, live run on the reference machine pending.)
+- [x] Feedback benchmark results recorded. ADR-0002 confirmed ([p0-engine.md](../benchmarks/p0-engine.md)).
+- [x] Offline renders are bit-identical across runs, and across host buffer sizes.
+- [ ] UI spike results recorded. ADR-0009 accepted or revised. (Spike done; GPU frame rate on the reference machine pending.)
+- [ ] NFR *(proposal)* numbers reviewed against real benchmarks. (Engine numbers well inside NFR-PERF-01; UI numbers pending.)
 
 ## P1. Desktop patcher and live basics
 
@@ -65,7 +65,7 @@ Scope:
 Exit criteria:
 - [ ] Tutorial: build a subtractive synth from primitives in under 20 minutes (tested with 3 people who did not write the tutorial).
 - [ ] Play that synth with a MIDI keyboard and map 4 knobs with MIDI learn.
-- [ ] An FM feedback patch sounds the same at buffer sizes 32 and 1024.
+- [x] An FM feedback patch sounds the same at buffer sizes 32 and 1024. (Already true in the P0 engine; covered by tests.)
 - [ ] Unplugging and replugging the MIDI controller during playback works without a restart.
 - [ ] UI holds 60 fps with 300 modules.
 

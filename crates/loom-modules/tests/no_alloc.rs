@@ -1,0 +1,58 @@
+//! NFR-RT-06: the audio path must never allocate or free.
+//!
+//! This test binary installs an allocator that aborts if any allocation or
+//! deallocation happens inside `assert_no_alloc`. Every call to
+//! `Engine::process` runs inside it, while the control side edits the graph
+//! between buffers (where allocation is allowed).
+//!
+//! The check is active in debug builds, which is how `cargo test` runs.
+
+mod common;
+
+use assert_no_alloc::{AllocDisabler, assert_no_alloc};
+use common::*;
+use loom_core::MidiEvent;
+
+#[global_allocator]
+static ALLOCATOR: AllocDisabler = AllocDisabler;
+
+#[test]
+fn audio_thread_never_allocates() {
+    for patch in [
+        "sine.ron",
+        "subtractive.ron",
+        "fm-feedback.ron",
+        "fm-feedback-delay1.ron",
+    ] {
+        let mut parts = load(patch);
+        let mut left = vec![0.0; 1024];
+        let mut right = vec![0.0; 1024];
+        let mut extra = Vec::new();
+        for i in 0..400usize {
+            // Control thread: allocation allowed here.
+            if i % 7 == 0 {
+                let id = parts.controller.add_module("loom.filter.svf").unwrap();
+                parts.controller.connect_named(id, "lowpass", id, "in").unwrap();
+                extra.push(id);
+            }
+            if i % 11 == 0
+                && let Some(id) = extra.pop()
+            {
+                parts.controller.remove_module(id).unwrap();
+            }
+            parts.controller.commit().unwrap();
+            if i % 50 == 0 {
+                parts.midi.send(MidiEvent::note_on(3, 0, 60 + (i % 12) as u8, 90));
+            }
+            if i % 50 == 25 {
+                parts.midi.send(MidiEvent::note_off(0, 0, 60 + ((i - 25) % 12) as u8));
+            }
+            let frames = [1, 32, 128, 129, 1024][i % 5];
+
+            // Audio thread: no allocation allowed.
+            assert_no_alloc(|| {
+                parts.engine.process(&mut left[..frames], &mut right[..frames]);
+            });
+        }
+    }
+}
