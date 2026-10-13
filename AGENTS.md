@@ -13,6 +13,8 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+cargo deny check                       # licences and advisories
+typos                                  # spelling
 cargo bench -p loom-modules
 cargo run --release -p loom-cli -- check examples/patches/fm-feedback.ron
 cargo run --release -p loom-cli -- render examples/patches/subtractive.ron -o /tmp/out.wav --note 60
@@ -26,6 +28,8 @@ cargo run --release -p loom-cli -- render examples/patches/subtractive.ron -o /t
 - **Modules** implement `Module::process` over a `PortIo`. Their ports and parameters are described by a static `ModuleDescriptor`. Unconnected inputs read zeros; use `io.is_connected(i)` for fallbacks.
 - **Signals** (ADR-0007). Every cable is `f32` at the sample rate. Types are hints only. Pitch is 0.1 per octave, 0.0 = middle C. Gates are high above 0.5. "1.0 = 10 V" for Eurorack users.
 - **Patches** (ADR-0008) are RON files, loaded by `loom-patch`.
+
+Before finishing a change, run fmt, clippy (with `-D warnings`), and tests. CI runs the full list in CONTRIBUTING.md.
 
 ## Hard rules
 

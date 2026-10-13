@@ -1,5 +1,7 @@
 # LoomDSP
 
+[![CI](https://github.com/brylie/LoomDSP/actions/workflows/ci.yml/badge.svg)](https://github.com/brylie/LoomDSP/actions/workflows/ci.yml)
+
 An open-source modular audio environment written in Rust, for musical experimentation and live performance.
 
 Build instruments and effects by connecting small DSP modules. Hide the wiring behind a front panel. Play it live with MIDI controllers. Later, export it as a plugin (CLAP, VST3) or a standalone app.

@@ -23,7 +23,25 @@ cargo fmt --all --check
 cargo bench -p loom-modules          # optional, takes a few minutes
 ```
 
-CI also checks that the engine core builds for WebAssembly and that every dependency has an allowed licence (`cargo deny check`).
+### What CI checks
+
+Every pull request runs these jobs. All must pass before merging (the "CI success" check).
+
+| Job | What it checks | Run it locally |
+|---|---|---|
+| Format | `rustfmt` style | `cargo fmt --all --check` |
+| Clippy | Lint groups set in the workspace `Cargo.toml`: correctness, suspicious, complexity, perf, style, cargo | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Test | All tests on Linux, macOS (Apple Silicon), and Windows, plus benchmarks compile | `cargo test --workspace` |
+| Coverage | Line coverage, shown in the job summary | `cargo llvm-cov --workspace` (install [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov)) |
+| Docs | API docs build without warnings | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
+| MSRV | Still builds with Rust 1.88 | `cargo +1.88 check --workspace` |
+| WebAssembly | Engine crates build for `wasm32-unknown-unknown` | `cargo build --target wasm32-unknown-unknown -p loom-core -p loom-modules -p loom-patch -p loom-rt` |
+| Licences | Only permissive licences, no known vulnerabilities | `cargo deny check` (install [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)) |
+| Spelling | Typos in code and docs | `typos` (install [typos-cli](https://github.com/crate-ci/typos)) |
+
+Why warnings fail CI but not your local build: a warning while you are still editing is noise, but a warning on `main` is a problem someone else inherits.
+
+The UI spike in `spikes/` builds in a separate workflow, only when its files change. Dependabot opens weekly pull requests for dependency updates.
 
 ## Rules for audio code
 
