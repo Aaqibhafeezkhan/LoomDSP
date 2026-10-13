@@ -1,6 +1,6 @@
-# ADR-0009: UI stack: Iced with iced_nodegraph
+# ADR-0009: UI stack: Iced (canvas decided in ADR-0010)
 
-- **Status:** Proposed. P0 spike done (see Spike results); GPU frame-rate measurement on real hardware still pending.
+- **Status:** Accepted in part (2026-10-13): Iced is accepted for the application UI. Both ready-made node editors are rejected for the patch canvas; see ADR-0010.
 - **Date:** 2026-10-13
 - **Related requirements:** FR-CANVAS-*, FR-PANEL-*, FR-VIS-*, NFR-PERF-04, OQ-02, OQ-12, OQ-13, OQ-14
 
@@ -61,5 +61,30 @@ Decision: proceed with Iced and `iced_nodegraph` for P1, unless the real-hardwar
 ## Consequences
 
 - One GPU-backed UI stack for the editor, panels, and plugin GUIs.
-- Iced also targets WebGPU in browsers, which keeps the optional web target (P5) possible without a second UI.
+- Iced also targets WebGPU in browsers, which keeps the optional, deferred web target possible without a second UI.
 - We depend on a young crate and a pre-1.0 framework. Version pinning and a wrapper layer reduce the risk (OQ-12, OQ-14).
+
+## Final decision (2026-10-13)
+
+Two spikes were measured on the reference laptop (Apple M1-family GPU, built-in Retina display):
+
+| | iced_nodegraph | egui-snarl |
+|---|---|---|
+| 300 modules, full window, Retina | 22 to 24 fps | Not measured |
+| 8 modules, full window, Retina | 40 fps | Not measured |
+| 300 modules, same window, 1x external display | about 70 fps | Not measured |
+| Look | Good | Poor (egui's stock look) |
+
+Findings:
+
+1. **Iced itself performed well.** Building the view took under 1 ms. Iced's layout and text work were about 13% of the main thread. A CPU cost in the spike's own pin styling (theme colours recomputed per pin per frame) was found with samply and fixed with a small cache.
+2. **iced_nodegraph is limited by GPU fill rate.** Its signed-distance-field renderer costs GPU time per physical pixel. On Retina (4x the pixels of a 1x display at the same window size) it reaches 24 fps with 300 modules and 40 fps with 8. A quarter-size window, or the same window on a 1x display, reaches 60 to 70 fps.
+3. **egui-snarl's look is far from the polish we want** (the Bitwig Grid is the reference), and its own-copy graph model fits our `Controller` poorly.
+
+Decision:
+
+- **Accepted:** Iced for the application UI (windows, inspector, browser, panels, theming, text).
+- **Rejected for the patch canvas:** iced_nodegraph and egui-snarl.
+- **The canvas** will be our own Iced widget (ADR-0010).
+
+Full measurements and profiles: [spikes/ui-nodegraph](../../spikes/ui-nodegraph/README.md), [spikes/ui-snarl](../../spikes/ui-snarl/README.md).
