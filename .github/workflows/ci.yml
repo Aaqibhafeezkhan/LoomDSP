@@ -4,10 +4,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly run catches new security advisories and toolchain breakage even
+  # when nobody pushes.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+# A newer push to the same branch or PR cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Warnings fail CI. Locally they stay warnings for a fast edit loop.
   RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   fmt:
@@ -30,7 +45,8 @@ jobs:
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Lint groups are configured in the workspace Cargo.toml.
+      - run: cargo clippy --workspace --all-targets
 
   test:
     name: Test (${{ matrix.os }})
@@ -38,6 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macos-latest is Apple Silicon, so this also covers aarch64.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
@@ -45,19 +62,75 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
-      # Debug build: the no-allocation test is only active with debug assertions.
+      # Debug build on purpose: the no-allocation test (NFR-RT-06) is only
+      # active with debug assertions.
       - run: cargo test --workspace
-      - run: cargo bench -p loom-modules --no-run
+      - name: Benchmarks compile
+        run: cargo bench -p loom-modules --no-run
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    # Job-level, so the Codecov step's `if` can see it.
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # The CLI and desktop host need audio hardware, so they are measured
+      # but not expected to be covered by unit tests.
+      - name: Measure coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Coverage summary
+        run: |
+          {
+            echo '## Test coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+      # Optional: set the CODECOV_TOKEN repository secret to publish reports
+      # and PR comments on codecov.io. Without it, this step is skipped.
+      - name: Upload to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  docs:
+    name: Docs (NFR-OSS-03)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
 
   msrv:
-    name: Minimum Rust version
+    name: Minimum Rust version (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      # Library and binary code only: dev-dependencies (benchmarks) may need
+      # a newer compiler, and users never build them.
       - run: cargo check --workspace
+        env:
+          RUSTFLAGS: ""
 
   wasm:
     name: WebAssembly build (NFR-PORT-01)
@@ -76,3 +149,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  typos:
+    name: Spelling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1
+
+  # One check to mark as "required" in branch protection, instead of
+  # listing every job. Fails if any job above failed or was cancelled.
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [fmt, clippy, test, coverage, docs, msrv, wasm, deny, typos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'

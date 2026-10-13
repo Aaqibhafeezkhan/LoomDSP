@@ -1,0 +1,41 @@
+name: Spikes
+
+# The UI spike has a large GUI dependency tree, so it only builds when its
+# own files (or the crates it uses) change.
+on:
+  pull_request:
+    paths:
+      - "spikes/**"
+      - "crates/**"
+      - ".github/workflows/spikes.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  ui-nodegraph:
+    name: UI spike builds
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spikes/ui-nodegraph
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/ui-nodegraph
+      - run: cargo fmt --check
+      - run: cargo clippy

@@ -1,0 +1,21 @@
+# Weekly dependency update PRs. CI (including cargo-deny's licence check)
+# runs on each one, so a new dependency version with a copyleft licence is
+# caught before merging.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR for all patch and minor updates, to keep the noise down.
+      rust-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
