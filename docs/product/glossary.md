@@ -12,10 +12,18 @@
 | **Encapsulation** | Collapsing part of a patch into a sub-patch with its own ports and panel. |
 | **Engine** | The Rust code that runs a patch and produces audio. The same engine runs in every target. |
 | **Front panel** | The user-facing control surface of a patch or sub-patch. Separate from the cable view. |
+| **Grid** | LoomDSP's patch canvas, where every feature is a module. Named after the idea in Bitwig Studio's Grid. |
 | **Gate** | A signal used as on/off. Values above 0.5 are high. |
+| **Group** | A set of loopers or other playable modules that take turns according to their next action. |
+| **Inspector** | The side panel that shows every parameter of the selected module. Tiles on the canvas show only key controls. |
+| **Living musical system** | A patch that plays, evolves, and arranges itself through modulation, randomness, sequencing, looping, and logic. What LoomDSP is for. |
+| **Looper** | A module that records and plays a loop of audio or MIDI, synced to the clock. |
 | **Lock-free** | Code that lets threads communicate without one thread waiting for another to release a lock. |
+| **Module view** | A custom display drawn inside a module's tile on the canvas: scope, step grid, envelope shape, clip lane. |
 | **Modulation** | Changing a parameter over time with another signal (LFO, envelope, MIDI). |
 | **Module** | One DSP unit on the canvas, such as an oscillator or filter. Built-in or from the SDK. |
+| **Next action** | What a group does when a member finishes its loop: play the next member, a random one, or follow an input. Taken from Bitwig's clip launcher, but patchable. |
+| **Note effect** | A module that transforms notes rather than audio: arpeggiator, chord, transpose, quantise. |
 | **Panic (MIDI)** | An action that silences all voices and clears stuck notes. Not the same as a Rust `panic!`. |
 | **Patch** | A complete graph of modules, cables, sub-patches, panels, and settings. Saved as one file. |
 | **Performance mode** | A locked view that shows only the front panel, for live use. |
@@ -24,8 +32,11 @@
 | **Polymorphic signal** | A signal that can connect to any input, whatever its type. Types only change colour and default ranges. |
 | **Polyphony** | Playing several notes at once. Each note uses its own voice. |
 | **Port** | An input or output point on a module. |
+| **Polymetric** | Patterns of different lengths playing together, so they shift against each other over time. |
+| **Round robin** | Playing the members of a group one after another, then starting again. |
 | **Real-time safe** | Code that always finishes in a bounded time. No allocation, locks, or system calls. |
 | **RON** | Rusty Object Notation. A text format that maps directly to Rust data types through Serde. Used for patch files. |
+| **Scene** | A stored state of chosen modules, recalled by a trigger, optionally with a morph. |
 | **Schedule** | The ordered list of module calls the engine runs each block. Built on a control thread. |
 | **SharedArrayBuffer (SAB)** | Browser memory that the main thread and the audio thread can both read and write. |
 | **SIMD** | Single Instruction, Multiple Data. One CPU instruction processes several values at once. |

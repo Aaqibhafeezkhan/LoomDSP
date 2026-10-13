@@ -1,0 +1,19 @@
+[package]
+name = "loom-core"
+description = "LoomDSP engine core: module API, runtime-editable DSP graph, and real-time engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords = ["audio", "dsp", "modular", "synthesizer", "realtime"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+rtrb.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

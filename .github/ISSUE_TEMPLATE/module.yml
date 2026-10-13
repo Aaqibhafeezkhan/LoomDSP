@@ -1,0 +1,27 @@
+name: New module
+description: Propose a new DSP module for the built-in library.
+labels: [feature, "area:modules"]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Module name and ID
+      description: For example "Wavefolder", loom.shaper.fold
+    validations:
+      required: true
+  - type: textarea
+    id: purpose
+    attributes:
+      label: What does it do, and why is it useful?
+    validations:
+      required: true
+  - type: textarea
+    id: ports
+    attributes:
+      label: Inputs, outputs, and parameters
+      description: Names, signal types (audio, modulation, pitch, phase, gate), and ranges.
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Papers, articles, or permissively licensed code that describe the algorithm. No GPL code, please.

@@ -1,0 +1,28 @@
+[package]
+name = "loom-cli"
+description = "LoomDSP command-line tool: play, render, check, and stress-test patches."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords = ["audio", "synthesizer", "modular", "midi", "dsp"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+loom-core.workspace = true
+loom-modules.workspace = true
+loom-patch.workspace = true
+loom-host-desktop.workspace = true
+loom-rt.workspace = true
+clap.workspace = true
+hound.workspace = true
+
+[lints]
+workspace = true

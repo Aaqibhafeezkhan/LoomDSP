@@ -1,0 +1,8 @@
+# Development tools for LoomDSP. Run `mise install` once per clone.
+[tools]
+rust = "latest"
+# Git hook runner (see prek.toml).
+prek = "latest"
+# Used by the prek hooks and by CI.
+"aqua:crate-ci/typos" = "latest"
+"aqua:EmbarkStudios/cargo-deny" = "latest"

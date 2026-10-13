@@ -1,0 +1,25 @@
+name: Bug report
+description: Something does not work or sounds wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, commands, or a patch file (paste the .ron text) that shows the problem.
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, audio interface, and buffer size if relevant.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit

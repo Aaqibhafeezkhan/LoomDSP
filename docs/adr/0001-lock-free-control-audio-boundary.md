@@ -1,6 +1,6 @@
 # ADR-0001: Lock-free boundary between control and audio threads
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented in P0)
 - **Date:** 2026-10-13
 - **Related requirements:** NFR-RT-01 to 07, FR-GRAPH-01, FR-GRAPH-02, NFR-WEB-01, NFR-WEB-02
 
@@ -30,3 +30,11 @@ Use option 2, with triple buffering only for large telemetry (scopes, spectra).
 - All message types must be fixed-size and `Copy`. Large data (wavetables) is passed by pointer to memory allocated on the control thread.
 - We need a deferred-free mechanism. Memory leaks are possible if the return queue is not drained, so tests must check this.
 - Prefer existing crates (for example `rtrb`, `basedrop`, or `arc-swap` patterns) over custom code where they meet the requirements and licence rules.
+
+## Implementation (P0)
+
+- Queues: `rtrb` (MIT/Apache-2.0). Three queues: commands (control to audio), garbage (audio to control), and MIDI (MIDI thread to audio).
+- Module instances live in a fixed array of engine slots, allocated once. A new module is created on the control thread and moved into a free slot. Removed modules are moved back through the garbage queue.
+- The garbage queue has the same capacity as the command queue, and the controller drains it before sending, so it cannot overflow in practice. If it ever does, the engine leaks the object instead of freeing it, and counts the leak in `EngineStats`.
+- The controller checks there is room for a schedule swap and all of its removals before sending any of them, so the engine never sees half an update.
+- A test runs the engine under `assert_no_alloc` with edits between buffers (NFR-RT-06).

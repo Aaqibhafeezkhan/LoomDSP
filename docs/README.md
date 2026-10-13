@@ -22,6 +22,13 @@ Status: **Draft v0.1** (2026-10-13). Everything here is open for discussion.
 |---|---|
 | [ADR index](adr/README.md) | Architecture Decision Records and how to write them |
 
+## Benchmarks
+
+| Document | Purpose |
+|---|---|
+| [Phase 0 engine](benchmarks/p0-engine.md) | Feedback loop cost, example patch cost, live and offline stress results |
+| [Phase 0 UI spikes](benchmarks/p0-ui-spikes.md) | Iced + iced_nodegraph and egui-snarl, measured on the reference laptop |
+
 ## How to read requirement IDs
 
 Each requirement has an ID such as `FR-GRAPH-03` or `NFR-RT-01`.

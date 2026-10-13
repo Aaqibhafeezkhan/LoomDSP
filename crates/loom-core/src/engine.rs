@@ -1,0 +1,305 @@
+//! The audio-thread side of the engine.
+//!
+//! Real-time rules (NFR-RT-01): nothing in this file allocates, frees, locks,
+//! or waits once the engine is running. Memory arrives pre-allocated through
+//! the command queue and leaves through the garbage queue.
+
+use crate::compile::{ModuleOp, Schedule, Step};
+use crate::midi::MidiEvent;
+use crate::module::{Module, PortIo, ProcessContext};
+use rtrb::{Consumer, Producer};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Engine settings, fixed for the engine's lifetime.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineConfig {
+    /// Sample rate in Hz.
+    pub sample_rate: f32,
+    /// Internal block size. Host buffers of any size are split into blocks of
+    /// at most this many frames.
+    pub max_block: usize,
+    /// Maximum number of DSP module instances.
+    pub max_modules: usize,
+    /// Capacity of the control-to-audio command queue.
+    pub command_capacity: usize,
+    /// Capacity of the MIDI input queue and per-buffer MIDI event list.
+    pub midi_capacity: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            max_block: 128,
+            max_modules: 1024,
+            command_capacity: 1024,
+            midi_capacity: 1024,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Default settings at the given sample rate.
+    pub fn with_sample_rate(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            ..Self::default()
+        }
+    }
+}
+
+/// Counters the engine updates and the control thread reads.
+#[derive(Debug, Default)]
+pub struct EngineStats {
+    /// Buffers processed.
+    pub buffers: AtomicU64,
+    /// Schedules swapped in.
+    pub schedule_swaps: AtomicU64,
+    /// MIDI events dropped because the per-buffer list was full.
+    pub dropped_midi: AtomicU64,
+    /// Objects the engine could not return for freeing (garbage queue full).
+    /// They are leaked rather than freed on the audio thread.
+    pub leaked: AtomicU64,
+}
+
+pub(crate) enum Command {
+    InsertModule { slot: usize, module: Box<dyn Module> },
+    RemoveModule { slot: usize },
+    SwapSchedule(Box<Schedule>),
+    SetParam { slot: usize, index: usize, value: f32 },
+    ResetModule { slot: usize },
+}
+
+pub(crate) enum Garbage {
+    Module(#[allow(dead_code)] Box<dyn Module>),
+    Schedule(#[allow(dead_code)] Box<Schedule>),
+}
+
+/// The audio-thread half of the engine. Call [`Engine::process`] from the
+/// audio callback.
+pub struct Engine {
+    slots: Box<[Option<Box<dyn Module>>]>,
+    schedule: Box<Schedule>,
+    commands: Consumer<Command>,
+    garbage: Producer<Garbage>,
+    midi_in: Consumer<MidiEvent>,
+    midi: Vec<MidiEvent>,
+    config: EngineConfig,
+    stats: Arc<EngineStats>,
+}
+
+impl Engine {
+    pub(crate) fn new(
+        config: EngineConfig,
+        commands: Consumer<Command>,
+        garbage: Producer<Garbage>,
+        midi_in: Consumer<MidiEvent>,
+        stats: Arc<EngineStats>,
+    ) -> Self {
+        Self {
+            slots: (0..config.max_modules).map(|_| None).collect(),
+            schedule: Box::new(Schedule::empty()),
+            commands,
+            garbage,
+            midi_in,
+            midi: Vec::with_capacity(config.midi_capacity),
+            config,
+            stats,
+        }
+    }
+
+    /// Engine settings.
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// Renders `left.len()` frames (both slices must have the same length).
+    ///
+    /// Applies pending changes first, at this buffer boundary (FR-GRAPH-02).
+    /// MIDI events are stamped relative to the start of this buffer.
+    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let frames = left.len().min(right.len());
+        self.apply_commands();
+        self.collect_midi(frames);
+
+        left[..frames].fill(0.0);
+        right[..frames].fill(0.0);
+
+        let mut position = 0;
+        while position < frames {
+            let n = (frames - position).min(self.config.max_block);
+            self.run_block(
+                position,
+                n,
+                &mut left[position..position + n],
+                &mut right[position..position + n],
+            );
+            position += n;
+        }
+        self.stats.buffers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn apply_commands(&mut self) {
+        while let Ok(command) = self.commands.pop() {
+            match command {
+                Command::InsertModule { slot, module } => {
+                    if let Some(old) = self.slots[slot].replace(module) {
+                        self.discard(Garbage::Module(old));
+                    }
+                }
+                Command::RemoveModule { slot } => {
+                    if let Some(old) = self.slots[slot].take() {
+                        self.discard(Garbage::Module(old));
+                    }
+                }
+                Command::SwapSchedule(mut schedule) => {
+                    schedule.take_tap_state_from(&self.schedule);
+                    let old = std::mem::replace(&mut self.schedule, schedule);
+                    self.discard(Garbage::Schedule(old));
+                    self.stats.schedule_swaps.fetch_add(1, Ordering::Relaxed);
+                }
+                Command::SetParam { slot, index, value } => {
+                    if let Some(module) = self.slots[slot].as_mut() {
+                        module.set_param(index, value);
+                    }
+                }
+                Command::ResetModule { slot } => {
+                    if let Some(module) = self.slots[slot].as_mut() {
+                        module.reset();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hands memory back to the control thread for freeing.
+    fn discard(&mut self, garbage: Garbage) {
+        if let Err(rtrb::PushError::Full(garbage)) = self.garbage.push(garbage) {
+            // Never free on the audio thread. Leaking is the lesser evil, and
+            // the counter makes it visible. The garbage queue has the same
+            // capacity as the command queue, so this should not happen.
+            std::mem::forget(garbage);
+            self.stats.leaked.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn collect_midi(&mut self, frames: usize) {
+        self.midi.clear();
+        let last = frames.saturating_sub(1) as u32;
+        while let Ok(mut event) = self.midi_in.pop() {
+            if self.midi.len() == self.midi.capacity() {
+                self.stats.dropped_midi.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            event.frame = event.frame.min(last);
+            // Insertion sort by frame (stable). Lists are short, and this
+            // keeps the audio thread free of allocation.
+            let at = self.midi.partition_point(|e| e.frame <= event.frame);
+            self.midi.insert(at, event);
+        }
+    }
+
+    fn run_block(&mut self, position: usize, frames: usize, left: &mut [f32], right: &mut [f32]) {
+        let sample_rate = self.config.sample_rate;
+        let midi = &self.midi[..];
+        let slots = &mut self.slots;
+        let Schedule {
+            input_ptrs,
+            output_ptrs,
+            ops,
+            taps,
+            loop_ops,
+            loop_taps,
+            steps,
+            outputs,
+            ..
+        } = &mut *self.schedule;
+
+        let mut run_op = |op: &ModuleOp, offset: usize, len: usize| {
+            if let Some(module) = slots[op.slot as usize].as_mut() {
+                let ctx = ProcessContext {
+                    sample_rate,
+                    midi,
+                    midi_base: position + offset,
+                    frames: len,
+                };
+                // SAFETY: the compiler gives every output its own buffer of
+                // `max_block` floats. Inputs point at other modules' outputs,
+                // a unit delay buffer, or the zero buffer. Cycles always pass
+                // through a unit delay, so no module reads its own output.
+                // `offset + len <= frames <= max_block`.
+                let mut io = unsafe {
+                    PortIo::new(
+                        &input_ptrs[op.inputs.0 as usize..op.inputs.1 as usize],
+                        &output_ptrs[op.outputs.0 as usize..op.outputs.1 as usize],
+                        op.connected,
+                        offset,
+                        len,
+                    )
+                };
+                module.process(&ctx, &mut io);
+            }
+        };
+
+        for step in steps.iter() {
+            match *step {
+                Step::Module(op) => run_op(&ops[op as usize], 0, frames),
+                Step::Tap(t) => {
+                    let tap = &mut taps[t as usize];
+                    // SAFETY: unit delay buffers are `max_block` long, and the
+                    // input and output buffers are distinct.
+                    unsafe {
+                        let input = std::slice::from_raw_parts(tap.input, frames);
+                        let output = std::slice::from_raw_parts_mut(tap.output, frames);
+                        output[0] = tap.state;
+                        output[1..].copy_from_slice(&input[..frames - 1]);
+                        tap.state = input[frames - 1];
+                    }
+                }
+                Step::Loop {
+                    ops: op_range,
+                    taps: tap_range,
+                } => {
+                    let region_ops = &loop_ops[op_range.0 as usize..op_range.1 as usize];
+                    let region_taps = &loop_taps[tap_range.0 as usize..tap_range.1 as usize];
+                    for i in 0..frames {
+                        // Unit delays emit last sample's value first...
+                        for &t in region_taps {
+                            let tap = &taps[t as usize];
+                            // SAFETY: `i < frames <= max_block`.
+                            unsafe { *tap.output.add(i) = tap.state };
+                        }
+                        // ...then the loop's modules run for one sample...
+                        for &op in region_ops {
+                            run_op(&ops[op as usize], i, 1);
+                        }
+                        // ...then unit delays capture this sample's value.
+                        for &t in region_taps {
+                            let tap = &mut taps[t as usize];
+                            // SAFETY: `i < frames <= max_block`.
+                            tap.state = unsafe { *tap.input.add(i) };
+                        }
+                    }
+                }
+            }
+        }
+
+        for output in outputs.iter() {
+            // SAFETY: output pointers reference schedule buffers of
+            // `max_block` floats.
+            let (l, r) = unsafe {
+                (
+                    std::slice::from_raw_parts(output.left, frames),
+                    std::slice::from_raw_parts(output.right, frames),
+                )
+            };
+            for (out, value) in left.iter_mut().zip(l) {
+                *out += value;
+            }
+            for (out, value) in right.iter_mut().zip(r) {
+                *out += value;
+            }
+        }
+    }
+}

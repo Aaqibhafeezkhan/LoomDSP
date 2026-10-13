@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/loom-rt",
+    "crates/loom-core",
+    "crates/loom-modules",
+    "crates/loom-patch",
+    "crates/loom-host-desktop",
+    "crates/loom-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/brylie/LoomDSP"
+authors = ["LoomDSP contributors"]
+readme = "README.md"
+
+[workspace.dependencies]
+loom-rt = { path = "crates/loom-rt", version = "0.1.0" }
+loom-core = { path = "crates/loom-core", version = "0.1.0" }
+loom-modules = { path = "crates/loom-modules", version = "0.1.0" }
+loom-patch = { path = "crates/loom-patch", version = "0.1.0" }
+loom-host-desktop = { path = "crates/loom-host-desktop", version = "0.1.0" }
+
+rtrb = "0.4"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+hound = "3.5"
+cpal = "0.18"
+midir = "0.11"
+clap = { version = "4.6", features = ["derive"] }
+assert_no_alloc = "1.1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+# Clippy lint groups, set explicitly so the policy is visible and versioned.
+# Groups use priority -1 so single lints below can override them.
+# Locally these are warnings (fast feedback while editing); CI runs with
+# `-D warnings`, so nothing reaches main with a warning.
+[workspace.lints.clippy]
+# Code that is outright wrong. Always an error, even locally.
+correctness = { level = "deny", priority = -1 }
+# Code that is very likely wrong or useless.
+suspicious = { level = "warn", priority = -1 }
+# Code that does something simple in a complex way.
+complexity = { level = "warn", priority = -1 }
+# Code that could run faster. Matters on the audio thread.
+perf = { level = "warn", priority = -1 }
+# Code that is not idiomatic Rust.
+style = { level = "warn", priority = -1 }
+# Cargo.toml hygiene: metadata needed for publishing, no wildcard versions.
+cargo = { level = "warn", priority = -1 }
+# Duplicate versions come from deep inside third-party crates (cpal, midir),
+# where we cannot fix them. `cargo deny check` still reports them.
+multiple_crate_versions = "allow"
+# Every `unsafe` block needs a `// SAFETY:` comment (AGENTS.md rule 7).
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = 1
+
+[profile.bench]
+debug = 1

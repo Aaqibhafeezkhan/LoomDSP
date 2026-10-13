@@ -1,0 +1,5 @@
+# Spell-check configuration for the `typos` CI job.
+[files]
+# Generated files: hashes and crate names, not prose.
+# Third-party agent skills vendored into .agents/ are not ours to fix.
+extend-exclude = ["*.lock", "*.png", "target/", ".agents/"]

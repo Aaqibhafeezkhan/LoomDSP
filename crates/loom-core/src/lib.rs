@@ -1,0 +1,39 @@
+//! LoomDSP engine core.
+//!
+//! The crate is split along the thread boundary described in ADR-0001:
+//!
+//! - [`Controller`] lives on a control thread (UI, CLI, patch loader). It owns
+//!   the editable [`Graph`], compiles it into an execution schedule, and sends
+//!   changes to the engine. It may allocate and block.
+//! - [`Engine`] lives on the audio thread. It runs the current schedule and
+//!   applies changes at block boundaries. It never allocates, frees, locks,
+//!   or waits.
+//!
+//! They talk through bounded single-producer, single-consumer queues.
+//!
+//! The core has no threads of its own and no audio or file I/O, so it builds
+//! for any target, including `wasm32-unknown-unknown` (NFR-PORT-01, 02).
+
+#![warn(missing_docs)]
+
+mod compile;
+mod controller;
+mod descriptor;
+mod engine;
+mod error;
+mod graph;
+mod midi;
+mod module;
+mod registry;
+pub mod signal;
+
+pub use compile::{CompileReport, FeedbackLoop};
+pub use controller::{Controller, EngineParts, MidiSender, create_engine};
+pub use descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole, ParamSpec, PortSpec};
+pub use engine::{Engine, EngineConfig, EngineStats};
+pub use error::LoomError;
+pub use graph::{Graph, InputRef, ModuleId, Node, OutputRef};
+pub use midi::{MidiEvent, MidiMessage};
+pub use module::{Module, PortIo, ProcessContext, testing};
+pub use registry::{ModuleKind, Registry};
+pub use signal::SignalType;

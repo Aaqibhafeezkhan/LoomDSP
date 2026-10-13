@@ -1,6 +1,6 @@
 # ADR-0002: Graph execution model and sample-accurate feedback
 
-- **Status:** Accepted, to be confirmed by P0 benchmarks (NFR-PERF-08)
+- **Status:** Accepted. Confirmed by P0 benchmarks (see Validation).
 - **Date:** 2026-10-13
 - **Related requirements:** FR-GRAPH-03, FR-GRAPH-04, FR-ENCAP-07, NFR-PERF-01, NFR-PERF-02, NFR-PERF-08
 
@@ -40,3 +40,10 @@ Modules implement both a block `process` and a single-sample `tick`, or provide 
 ## Validation
 
 P0 benchmarks measure CPU cost for feedback loops containing 1, 10, and 50 modules, compared with the same modules in an acyclic chain. If per-sample overhead inside loops is too high, consider batching small sub-blocks inside the loop where the loop delay allows it, or code generation (option 4) for hot loops.
+
+Result (2026-10-13, [p0-engine.md](../benchmarks/p0-engine.md)): per-sample mode adds about 5 to 15 ns per module per sample. A 50-filter loop uses 12% of one core's real-time budget. The model is kept.
+
+Implementation notes:
+
+- Modules have a single `process` entry point. Inside loops the engine calls it with one frame, so no separate `tick` method is needed. The requirement is that modules are block-size invariant, which the test suite checks.
+- When the compiler must insert delays, it picks the module with the fewest unresolved inputs (lowest ID on ties) and delays those inputs. The choice is deterministic, and `loom check` shows it.
