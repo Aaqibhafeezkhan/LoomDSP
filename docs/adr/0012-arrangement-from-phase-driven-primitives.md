@@ -104,3 +104,9 @@ User abstractions use exactly the same format as built-in ones. Saved and shared
 - **Arrangement loops are feedback loops.** End → counter → select → play forms a cycle in the graph. The compiler handles it (ADR-0002): it inserts a one-sample delay and runs the loop one sample at a time. The modules involved are cheap, but an Audio Cycle inside such a loop also runs per sample. Measure this in P3, and consider giving end outputs a one-block delay if needed.
 - **The logic modules are small and testable.** Clock Divide, Counter, and Step Select need no module data, so they can be built early (P1), and they are good first issues.
 - **The roadmap's P3 exit criterion** becomes the worked example above.
+
+## Work items
+
+- P1, small logic modules: Counter with phase output ([#39](https://github.com/brylie/LoomDSP/issues/39)), Clock Divide ([#48](https://github.com/brylie/LoomDSP/issues/48)), Step Select ([#49](https://github.com/brylie/LoomDSP/issues/49)), and the trigger decision ([#47](https://github.com/brylie/LoomDSP/issues/47)).
+- P2, foundations: module data ([#50](https://github.com/brylie/LoomDSP/issues/50)) and sub-patches ([#51](https://github.com/brylie/LoomDSP/issues/51)).
+- P3: Note Cycle ([#52](https://github.com/brylie/LoomDSP/issues/52)), Audio Cycle ([#53](https://github.com/brylie/LoomDSP/issues/53)), built-in abstractions ([#54](https://github.com/brylie/LoomDSP/issues/54)), and the worked example as a test ([#55](https://github.com/brylie/LoomDSP/issues/55)).

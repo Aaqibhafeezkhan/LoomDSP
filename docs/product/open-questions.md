@@ -86,7 +86,7 @@ ADR-0007 defines gates (high above 0.5) but not triggers. Arrangement logic (ADR
 | One sample high | Exact, cheapest, no overlap between fast triggers. | Invisible on scopes and cable activity; a module reading only block starts would miss it. |
 | Fixed short pulse (for example 1 ms) | Visible, and matches Eurorack practice. | Two triggers closer than the pulse merge into one. Length depends on sample rate. |
 
-- **Leaning:** one sample high on the cable, with the UI stretching it for display. Decide before the logic modules (#39) are built.
+- **Leaning:** one sample high on the cable, with the UI stretching it for display. Decide before the logic modules are built. Tracked in [#47](https://github.com/brylie/LoomDSP/issues/47).
 
 ## Risks
 
