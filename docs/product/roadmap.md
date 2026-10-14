@@ -100,7 +100,7 @@ Exit criteria:
 **Goal:** patches that play, evolve, and arrange themselves. Arrangement happens inside the grid, through loopers, groups, logic, and scenes, not on a timeline (ADR-0011).
 
 Scope:
-- Arrangement from phase-driven primitives (ADR-0012):
+- Arrangement from phase-driven primitives (ADR-0012, [specification](../design/arrangement.md)):
   - Note and audio cycles that read the clock's bar phase and output an end trigger (FR-LIB-20).
   - Clock Divide, Counter (with phase output), and Step Select (FR-LIB-22). These small logic modules can be built as early as P1.
   - Built-in abstractions made from them: Looper Group, Part, Song Sequencer (FR-LIB-21, FR-LIB-24).
@@ -111,7 +111,7 @@ Scope:
 - Record the live output to an audio file while performing (FR-SHARE-03).
 
 Exit criteria:
-- [ ] A patch plays group A round robin, each loop twice; after two rounds it plays group B the same way, then returns to A, with no manual action (the worked example in ADR-0012).
+- [ ] A patch plays group A round robin, each loop twice; after two rounds it plays group B the same way, then returns to A, with no manual action (the [worked example](../design/arrangement.md#worked-example)).
 - [ ] A polymetric step sequencer with lanes of different lengths drives notes and modulation in the same patch.
 - [ ] A 30-minute self-arranging set runs live with zero dropouts.
 

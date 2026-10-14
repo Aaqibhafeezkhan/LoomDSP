@@ -30,7 +30,7 @@ Every feature of LoomDSP is a module in the graph. There are no separate subsyst
 
 ### Example: arrangement by logic
 
-ADR-0012 refines this example and the modules it needs.
+ADR-0012 decides how arrangement modules work. The modules and a fuller example are in the [arrangement specification](../design/arrangement.md).
 
 Four loopers form group A, playing round robin. Group A outputs a trigger each time it completes a round. A counter counts those triggers. When the count reaches 4, the counter fires a trigger into group B's "start" input and group A's "stop" input, and resets.
 

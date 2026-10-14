@@ -132,4 +132,4 @@ Goal: play group A round robin, each loop twice. After two rounds, play group B 
 6. Press play. Part A rotates through its loops, part B takes over after two rounds, and the song returns to A. The sequencer's lanes drift against each other throughout.
 7. Open the Looper Group to see how it works: cycles, a clock divider, a counter, and a step select. Change its rule, for example to pick the next loop at random, and save it as your own abstraction.
 
-Requirements: FR-LIB-14, FR-LIB-20 to FR-LIB-24, ADR-0011, ADR-0012.
+Requirements: FR-LIB-14, FR-LIB-20 to FR-LIB-24. Decisions: ADR-0011, ADR-0012. Specification: [arrangement](../design/arrangement.md).
