@@ -4,6 +4,20 @@ This folder holds the product requirements and architecture decisions for LoomDS
 
 Status: **Draft v0.1** (2026-10-13). Everything here is open for discussion.
 
+## Kinds of documents
+
+Each kind of document has one job, so readers know what to trust and writers know where things go.
+
+| Kind | Where | Holds | Changes |
+|---|---|---|---|
+| **Decision (ADR)** | [`adr/`](adr/README.md) | One decision: context, options, the choice, consequences. | Frozen once accepted. A changed decision gets a new ADR that supersedes the old one. |
+| **Specification** | [`design/`](design/README.md) | How a feature works: modules, ports, rules, examples, open points. | Living. Updated with the code it describes. |
+| **Product** | [`product/`](product/vision.md) | Vision, personas and use cases, requirements, roadmap, open questions. | Living. |
+| **Guide** | `guide/`, `dev/` | How to use LoomDSP, or how to work on it. | Living. |
+| **Benchmark** | [`benchmarks/`](benchmarks/) | Measurements on a stated machine and date. | Add new results; keep old ones for comparison. |
+
+Why decisions are kept apart from specifications: a decision record explains *why* the code is the way it is, and stays useful only if it does not move. Details such as ports, parameters, and examples change as features are built. Keeping them in an ADR would mean either editing a "frozen" record or writing a new ADR for every small change.
+
 ## Product
 
 | Document | Purpose |
@@ -21,6 +35,7 @@ Status: **Draft v0.1** (2026-10-13). Everything here is open for discussion.
 | Document | Purpose |
 |---|---|
 | [ADR index](adr/README.md) | Architecture Decision Records and how to write them |
+| [Design specifications](design/README.md) | Living specifications of features, linked to their ADRs |
 
 ## Benchmarks
 

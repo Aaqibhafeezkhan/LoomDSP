@@ -6,7 +6,7 @@ Thank you for helping. This guide explains how to build, test, and send changes.
 
 - Look for an issue first. If none exists, open one and describe what you want to change.
 - Issues reference requirement IDs from [docs/product/requirements.md](docs/product/requirements.md), for example `FR-MIDI-02`. Mention the ID in your pull request too. This links code to the reason it exists.
-- Big design changes need an [ADR](docs/adr/README.md) first.
+- Big design changes need an [ADR](docs/adr/README.md) first. The ADR records the decision only. Details that will change (ports, parameters, examples) go in a [design specification](docs/design/README.md), which you update with the code. See [kinds of documents](docs/README.md#kinds-of-documents).
 - AI-assisted contributions are welcome. Read the [AI contribution policy](AI_POLICY.md).
 
 Good starting points: issues labelled `good first issue` or `help wanted`. New modules are often a good first contribution: they are small, self-contained, and easy to test.
