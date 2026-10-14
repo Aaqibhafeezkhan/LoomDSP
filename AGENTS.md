@@ -18,9 +18,13 @@ typos                                  # spelling
 cargo bench -p loom-modules
 cargo run --release -p loom-cli -- check examples/patches/fm-feedback.ron
 cargo run --release -p loom-cli -- render examples/patches/subtractive.ron -o /tmp/out.wav --note 60
+cargo run --release -p loom-app -- examples/patches/fm-feedback.ron   # desktop app
+cargo run --release -p loom-app -- --generate 300 --bench            # canvas frame-rate test
 ```
 
 ## Architecture in one page
+
+The longer version, with diagrams, is [docs/dev/architecture.md](docs/dev/architecture.md).
 
 - **Two threads, two halves** (ADR-0001). `Controller` runs on a control thread, owns the editable `Graph`, compiles it, and sends commands. `Engine` runs on the audio thread and only executes. They talk through bounded SPSC queues (`rtrb`). Memory is allocated on the control thread, moved to the audio thread, and moved back for freeing.
 - **Compilation** (ADR-0002, `crates/loom-core/src/compile.rs`). The graph is turned into a `Schedule`: every output port gets a buffer, Tarjan's algorithm finds feedback loops (SCCs), acyclic parts run a block at a time, and loops run one sample at a time. `loom.time.delay1` modules break loops. If a cycle has none, the compiler inserts one and reports it.
@@ -28,6 +32,8 @@ cargo run --release -p loom-cli -- render examples/patches/subtractive.ron -o /t
 - **Modules** implement `Module::process` over a `PortIo`. Their ports and parameters are described by a static `ModuleDescriptor`. Unconnected inputs read zeros; use `io.is_connected(i)` for fallbacks.
 - **Signals** (ADR-0007). Every cable is `f32` at the sample rate. Types are hints only. Pitch is 0.1 per octave, 0.0 = middle C. Gates are high above 0.5. "1.0 = 10 V" for Eurorack users.
 - **Patches** (ADR-0008) are RON files, loaded by `loom-patch`.
+- **Canvas** (ADR-0010, `crates/loom-canvas`). An Iced widget drawn by one custom wgpu primitive (`canvas.wgsl`): instanced rounded rectangles and Bezier cable strips. The app builds a `Scene` from the graph; the canvas never edits it, it reports `CanvasEvent`s. GPU data is rebuilt only when the scene's generation changes, and pan or zoom only updates a uniform. Keep it that way: do not rebuild GPU data every frame, and do not add shaders that run over the whole window for each shape.
+- **App** (`crates/loom-app`). Owns the `Controller`, module positions, and selection. UI crates are desktop only; the engine crates never depend on them.
 
 Before finishing a change, run `prek run --all-files` (fmt, clippy, typos, file checks) and `cargo test --workspace`. CI runs the full list in CONTRIBUTING.md. Never bypass the hooks with `--no-verify`; fix the cause instead.
 

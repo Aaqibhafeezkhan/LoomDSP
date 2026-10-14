@@ -66,6 +66,15 @@ Scope:
 - Audio and MIDI device setup, hot-plugging, audio input (FR-APP-01, 03, 04, FR-MIDI-08).
 - MIDI learn, panic, CPU meter (FR-MIDI-02, FR-PERF-04, 05).
 
+Progress:
+Issues for this phase are in the [P1 milestone](https://github.com/brylie/LoomDSP/milestone/1).
+
+- [x] Canvas prototype: `loom-canvas` and `loom-app`, with tiles, typed ports, cables, level of detail, inspector, live audio, every MIDI input connected, and a stats bar. 120 fps (the display maximum) with 300 modules and the camera moving on the reference laptop ([p1-canvas.md](../benchmarks/p1-canvas.md)). The zoomed-in and idle measurements are still open ([#4](https://github.com/brylie/LoomDSP/issues/4)).
+- [ ] Engine-to-UI telemetry and the first module views: scope and level meter ([#6](https://github.com/brylie/LoomDSP/issues/6) to [#10](https://github.com/brylie/LoomDSP/issues/10)).
+- [ ] Module browser, undo/redo, copy and paste, open and save ([#11](https://github.com/brylie/LoomDSP/issues/11) to [#15](https://github.com/brylie/LoomDSP/issues/15)).
+- [ ] Modulation on parameters, MIDI learn, panic, device selection and hot-plugging ([#19](https://github.com/brylie/LoomDSP/issues/19) to [#29](https://github.com/brylie/LoomDSP/issues/29)).
+- [ ] Phase 1 module library, test harness, help pages, and the tutorial ([#30](https://github.com/brylie/LoomDSP/issues/30) to [#45](https://github.com/brylie/LoomDSP/issues/45)).
+
 Exit criteria:
 - [ ] Tutorial: build a subtractive synth from primitives in under 20 minutes (tested with 3 people who did not write the tutorial).
 - [ ] Play that synth with a MIDI keyboard and map 4 knobs with MIDI learn.
