@@ -3,7 +3,7 @@
 Keyboard shortcuts let patch authors navigate and edit a LoomDSP canvas without reaching for the pointer.
 
 - **Kind:** living specification.
-- **Status:** Draft
+- **Status:** Implemented
 - **Decision behind it:** None yet.
 - **Use case and requirements:** FR-CANVAS-06 (keyboard navigation and shortcuts for common actions).
 - **Issues:** [#16](https://github.com/brylie/LoomDSP/issues/16).
@@ -35,14 +35,14 @@ The platform modifier is Command on macOS and Control on other platforms. The in
 
 ## Acceptance criteria
 
-- [ ] With one module selected, each arrow key moves it exactly one grid step in that direction.
-- [ ] With one or more modules selected, Shift + an arrow key moves the selection exactly four grid steps in that direction.
-- [ ] Nudging preserves the selected modules and their relative arrangement.
-- [ ] Escape during a cable drag cancels the drag and does not create a connection.
-- [ ] Escape when no cable drag is active clears a non-empty selection.
-- [ ] Cmd/Ctrl + 0 resets zoom to exactly 100%.
-- [ ] The inspector help text lists all shortcuts and their meanings.
-- [ ] Automated tests cover movement distance and direction, Escape handling, and zoom reset.
+- [x] With one module selected, each arrow key moves it exactly one grid step in that direction.
+- [x] With one or more modules selected, Shift + an arrow key moves the selection exactly four grid steps in that direction.
+- [x] Nudging preserves the selected modules and their relative arrangement.
+- [x] Escape during a cable drag cancels the drag and does not create a connection.
+- [x] Escape when no cable drag is active clears a non-empty selection.
+- [x] Cmd/Ctrl + 0 resets zoom to exactly 100%.
+- [x] The inspector help text lists all shortcuts and their meanings.
+- [x] Automated tests cover movement distance and direction, Escape handling, and zoom reset.
 
 ## Out of scope
 
@@ -50,10 +50,12 @@ The platform modifier is Command on macOS and Control on other platforms. The in
 - Reworking existing Delete, F, Home, or Cmd/Ctrl + A behaviour.
 - A general keyboard-only navigation model for every canvas control.
 
+## Implementation notes
+
+- Shortcuts are handled only while the pointer is over the canvas, matching the widget's existing keyboard shortcuts.
+- Zoom reset preserves the world point at the centre of the viewport.
+- Nudges emit the existing `CanvasEvent::Move` event, so the application updates selected module positions through its normal model path.
+
 ## Open points
 
-- **Keyboard focus:** Should canvas shortcuts be ignored while focus is in a text field, editable control, or another widget? The implementation should avoid intercepting normal text editing.
-- **Undo/redo:** Should a single nudge (including a Shift nudge) create one undoable edit, and should repeated key presses be grouped? Align this with the project's undo model before implementation.
-- **No selection:** Should arrow keys do nothing when no modules are selected, or should they navigate the canvas/selection?
-- **Zoom anchor:** Should resetting to 100% preserve the current viewport centre, or preserve the point under the pointer?
-- **Modifier handling:** Confirm that Command is the macOS modifier and Control is the modifier on other platforms, and that the browser/window's own Ctrl/Cmd+0 action can be prevented when the canvas handles it.
+- **Undo/redo:** Should a single nudge (including a Shift nudge) create one undoable edit, and should repeated key presses be grouped? Align this with the project's undo model.

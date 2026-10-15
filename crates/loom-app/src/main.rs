@@ -563,9 +563,11 @@ fn bar_text<'a>(content: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> 
 
 const DIM: Color = Color::from_rgb(0.62, 0.65, 0.71);
 
-const HELP: &str = "Drag from a port to patch a cable. Drag a connected input to move or remove its cable.\n\
-Drag tiles to move them. Shift-click or drag a box to select several.\n\
-Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom.\n\
+const HELP: &str = "Drag from a port to patch a cable. Drag a connected input to move or remove its cable.\\n\\
+Drag tiles to move them. Shift-click or drag a box to select several.\\n\\
+Arrow keys nudge the selection one grid step; Shift + Arrow nudges four steps.\\n\\
+Escape cancels a cable drag or clears the selection. Cmd/Ctrl+0 resets zoom to 100%.\\n\\
+Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom.\\n\\
 F or Home frames the patch. Delete removes the selection.";
 
 /// Frame timing over the last second.
