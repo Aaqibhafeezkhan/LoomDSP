@@ -71,5 +71,6 @@ The planned direction for displays: signal displays are modules in the grid, not
 
 ## Open points
 
-- The app does not draw meters or scopes yet (FR-VIS-01, FR-VIS-02). Planned: a scope module that reads its probe through these queues, drawn by the canvas inside its tile, and an activity display without constant motion (for example a "carrying signal" or "silent" port marker, or levels only on hover). Meters must not brighten cables: pulsing cables are tiring and hide the hover focus in large patches.
+- The app does not draw meters or scopes yet (FR-VIS-01, FR-VIS-02). Planned, in the [panels specification](panels.md): a scope module that reads its probe through these queues, drawn by the canvas inside its tile, and an activity display without constant motion (for example a "carrying signal" or "silent" port marker, or levels only on hover). Meters must not brighten cables: pulsing cables are tiring and hide the hover focus in large patches.
+- Module display values (a sequencer's current step, an envelope's stage) need a path of their own, beside port probes. See the panels specification.
 - Probes on one port are independent. Two views of the same port send the data twice.
