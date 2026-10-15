@@ -239,6 +239,14 @@ where
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
             }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape))
+                    && matches!(state.interaction, Interaction::Wiring { .. }) =>
+            {
+                state.interaction = Interaction::Idle;
+                shell.capture_event();
+                shell.request_redraw();
+            }
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if over => {
                 use keyboard::key::Named;
                 match key.as_ref() {
