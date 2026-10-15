@@ -491,7 +491,8 @@ impl<Message> PatchCanvas<'_, Message> {
                         index: c.from.1,
                     });
                 if let Some(source) = source {
-                    self.emit(shell, CanvasEvent::Disconnect(port));
+                    // Keep the existing cable until a valid drop emits Connect.
+                    // Canceling or dropping elsewhere must leave the patch unchanged.
                     state.interaction = Interaction::Wiring { from: source };
                 } else {
                     state.interaction = Interaction::Wiring { from: port };
