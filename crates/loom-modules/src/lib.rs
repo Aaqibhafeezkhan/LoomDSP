@@ -16,6 +16,7 @@ pub mod display;
 pub mod env;
 pub mod filter;
 pub mod io;
+pub mod logic;
 pub mod math;
 pub mod midi;
 pub mod osc;
@@ -24,6 +25,7 @@ pub mod phase;
 /// Every built-in module.
 pub static ALL: &[&ModuleDescriptor] = &[
     &phase::PHASE,
+    &phase::PHASE_TRIGGER,
     &osc::SINE,
     &osc::SAW,
     &osc::NOISE,
@@ -36,6 +38,7 @@ pub static ALL: &[&ModuleDescriptor] = &[
     &io::AUDIO_OUT,
     &midi::NOTE_IN,
     &display::METER,
+    &logic::DIVIDE,
 ];
 
 /// Adds every built-in module to a registry.

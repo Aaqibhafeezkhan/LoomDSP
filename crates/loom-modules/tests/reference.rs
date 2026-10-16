@@ -6,7 +6,7 @@
 //! listen to them, and commit them.
 
 use loom_core::{MidiEvent, ModuleRole};
-use loom_modules::{ALL, display, env, filter, math, midi, osc, phase};
+use loom_modules::{ALL, display, env, filter, logic, math, midi, osc, phase};
 use loom_test::{Harness, Signal, reference};
 
 #[test]
@@ -132,10 +132,54 @@ fn meter() {
 }
 
 #[test]
+fn divide() {
+    // A trigger every 10 ms, divided by 3 with offset 1, reset at 55 ms.
+    let render = Harness::new(&logic::DIVIDE)
+        .seconds(0.1)
+        .input(
+            "trigger",
+            Signal::from_fn(|frame| if frame % 480 == 0 { 1.0 } else { 0.0 }),
+        )
+        .input("reset", Signal::gate(0.055, 0.056))
+        .param("n", 3.0)
+        .param("offset", 1.0)
+        .check(reference!("divide"));
+    let fired: Vec<usize> = render
+        .output("trigger")
+        .iter()
+        .enumerate()
+        .filter(|&(_, &value)| value == 1.0)
+        .map(|(frame, _)| frame / 480 + 1)
+        .collect();
+    // Triggers 2 and 5 fire. The reset falls before trigger 7, which then
+    // counts as the first again, so 8 fires.
+    assert_eq!(fired, [2, 5, 8]);
+}
+
+#[test]
+fn phase_trigger() {
+    // A 40 Hz phase from a bar line, so it fires on frame 0 and then every
+    // 1200 frames.
+    let render = Harness::new(&phase::PHASE_TRIGGER)
+        .seconds(0.1)
+        .input("phase", Signal::phase(40.0))
+        .check(reference!("phase_trigger"));
+    let fired: Vec<usize> = render
+        .output("trigger")
+        .iter()
+        .enumerate()
+        .filter(|&(_, &value)| value == 1.0)
+        .map(|(frame, _)| frame)
+        .collect();
+    assert_eq!(fired, [0, 1_200, 2_400, 3_600]);
+}
+
+#[test]
 fn every_dsp_module_has_a_reference_test() {
     // Add a test above when you add a module to `ALL`.
     let tested = [
         &phase::PHASE,
+        &phase::PHASE_TRIGGER,
         &osc::SINE,
         &osc::SAW,
         &osc::NOISE,
@@ -146,6 +190,7 @@ fn every_dsp_module_has_a_reference_test() {
         &math::CONSTANT,
         &midi::NOTE_IN,
         &display::METER,
+        &logic::DIVIDE,
     ]
     .map(|descriptor| descriptor.id);
     for descriptor in ALL {
