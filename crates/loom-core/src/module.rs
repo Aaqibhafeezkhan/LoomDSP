@@ -25,6 +25,20 @@ pub trait Module: Send {
         let _ = (index, value);
     }
 
+    /// The value parameter `index` has right now, in the parameter's units,
+    /// while the module is still gliding toward the value from
+    /// [`Module::set_param`]. `None` when it is not gliding, or when the
+    /// module does not smooth that parameter.
+    ///
+    /// When the first assignment on a smoothed parameter is added, the
+    /// engine starts its own glide from this value, so the sound does not
+    /// step to the target (modulation spec, rule 9). Called on the audio
+    /// thread, so the rules for `process` apply.
+    fn param_glide(&self, index: usize) -> Option<f32> {
+        let _ = index;
+        None
+    }
+
     /// Clears internal state (envelopes, filter memory, oscillator phase).
     fn reset(&mut self) {}
 
@@ -95,6 +109,9 @@ impl<'a> ProcessContext<'a> {
 pub struct PortIo<'a> {
     inputs: &'a [*const f32],
     outputs: &'a [*mut f32],
+    /// Modulated parameters for this call: parameter index and the start of
+    /// its per-sample buffer. Empty when nothing on this module is modulated.
+    params: &'a [(u16, *const f32)],
     connected: u64,
     offset: usize,
     frames: usize,
@@ -106,10 +123,12 @@ impl<'a> PortIo<'a> {
     ///
     /// Every pointer must be valid for reads (inputs) or writes (outputs) of
     /// `offset + frames` floats for `'a`. No output may alias any input or
-    /// any other output.
+    /// any other output. Each parameter pointer, if any, must be readable for
+    /// the same range.
     pub(crate) unsafe fn new(
         inputs: &'a [*const f32],
         outputs: &'a [*mut f32],
+        params: &'a [(u16, *const f32)],
         connected: u64,
         offset: usize,
         frames: usize,
@@ -117,6 +136,7 @@ impl<'a> PortIo<'a> {
         Self {
             inputs,
             outputs,
+            params,
             connected,
             offset,
             frames,
@@ -146,6 +166,35 @@ impl<'a> PortIo<'a> {
     #[inline]
     pub fn is_connected(&self, index: usize) -> bool {
         index < 64 && self.connected & (1 << index) != 0
+    }
+
+    /// The per-sample values of a modulated parameter, one per frame of this
+    /// call. `None` when the parameter has no assignment: use the value from
+    /// [`Module::set_param`](crate::Module::set_param), which is constant for
+    /// the block.
+    ///
+    /// Use each value for its frame only, in a local that falls back to the
+    /// base. Do not store it in a field that `set_param` owns: the engine does
+    /// not call `set_param` again when an assignment is removed, so the
+    /// module would keep the last modulated value instead of the knob's.
+    ///
+    /// The slice does not borrow `self`, so it can be held across
+    /// [`PortIo::split`].
+    #[inline]
+    pub fn modulated(&self, index: usize) -> Option<&'a [f32]> {
+        let index = u16::try_from(index).ok()?;
+        let ptr = self.params.iter().find(|(i, _)| *i == index)?.1;
+        // SAFETY: guaranteed by the contract of `PortIo::new`.
+        Some(unsafe { std::slice::from_raw_parts(ptr.add(self.offset), self.frames) })
+    }
+
+    /// The modulated value of parameter `index` at `frame` within this call.
+    ///
+    /// `None` when the parameter is not modulated. `frame` must be less than
+    /// [`PortIo::frames`].
+    #[inline]
+    pub fn param_at(&self, index: usize, frame: usize) -> Option<f32> {
+        self.modulated(index).map(|samples| samples[frame])
     }
 
     /// Returns the first `I` inputs and the first `O` outputs at once.
@@ -240,7 +289,7 @@ pub mod testing {
         // SAFETY: the pointers come from distinct slices of length `frames`
         // that outlive this call; `&mut [&mut [f32]]` guarantees outputs are
         // unique and cannot alias the shared input slices.
-        let mut io = unsafe { PortIo::new(&input_ptrs, &output_ptrs, mask, 0, frames) };
+        let mut io = unsafe { PortIo::new(&input_ptrs, &output_ptrs, &[], mask, 0, frames) };
         module.process(&ctx, &mut io);
     }
 }
