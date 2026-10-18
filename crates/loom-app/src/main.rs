@@ -12,6 +12,7 @@ mod live;
 mod monitor;
 mod param;
 mod scene;
+mod undo;
 
 use clap::Parser;
 use iced::widget::{
@@ -91,8 +92,14 @@ enum Message {
     },
     /// A MIDI control change arrived.
     Midi,
-    /// A key, while learn mode listens for Escape.
+    /// A key: the undo and redo shortcuts, and Escape in learn mode.
     Key(iced::keyboard::Event),
+    /// Take back the last step (`docs/design/undo.md`).
+    Undo,
+    /// Replay the step undo took back.
+    Redo,
+    /// An inspector slider was let go.
+    SliderReleased,
 }
 
 struct App {
@@ -139,6 +146,23 @@ struct App {
     armed: Option<learn::Armed>,
     /// What learn mode shows on the canvas.
     learn_view: LearnView,
+    /// Undo and redo (`docs/design/undo.md`).
+    history: undo::History,
+    /// The patch before the edit in progress, if there is one.
+    pending: Option<undo::Snapshot>,
+    /// True between a gesture's start and end. Undo waits for it.
+    gesture: bool,
+    /// True when the open gesture began on an inspector slider. A slider
+    /// sends no start, and arrow keys on it send no end, so the next edit
+    /// or an undo closes it too.
+    slider_gesture: bool,
+    /// True after a commit failed, until the graph is sent. The graph holds a
+    /// change the engine does not, so no step is recorded: undo would send
+    /// that change along with a later one.
+    history_off: bool,
+    /// Parameters this app set during the edit in progress. A change on a
+    /// mapped parameter is part of the step only if it is listed here.
+    touched: BTreeSet<(u32, usize)>,
 }
 
 impl App {
@@ -259,6 +283,12 @@ impl App {
             learning: false,
             armed: None,
             learn_view: LearnView::default(),
+            history: undo::History::default(),
+            pending: None,
+            gesture: false,
+            slider_gesture: false,
+            history_off: false,
+            touched: BTreeSet::new(),
         };
         if app.status.is_empty() {
             app.report();
@@ -298,7 +328,7 @@ impl App {
             };
             Subscription::run_with(watch, learn::stream).map(|_| Message::Midi)
         });
-        let keys = self.learning.then(|| iced::keyboard::listen().map(Message::Key));
+        let keys = Some(iced::keyboard::listen().map(Message::Key));
         Subscription::batch(watch.into_iter().chain(keys))
     }
 
@@ -382,7 +412,10 @@ impl App {
             return;
         }
         let (module, index) = armed.param;
-        match self.controller.learn_midi(seen, ModuleId(module), index) {
+        self.begin_edit();
+        self.touched.insert((module, index));
+        let learned = self.controller.learn_midi(seen, ModuleId(module), index);
+        match learned {
             Ok((id, removed)) => {
                 let mapping = self
                     .controller
@@ -401,6 +434,9 @@ impl App {
                 self.status = format!("error: {e}");
                 self.refresh_learn();
             }
+        }
+        if !self.gesture {
+            self.record();
         }
     }
 
@@ -474,6 +510,7 @@ impl App {
         if let Err(e) = self.controller.set_params(ModuleId(module), &changes) {
             self.status = format!("error: {e}");
         }
+        self.touched.extend(changes.iter().map(|&(i, _)| (module, i)));
         self.refresh_values();
     }
 
@@ -511,15 +548,157 @@ impl App {
         };
     }
 
-    fn commit(&mut self) {
+    /// Starts recording an edit: keeps the patch as it is now. Does nothing
+    /// if one is already open, so a gesture's first call is the one that
+    /// counts.
+    fn begin_edit(&mut self) {
+        // Another path (probe sync) may have sent the graph since the failure.
+        if !self.gesture {
+            self.history_back_on();
+        }
+        if self.pending.is_none() && !self.history_off {
+            self.pending = Some(undo::Snapshot::take(&self.controller, &self.positions));
+            self.touched.clear();
+        }
+    }
+
+    /// Ends the recording and adds a step if the patch changed.
+    fn record(&mut self) {
+        let Some(before) = self.pending.take() else {
+            return;
+        };
+        let after = undo::Snapshot::take(&self.controller, &self.positions);
+        if let Some(step) = undo::diff(&before, &after, &self.touched) {
+            self.history.push(step);
+        }
+        self.touched.clear();
+    }
+
+    /// Runs one edit as one undo step, unless a gesture is open: then the
+    /// gesture's end makes the step (undo.md, rule 1 and 2).
+    fn edit(&mut self, change: impl FnOnce(&mut Self)) {
+        self.begin_edit();
+        change(self);
+        if !self.gesture {
+            self.record();
+        }
+    }
+
+    /// Closes a gesture that began on an inspector slider.
+    fn close_slider_gesture(&mut self) {
+        if self.slider_gesture {
+            self.slider_gesture = false;
+            self.gesture = false;
+            self.record();
+            self.history_back_on();
+        }
+    }
+
+    /// Records steps again once the engine has the whole graph.
+    fn history_back_on(&mut self) {
+        if !self.controller.has_uncommitted_changes() {
+            self.history_off = false;
+        }
+    }
+
+    fn undo(&mut self) {
+        self.close_slider_gesture();
+        if !self.gesture {
+            self.step(false);
+        }
+    }
+
+    fn redo(&mut self) {
+        self.close_slider_gesture();
+        if !self.gesture {
+            self.step(true);
+        }
+    }
+
+    /// Undoes (`forward` false) or redoes the next step.
+    fn step(&mut self, forward: bool) {
+        let step = if forward {
+            self.history.redo_step()
+        } else {
+            self.history.undo_step()
+        };
+        let Some(step) = step.cloned() else { return };
+        let verb = if forward { "Redo" } else { "Undo" };
+        if let Err(why) = undo::check(&step, forward, &self.controller) {
+            self.status = format!("Cannot {} {}: {why}", verb.to_lowercase(), step.name());
+            return;
+        }
+        // An armed parameter is a mode, not an edit: undo disarms it first.
+        self.armed = None;
+        let applied = undo::apply(&step, forward, &mut self.controller, &mut self.positions);
+        match applied {
+            Ok(()) => {
+                if forward {
+                    self.history.redone();
+                } else {
+                    self.history.undone();
+                }
+                // What the step touched, if it still exists, is selected.
+                let touched: BTreeSet<u32> = step
+                    .touched_modules()
+                    .filter(|&id| self.controller.graph().node(ModuleId(id)).is_some())
+                    .collect();
+                if !touched.is_empty() {
+                    self.selection = touched;
+                }
+                self.selection
+                    .retain(|&id| self.controller.graph().node(ModuleId(id)).is_some());
+                if self.commit() {
+                    self.status = format!("{verb}: {}", step.name());
+                } else {
+                    // The graph has the change but the engine does not. The
+                    // history is already cleared by `commit`.
+                    self.status = format!(
+                        "{verb} could not reach the engine ({}); undo history cleared",
+                        self.status
+                    );
+                }
+            }
+            Err(e) => {
+                self.history.clear();
+                self.commit();
+                self.status = format!("{verb} failed ({e}); undo history cleared");
+            }
+        }
+    }
+
+    /// Sends the graph to the engine. Returns false if that failed; the
+    /// status bar then holds the error.
+    fn commit(&mut self) -> bool {
         // Probes follow the graph: a removed module loses its probes.
         let wanted = self.metered_outputs();
         self.live.sync(&mut self.controller, &wanted);
-        match self.controller.commit() {
-            Ok(_) => self.report(),
-            Err(e) => self.status = format!("error: {e}"),
-        }
+        let sent = match self.controller.commit() {
+            Ok(_) => {
+                self.report();
+                // Inside a gesture, wait for its end: the rest of it was not
+                // recorded, so it stays out of the history as a whole.
+                if !self.gesture {
+                    self.history_off = false;
+                }
+                true
+            }
+            Err(e) => {
+                self.status = format!("error: {e}");
+                // The graph holds a change the engine does not. Recording it
+                // would put a step in the history for something that does not
+                // play. The controller stays dirty, so the next commit
+                // retries the change; until then the history cannot be
+                // trusted.
+                self.pending = None;
+                self.touched.clear();
+                self.history.clear();
+                self.history_off = true;
+                false
+            }
+        };
         self.refresh();
+        sent
     }
 
     fn update(&mut self, message: Message) {
@@ -537,19 +716,30 @@ impl App {
                     .and_then(|n| n.descriptor.params.get(index))
                 {
                     let value = spec.denormalize(position);
+                    // A slider sends no start. Its first change opens the
+                    // gesture, and letting go closes it.
+                    if !self.gesture {
+                        self.gesture = true;
+                        self.slider_gesture = true;
+                    }
+                    self.begin_edit();
                     self.set_param(module, index, value);
                 }
             }
+            Message::SliderReleased => self.close_slider_gesture(),
+            Message::Undo => self.undo(),
+            Message::Redo => self.redo(),
             Message::Pick(kind) => self.picked = Some(kind),
             Message::Add => {
+                self.close_slider_gesture();
                 if let Some(kind) = self.picked.clone() {
-                    match self.controller.add_module(&kind) {
+                    self.edit(|app| match app.controller.add_module(&kind) {
                         Ok(id) => {
-                            self.selection = BTreeSet::from([id.0]);
-                            self.commit();
+                            app.selection = BTreeSet::from([id.0]);
+                            app.commit();
                         }
-                        Err(e) => self.status = format!("error: {e}"),
-                    }
+                        Err(e) => app.status = format!("error: {e}"),
+                    });
                 }
             }
             Message::HoldNote => {
@@ -620,29 +810,66 @@ impl App {
                     self.arm((module, index));
                 }
             }
-            Message::Unmap { module, index } => match self.controller.unmap_midi(ModuleId(module), index) {
-                Ok(Some(mapping)) => {
-                    self.commit();
-                    self.status = format!(
-                        "Removed {} from {}",
-                        mapping.control,
-                        learn::param_name(&self.controller, (module, index))
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => self.status = format!("error: {e}"),
-            },
+            Message::Unmap { module, index } => {
+                self.close_slider_gesture();
+                self.edit(|app| match app.controller.unmap_midi(ModuleId(module), index) {
+                    Ok(Some(mapping)) => {
+                        app.commit();
+                        app.status = format!(
+                            "Removed {} from {}",
+                            mapping.control,
+                            learn::param_name(&app.controller, (module, index))
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => app.status = format!("error: {e}"),
+                });
+            }
             Message::Midi => self.midi_arrived(),
             Message::Key(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
             }) if self.learning => self.stop_learning(),
+            Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) if modifiers.command() => {
+                // Ctrl+Z or Cmd+Z undoes; adding Shift redoes. Ctrl+Y also
+                // redoes, except on macOS.
+                match key.as_ref() {
+                    iced::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("z") && modifiers.shift() => {
+                        self.redo()
+                    }
+                    iced::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("z") => self.undo(),
+                    iced::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("y") && !cfg!(target_os = "macos") => {
+                        self.redo()
+                    }
+                    _ => {}
+                }
+            }
             Message::Key(_) => {}
         }
     }
 
     fn canvas_event(&mut self, event: CanvasEvent) {
+        let edits = undo::is_edit(&self.controller, &event);
+        if edits {
+            self.close_slider_gesture();
+            self.edit(|app| app.apply_canvas_event(event));
+        } else {
+            self.apply_canvas_event(event);
+        }
+    }
+
+    fn apply_canvas_event(&mut self, event: CanvasEvent) {
         match event {
+            CanvasEvent::GestureStart => {
+                self.close_slider_gesture();
+                self.gesture = true;
+                self.begin_edit();
+            }
+            CanvasEvent::GestureEnd => {
+                self.gesture = false;
+                self.record();
+                self.history_back_on();
+            }
             CanvasEvent::Select(ids) => self.selection = ids.into_iter().collect(),
             CanvasEvent::Move { ids, delta } => {
                 for id in &ids {
@@ -662,7 +889,9 @@ impl App {
                     port: to.index,
                 };
                 match self.controller.connect(output, input) {
-                    Ok(_) => self.commit(),
+                    Ok(_) => {
+                        self.commit();
+                    }
                     Err(e) => self.status = format!("error: {e}"),
                 }
             }
@@ -761,6 +990,8 @@ impl App {
                 .text_size(13),
             button(text("Add").size(13)).on_press_maybe(self.picked.as_ref().map(|_| Message::Add)),
             hold,
+            self.history_button("Undo", "Undo", self.history.undo_step(), Message::Undo),
+            self.history_button("Redo", "Redo", self.history.redo_step(), Message::Redo),
             button(text("MIDI learn").size(13))
                 .on_press(Message::ToggleLearn)
                 .style(if self.learning {
@@ -773,6 +1004,27 @@ impl App {
         .spacing(8)
         .padding([6, 10])
         .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    /// An Undo or Redo button. It is disabled with nothing to do, and its
+    /// hover text names the step.
+    fn history_button<'a>(
+        &self,
+        label: &'a str,
+        verb: &str,
+        step: Option<&undo::Step>,
+        message: Message,
+    ) -> Element<'a, Message> {
+        let hint = match step {
+            Some(step) => format!("{verb}: {}", step.name()),
+            None => format!("Nothing to {}", verb.to_lowercase()),
+        };
+        tooltip(
+            button(text(label).size(13)).on_press_maybe(step.map(|_| message)),
+            container(text(hint).size(12)).padding(6).style(container::rounded_box),
+            tooltip::Position::Bottom,
+        )
         .into()
     }
 
@@ -845,6 +1097,7 @@ impl App {
                                     position,
                                 }
                             })
+                            .on_release(Message::SliderReleased)
                             .step(param::slider_step(spec)),
                         ]
                         .spacing(2);
