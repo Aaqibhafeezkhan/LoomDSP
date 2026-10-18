@@ -46,6 +46,24 @@ impl Shape {
         self.rect
     }
 
+    /// The fill colour, as uploaded.
+    #[cfg(test)]
+    pub fn fill(&self) -> [f32; 4] {
+        self.fill
+    }
+
+    /// The border colour, as uploaded.
+    #[cfg(test)]
+    pub fn border(&self) -> [f32; 4] {
+        self.border
+    }
+
+    /// The border width, in world units.
+    #[cfg(test)]
+    pub fn border_width(&self) -> f32 {
+        self.params[1]
+    }
+
     /// A circle or square marker centred on a point.
     fn marker(centre: Point, radius: f32, shape: PortShape, fill: Color, border: Color, border_width: f32) -> Self {
         let rect = Rectangle::new(

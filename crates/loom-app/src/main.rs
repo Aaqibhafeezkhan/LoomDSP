@@ -11,6 +11,7 @@ mod layout;
 mod learn;
 mod lights;
 mod live;
+mod modulation;
 mod monitor;
 mod param;
 mod scene;
