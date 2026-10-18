@@ -273,11 +273,48 @@ impl Patch {
     }
 
     /// Writes a patch file.
+    ///
+    /// The text goes to a new temporary file in the same folder first, then
+    /// replaces the target by a rename. A full disk or a failed write cannot
+    /// leave a half-written patch where a good one was. It does not promise
+    /// the data survives a power loss. The temporary name is
+    /// unique to this process and is never an existing file, so another
+    /// save or a backup is never overwritten. A read-only target is refused,
+    /// and the target keeps its permissions.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PatchError> {
+        use std::io::Write;
         let path = path.as_ref();
-        std::fs::write(path, self.to_ron()?).map_err(|source| PatchError::Io {
+        let text = self.to_ron()?;
+        // Write through a symlink to its target, as a plain write would. A
+        // rename over the link would replace the link itself.
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let target = resolved.as_path();
+        let io = |source| PatchError::Io {
             path: path.display().to_string(),
             source,
+        };
+        let existing = std::fs::metadata(target).ok();
+        if existing.as_ref().is_some_and(|m| m.permissions().readonly()) {
+            return Err(io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file is read-only",
+            )));
+        }
+        let name = target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let temp = target.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .and_then(|()| match &existing {
+                Some(meta) => std::fs::set_permissions(&temp, meta.permissions()),
+                None => Ok(()),
+            })
+            .and_then(|()| std::fs::rename(&temp, target));
+        written.map_err(|source| {
+            let _ = std::fs::remove_file(&temp);
+            io(source)
         })
     }
 
@@ -559,6 +596,46 @@ Patch(
 
     /// The engine adds assignments on one parameter in id order. Float sums
     /// depend on order, so a reloaded patch must keep it (review on #133).
+    #[test]
+    fn save_replaces_the_file_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("loom-patch-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.ron");
+        std::fs::write(&path, "old").unwrap();
+        let patch = Patch::new("Saved");
+        patch.save(&path).unwrap();
+        assert_eq!(Patch::load(&path).unwrap().name, "Saved");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left");
+        // A target that cannot be written reports the error and keeps the old file.
+        let missing = dir.join("no-such-folder").join("p.ron");
+        assert!(matches!(patch.save(&missing), Err(PatchError::Io { .. })));
+        // A read-only target is refused and keeps its content.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        assert!(matches!(Patch::new("Other").save(&path), Err(PatchError::Io { .. })));
+        assert_eq!(Patch::load(&path).unwrap().name, "Saved");
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_through_a_symlink_updates_the_target() {
+        let dir = std::env::temp_dir().join(format!("loom-patch-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.ron");
+        let link = dir.join("link.ron");
+        Patch::new("First").save(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        Patch::new("Second").save(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(Patch::load(&real).unwrap().name, "Second");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn assignment_order_survives_save_and_load() {
         let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
