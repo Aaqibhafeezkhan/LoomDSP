@@ -4,7 +4,10 @@ use crate::camera::Camera;
 use crate::controls::{ControlGeometry, PanelValues, focus_ring, knob_drag, knob_step, radio_option};
 use crate::gpu::{Cable, CanvasPrimitive, Geometry, Overlay, Shape};
 use crate::hover::{HOVER_PADDING, HOVER_TEXT_PX, HoverTarget, HoverTimer};
-use crate::scene::{GRID, Hit, HoverText, PORT_HIT_RADIUS, PORT_RADIUS, PortRef, Scene, TILE_WIDTH, WidgetViewKind};
+use crate::scene::{
+    BADGE_TEXT_SIZE, GRID, Hit, HoverText, PORT_HIT_RADIUS, PORT_RADIUS, PortRef, Scene, TILE_WIDTH, WidgetView,
+    WidgetViewKind,
+};
 use crate::theme::Palette;
 use crate::tile_text::{self, Align, LABEL_SIZE, TITLE_SIZE, TextKind};
 use iced::advanced::layout::{self, Layout};
@@ -56,6 +59,17 @@ pub enum CanvasEvent {
     },
     /// Remove the cable into this input.
     Disconnect(PortRef),
+    /// An output was dropped on a control that takes modulation: assign the
+    /// output to the control's parameter (`docs/design/modulation.md`,
+    /// Making an assignment). Not sent in MIDI learn mode.
+    Assign {
+        /// The output.
+        from: PortRef,
+        /// Module ID of the control.
+        module: u32,
+        /// Index in the module's panel widgets.
+        widget: usize,
+    },
     /// Delete modules.
     Delete(Vec<u32>),
     /// Set a control on a module's panel. `position` is the knob position
@@ -235,6 +249,19 @@ impl<'a, Message> PatchCanvas<'a, Message> {
         self
     }
 
+    /// True if dropping `from` on this control makes an assignment: an
+    /// output, a control that takes modulation, and not in MIDI learn mode,
+    /// where touching a control arms it instead.
+    fn takes_assignment(&self, from: PortRef, module: u32, widget: usize) -> bool {
+        from.output
+            && self.learn.is_none()
+            && self
+                .scene
+                .module(module)
+                .and_then(|m| m.panel.widgets.get(widget))
+                .is_some_and(WidgetView::accepts_modulation)
+    }
+
     fn emit(&self, shell: &mut Shell<'_, Message>, event: CanvasEvent) {
         shell.publish((self.on_event)(event));
     }
@@ -293,6 +320,10 @@ enum Interaction {
     },
     Wiring {
         from: PortRef,
+        /// True when the drag began by pulling a cable off an input. Then a
+        /// drop on a control assigns nothing: the user is discarding the
+        /// cable (modulation.md, Making an assignment).
+        pulled: bool,
     },
     Selecting {
         start: Point,
@@ -727,18 +758,26 @@ impl<Message> PatchCanvas<'_, Message> {
                 );
                 let world = screen.map(|s| state.camera.to_world(s));
                 match interaction {
-                    Interaction::Wiring { from } => {
-                        if let Some(Hit::Port(to)) = world.map(|w| self.scene.hit(w, state.hit_radius())) {
-                            let pair = if from.output { (from, to) } else { (to, from) };
-                            if pair.0.output && !pair.1.output {
-                                self.emit(
-                                    shell,
-                                    CanvasEvent::Connect {
-                                        from: pair.0,
-                                        to: pair.1,
-                                    },
-                                );
+                    Interaction::Wiring { from, pulled } => {
+                        match world.map(|w| self.scene.hit(w, state.hit_radius())) {
+                            Some(Hit::Port(to)) => {
+                                let pair = if from.output { (from, to) } else { (to, from) };
+                                if pair.0.output && !pair.1.output {
+                                    self.emit(
+                                        shell,
+                                        CanvasEvent::Connect {
+                                            from: pair.0,
+                                            to: pair.1,
+                                        },
+                                    );
+                                }
                             }
+                            Some(Hit::Widget { module, widget })
+                                if !pulled && self.takes_assignment(from, module, widget) =>
+                            {
+                                self.emit(shell, CanvasEvent::Assign { from, module, widget });
+                            }
+                            _ => {}
                         }
                     }
                     Interaction::Selecting { start, current, base } => {
@@ -1271,13 +1310,30 @@ impl<Message> PatchCanvas<'_, Message> {
                     // step, so the gesture starts before the disconnect.
                     self.emit(shell, CanvasEvent::GestureStart);
                     self.emit(shell, CanvasEvent::Disconnect(port));
-                    state.interaction = Interaction::Wiring { from: source };
+                    state.interaction = Interaction::Wiring {
+                        from: source,
+                        pulled: true,
+                    };
                 } else {
-                    self.begin(state, Interaction::Wiring { from: port }, shell);
+                    self.begin(
+                        state,
+                        Interaction::Wiring {
+                            from: port,
+                            pulled: false,
+                        },
+                        shell,
+                    );
                 }
             }
             Hit::Port(port) => {
-                self.begin(state, Interaction::Wiring { from: port }, shell);
+                self.begin(
+                    state,
+                    Interaction::Wiring {
+                        from: port,
+                        pulled: false,
+                    },
+                    shell,
+                );
             }
             Hit::Module(id) => {
                 let mut selection = self.selection.clone();
@@ -1475,7 +1531,20 @@ impl<Message> PatchCanvas<'_, Message> {
                 .push(Shape::new(ring, radius, Color::TRANSPARENT, p.focus, 1.5));
         }
         match &state.interaction {
-            Interaction::Wiring { from } => {
+            Interaction::Wiring { from, pulled } => {
+                // A control that would take this output as an assignment is
+                // highlighted, like an input port for a cable.
+                if let Some(Hit::Widget { module, widget }) = state.hover
+                    && !pulled
+                    && self.takes_assignment(*from, module, widget)
+                    && let Some(m) = self.scene.module(module)
+                    && let (Some(rect), Some(view)) = (m.widget_bounds(widget), m.panel.widgets.get(widget))
+                {
+                    let (ring, radius) = focus_ring(&view.kind, rect);
+                    overlay
+                        .shapes
+                        .push(Shape::new(ring, radius, Color::TRANSPARENT, p.hover, 1.5));
+                }
                 if let (Some(start), Some(port), Some(cursor)) =
                     (self.scene.port_position(*from), self.scene.port(*from), state.cursor)
                 {
@@ -1592,6 +1661,33 @@ impl<Message> PatchCanvas<'_, Message> {
                     clip,
                 );
             });
+        }
+
+        // Badge numbers sit outside their tile, so they are checked against
+        // their own bounds, not the tile's, and clip to the canvas. Too small
+        // to read, the pill alone shows.
+        let badge_px = quantise(BADGE_TEXT_SIZE * zoom);
+        if badge_px < LABEL_MIN_PX * 0.8 {
+            return;
+        }
+        for module in self.scene.modules() {
+            // A badge reaches past its tile's right edge by at most this
+            // much: the gap after the port and a pill with several digits.
+            const BADGE_REACH: f32 = 40.0;
+            if !module.bounds().expand(BADGE_REACH).intersects(&visible) {
+                continue;
+            }
+            for (index, port) in module.outputs.iter().enumerate() {
+                if let Some(rect) = module.badge_bounds(index).filter(|r| r.intersects(&visible)) {
+                    let label = port.badge.to_string();
+                    renderer.fill_text(
+                        text(&label, badge_px, rect.width * zoom, text::Alignment::Center),
+                        to_screen(rect.center()),
+                        self.palette.background,
+                        bounds,
+                    );
+                }
+            }
         }
     }
 
@@ -1786,6 +1882,7 @@ mod tests {
             hover: crate::scene::HoverText::default(),
             colour: Color::WHITE,
             shape: PortShape::Round,
+            badge: 0,
         };
         ModuleView {
             id,
@@ -1946,7 +2043,10 @@ mod tests {
             index: 0,
         };
         let drags = [
-            Interaction::Wiring { from: port },
+            Interaction::Wiring {
+                from: port,
+                pulled: false,
+            },
             Interaction::Turning {
                 module: 1,
                 widget: 0,
@@ -2645,6 +2745,133 @@ mod tests {
 
     fn moved(to: Point) -> Event {
         Event::Mouse(mouse::Event::CursorMoved { position: to })
+    }
+
+    /// A source tile with one output, and a tile with a knob, a light, and
+    /// a toggle further right.
+    fn assign_scene() -> Scene {
+        let target = ModuleView {
+            panel: panel(),
+            ..module(2, 300.0)
+        };
+        Scene::new(vec![module(1, 0.0), target], Vec::new())
+    }
+
+    const OUT: PortRef = PortRef {
+        module: 1,
+        output: true,
+        index: 0,
+    };
+
+    /// Drags from the source output to widget `widget` on tile 2 and lets
+    /// go there. Returns the events and the overlay shape count while over
+    /// the widget.
+    fn drop_on(canvas: &PatchCanvas<'_, CanvasEvent>, scene: &Scene, widget: usize) -> (Vec<CanvasEvent>, usize) {
+        let mut state = State::default();
+        let start = scene.port_position(OUT).unwrap();
+        drive(canvas, &mut state, &click(mouse::Button::Left), start);
+        let over = scene.module(2).unwrap().widget_bounds(widget).unwrap().center();
+        drive(canvas, &mut state, &moved(over), over);
+        let shapes = canvas.overlay(&state).shapes.len();
+        (drive(canvas, &mut state, &released(), over), shapes)
+    }
+
+    /// Dropping an output on a knob or toggle assigns it, and the control is
+    /// highlighted while the drag is over it. A light takes nothing
+    /// (modulation.md, Making an assignment).
+    #[test]
+    fn dropping_an_output_on_a_control_assigns_it() {
+        let scene = assign_scene();
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        let (events, on_knob) = drop_on(&canvas, &scene, 0);
+        assert_eq!(
+            events,
+            vec![
+                CanvasEvent::Assign {
+                    from: OUT,
+                    module: 2,
+                    widget: 0
+                },
+                CanvasEvent::GestureEnd
+            ]
+        );
+        let (events, _) = drop_on(&canvas, &scene, 2);
+        assert!(events.contains(&CanvasEvent::Assign {
+            from: OUT,
+            module: 2,
+            widget: 2
+        }));
+        let (events, on_light) = drop_on(&canvas, &scene, 1);
+        assert_eq!(events, vec![CanvasEvent::GestureEnd]);
+        assert_eq!(
+            on_knob,
+            on_light + 1,
+            "only a control that takes the drop is highlighted"
+        );
+    }
+
+    /// In MIDI learn mode a drop on a control makes no assignment, and
+    /// nothing is highlighted.
+    #[test]
+    fn learn_mode_takes_no_assignment_drop() {
+        let scene = assign_scene();
+        let none = BTreeSet::new();
+        let learn = LearnView::default();
+        let canvas = learning(&scene, &none, &learn);
+        let (events, _) = drop_on(&canvas, &scene, 0);
+        assert_eq!(events, vec![CanvasEvent::GestureEnd]);
+    }
+
+    /// A cable pulled off a connected input and dropped on a control is
+    /// discarded. It does not become an assignment.
+    #[test]
+    fn a_pulled_cable_dropped_on_a_control_does_not_assign() {
+        let cable = CableView {
+            from: (1, 0),
+            to: (2, 0),
+            colour_from: Color::WHITE,
+            colour_to: Color::WHITE,
+            delayed: false,
+        };
+        let target = ModuleView {
+            panel: panel(),
+            ..module(2, 300.0)
+        };
+        let scene = Scene::new(vec![module(1, 0.0), target], vec![cable]);
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        let mut state = State::default();
+        let input = PortRef {
+            module: 2,
+            output: false,
+            index: 0,
+        };
+        let start = scene.port_position(input).unwrap();
+        let down = drive(&canvas, &mut state, &click(mouse::Button::Left), start);
+        assert!(down.contains(&CanvasEvent::Disconnect(input)), "{down:?}");
+        let knob = scene.module(2).unwrap().widget_bounds(0).unwrap().center();
+        drive(&canvas, &mut state, &moved(knob), knob);
+        let up = drive(&canvas, &mut state, &released(), knob);
+        assert_eq!(up, vec![CanvasEvent::GestureEnd]);
+    }
+
+    /// A drag that starts on an input never assigns.
+    #[test]
+    fn an_input_drag_does_not_assign() {
+        let scene = assign_scene();
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        let mut state = State::default();
+        let input = PortRef { output: false, ..OUT };
+        let start = scene.port_position(input).unwrap();
+        drive(&canvas, &mut state, &click(mouse::Button::Left), start);
+        let knob = scene.module(2).unwrap().widget_bounds(0).unwrap().center();
+        drive(&canvas, &mut state, &moved(knob), knob);
+        assert_eq!(
+            drive(&canvas, &mut state, &released(), knob),
+            vec![CanvasEvent::GestureEnd]
+        );
     }
 
     fn released() -> Event {
