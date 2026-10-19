@@ -125,6 +125,12 @@ impl Cable {
         }
     }
 
+    /// Draws the cable at a third of the usual width: a modulation line.
+    pub fn thin(mut self) -> Self {
+        self.params[0] = CABLE_WIDTH / 3.0;
+        self
+    }
+
     /// Draws the cable at full opacity, in front of the tiles.
     pub fn focused(mut self) -> Self {
         self.params[3] = 1.0;
@@ -385,6 +391,9 @@ pub struct CanvasPipeline {
     control_shapes: InstanceBuffer,
     uploaded: u64,
     controls_uploaded: (u64, u64),
+    /// The overlay last uploaded, as bytes: cables, then shapes. A frame
+    /// whose overlay is the same uploads nothing.
+    overlay_uploaded: (Vec<u8>, Vec<u8>),
     tiles: u32,
     markers: u32,
 }
@@ -502,6 +511,7 @@ impl Pipeline for CanvasPipeline {
             control_shapes: InstanceBuffer::new(device, "loom-canvas control shapes"),
             uploaded: 0,
             controls_uploaded: (0, 0),
+            overlay_uploaded: (Vec::new(), Vec::new()),
             tiles: 0,
             markers: 0,
         }
@@ -548,8 +558,19 @@ impl Primitive for CanvasPrimitive {
             pipeline.control_shapes.upload(device, queue, &controls.shapes);
             pipeline.controls_uploaded = controls.key;
         }
-        pipeline.overlay_cables.upload(device, queue, &self.overlay.cables);
-        pipeline.overlay_shapes.upload(device, queue, &self.overlay.shapes);
+        // The overlay is built every frame, but often does not change: a
+        // live dot moving under still modulation lines changes only the
+        // controls.
+        let cables: &[u8] = bytemuck::cast_slice(&self.overlay.cables);
+        if pipeline.overlay_uploaded.0 != cables {
+            pipeline.overlay_cables.upload(device, queue, &self.overlay.cables);
+            pipeline.overlay_uploaded.0 = cables.to_vec();
+        }
+        let shapes: &[u8] = bytemuck::cast_slice(&self.overlay.shapes);
+        if pipeline.overlay_uploaded.1 != shapes {
+            pipeline.overlay_shapes.upload(device, queue, &self.overlay.shapes);
+            pipeline.overlay_uploaded.1 = shapes.to_vec();
+        }
     }
 
     fn draw(&self, pipeline: &CanvasPipeline, pass: &mut wgpu::RenderPass<'_>) -> bool {
