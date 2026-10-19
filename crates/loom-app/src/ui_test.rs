@@ -98,6 +98,8 @@ impl Ui {
             bench: false,
             output_safety: OutputSafety::LowLatency,
             view: screenshot::Options::default(),
+            dump_ui: false,
+            select: Vec::new(),
         });
         // `ICED_TEST_BACKEND=tiny-skia` forces the renderer CI falls back
         // to without a GPU, as for Iced's own test crate.
