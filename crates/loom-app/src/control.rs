@@ -16,7 +16,7 @@ use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, Stream};
 use iced::{Point, Rectangle, keyboard};
 use loom_canvas::{CanvasEvent, CanvasView, PortRef};
-use loom_core::{MidiEvent, ModuleId};
+use loom_core::{MidiControl, MidiEvent, ModuleId};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::any::Any;
@@ -99,6 +99,12 @@ pub enum Command {
         key: String,
         #[serde(default)]
         modifiers: Vec<String>,
+    },
+    Press {
+        button: String,
+    },
+    Arm {
+        target: String,
     },
     Locate {
         target: String,
@@ -322,6 +328,10 @@ fn run_line(line: &str, tx: &mut mpsc::Sender<Call>) -> (Option<Value>, Answer) 
 /// that was already on its way, then the one that draws the change.
 const FRAMES_BEFORE_ANSWER: u8 = 2;
 
+/// Frames a `cc` waits for the engine to take the control change, after
+/// the frames that draw it: about two seconds at 60 frames per second.
+const FRAMES_FOR_ENGINE: u16 = 120;
+
 /// When a command is answered.
 enum Then {
     Now(Answer),
@@ -331,6 +341,19 @@ enum Then {
 /// What to do once the window has drawn a command's change.
 pub(crate) enum Step {
     Answer(Answer),
+    /// A control change sent to the engine: answer once the engine has
+    /// taken it and the app has applied it (a mapped control moved, or the
+    /// armed parameter learned it). `before` is the serial of the last
+    /// control change seen before it was sent. The engine keeps only the
+    /// last change, so the command's own is the one that is newer and has
+    /// its control and value: a MIDI port's change that arrives first is
+    /// not taken for it.
+    ControlChange {
+        before: Option<u32>,
+        control: MidiControl,
+        value: u8,
+        frames_left: u16,
+    },
     Locate(String),
     Screenshot(PathBuf),
 }
@@ -523,6 +546,52 @@ fn refuse_dialog_keys(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Re
     }
 }
 
+/// The toolbar buttons `press` clicks, by stable name. Labels are not
+/// used: they change while the app runs ("Hold note" becomes "Release
+/// note") and may be reworded.
+const BUTTONS: [&str; 4] = ["learn", "hold", "undo", "redo"];
+
+/// The message a toolbar button sends, or why it cannot be pressed: it
+/// opens a dialog (rule 9), it is disabled, or there is no such button.
+/// Add module is left out: it opens the browser at the pointer, which a
+/// script does not have, and the `add` command adds a module directly.
+fn press_message(app: &App, name: &str) -> Result<Message, String> {
+    let (message, disabled) = match name {
+        "learn" => (Message::ToggleLearn, None),
+        "hold" => (
+            Message::HoldNote,
+            app.midi
+                .is_none()
+                .then_some("Hold note is disabled: no audio is playing the engine"),
+        ),
+        "undo" => (
+            Message::Undo,
+            app.history
+                .undo_step()
+                .is_none()
+                .then_some("Undo is disabled: nothing to undo"),
+        ),
+        "redo" => (
+            Message::Redo,
+            app.history
+                .redo_step()
+                .is_none()
+                .then_some("Redo is disabled: nothing to redo"),
+        ),
+        "new" | "open" | "save" | "save-as" => {
+            return Err(format!(
+                "the {name} button opens a dialog; use the `open` or `save` command instead"
+            ));
+        }
+        "add" => return Err("use the `add` command to add a module".to_string()),
+        _ => return Err(format!("no toolbar button `{name}`; buttons: {}", BUTTONS.join(", "))),
+    };
+    match disabled {
+        Some(reason) => Err(reason.to_string()),
+        None => Ok(message),
+    }
+}
+
 /// The key press and release, as the keyboard listener sends them.
 fn key_events(key: keyboard::Key, modifiers: keyboard::Modifiers) -> [keyboard::Event; 2] {
     let physical = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
@@ -577,6 +646,37 @@ impl App {
             let Pending { call, step, .. } = pending;
             match step {
                 Step::Answer(answer) => call.answer(answer),
+                Step::ControlChange {
+                    before,
+                    control,
+                    value,
+                    frames_left,
+                } => {
+                    let seen = self.controller.last_control_change();
+                    if seen.is_some_and(|seen| {
+                        Some(seen.serial) != before && seen.control == control && seen.value == value
+                    }) {
+                        // As the MIDI watch would. Applying it twice is
+                        // harmless: an armed parameter learns only once.
+                        self.midi_arrived();
+                        call.answer(Ok(Map::new()));
+                    } else if frames_left == 0 {
+                        call.answer(Err(
+                            "the engine did not take the control change, or other MIDI came right after it".to_string(),
+                        ));
+                    } else {
+                        waiting.push(Pending {
+                            frames: 1,
+                            call,
+                            step: Step::ControlChange {
+                                before,
+                                control,
+                                value,
+                                frames_left: frames_left - 1,
+                            },
+                        });
+                    }
+                }
                 Step::Locate(target) => {
                     let operation = Find {
                         text: target.clone(),
@@ -678,13 +778,21 @@ impl App {
                 channel,
                 ..
             } => {
-                let channel = channel.unwrap_or(1).clamp(1, 16) - 1;
-                self.send_midi(MidiEvent::control_change(
-                    0,
-                    channel,
-                    controller.min(127),
-                    value.min(127),
-                ))
+                let control = MidiControl {
+                    channel: channel.unwrap_or(1).clamp(1, 16) - 1,
+                    controller: controller.min(127),
+                };
+                let value = value.min(127);
+                let step = Step::ControlChange {
+                    before: self.controller.last_control_change().map(|seen| seen.serial),
+                    control,
+                    value,
+                    frames_left: FRAMES_FOR_ENGINE,
+                };
+                return match self.send_midi(MidiEvent::control_change(0, control.channel, control.controller, value)) {
+                    Ok(_) => (Then::AfterDraw(step), Task::batch(tasks)),
+                    Err(error) => (Then::Now(Err(error)), Task::batch(tasks)),
+                };
             }
             Command::Key {
                 key: name,
@@ -699,6 +807,14 @@ impl App {
                     }
                     Map::new()
                 }),
+            Command::Press { button } => press_message(self, &button).map(|message| {
+                send(self, message);
+                Map::new()
+            }),
+            Command::Arm { target } => self.arm_command(&target).map(|message| {
+                send(self, message);
+                Map::new()
+            }),
             Command::Locate { target } => return (Then::AfterDraw(Step::Locate(target)), Task::batch(tasks)),
             Command::Screenshot { path } => return (Then::AfterDraw(Step::Screenshot(path)), Task::batch(tasks)),
             Command::Wait { .. } => Ok(Map::new()),
@@ -776,6 +892,29 @@ impl App {
         Ok(fields(json!({ "value": stored })))
     }
 
+    /// The message an inspector row sends in learn mode: it arms the
+    /// parameter, or disarms it if it is armed.
+    fn arm_command(&self, target: &str) -> Result<Message, String> {
+        if !self.learning {
+            return Err("MIDI learn is off; press `learn` first".to_string());
+        }
+        let Some((module, Some(param))) = split_target(target) else {
+            return Err(format!(
+                "`{target}` is not a parameter; use `module:param`, like `4:cutoff`"
+            ));
+        };
+        let node = self
+            .controller
+            .graph()
+            .node(ModuleId(module))
+            .ok_or_else(|| format!("no module {module}"))?;
+        let descriptor = node.descriptor;
+        let index = descriptor
+            .param_index(param)
+            .ok_or_else(|| format!("module {module} ({}) has no parameter `{param}`", descriptor.name))?;
+        Ok(Message::LearnParam { module, index })
+    }
+
     fn add_command(&mut self, kind: &str, at: Option<[f32; 2]>) -> Answer {
         // Patch files name a kind with its version (`loom.filter.svf@1`).
         let id = kind.split_once('@').map_or(kind, |(id, _)| id);
@@ -847,12 +986,16 @@ mod tests {
             reply: Reply(Arc::new(Mutex::new(Some(sender)))),
         };
         let _ = app.control(call);
-        // As the window would: answers wait for the change to be drawn.
-        for _ in 0..FRAMES_BEFORE_ANSWER {
+        // As the window would: answers wait for the change to be drawn, and
+        // a `cc` for the engine to take it. Frames come about 60 a second.
+        for _ in 0..u32::from(FRAMES_BEFORE_ANSWER) + u32::from(FRAMES_FOR_ENGINE) {
             if let Ok(answer) = receiver.try_recv() {
                 return answer;
             }
             let _ = app.update(Message::ControlFrame);
+            if app.control_waiting() {
+                std::thread::sleep(Duration::from_millis(16));
+            }
         }
         receiver.try_recv().expect("answered after drawing")
     }
@@ -989,6 +1132,15 @@ mod tests {
             run(&mut app, r#"{"cmd": "cc", "controller": 1, "value": 64}"#),
             Ok(Map::new())
         );
+        // Another control change queued just before, as from a MIDI port:
+        // `cc` still waits for its own.
+        assert_eq!(app.send_midi(MidiEvent::control_change(0, 0, 2, 10)), Ok(Map::new()));
+        assert_eq!(
+            run(&mut app, r#"{"cmd": "cc", "controller": 3, "value": 99}"#),
+            Ok(Map::new())
+        );
+        let seen = app.controller.last_control_change().unwrap();
+        assert_eq!((seen.control.controller, seen.value), (3, 99));
 
         let added = run(&mut app, r#"{"cmd": "add", "kind": "loom.filter.svf@1"}"#).unwrap();
         let module = added["module"].as_u64().unwrap();
@@ -1019,6 +1171,69 @@ mod tests {
 
         assert_eq!(run(&mut app, r#"{"cmd": "quit"}"#), Ok(Map::new()));
         assert!(app.quit);
+    }
+
+    /// The MIDI learn check from #256: turn learn mode on, arm a control,
+    /// send a control change, turn learn mode off, and read the mapping.
+    #[test]
+    fn a_script_maps_a_control_in_learn_mode() {
+        let mut app = App::new(crate::Args {
+            patch: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches/subtractive.ron")),
+            fake_audio: true,
+            no_audio: false,
+            ..crate::tests::app_args()
+        });
+        let ok = Ok(Map::new());
+        assert!(
+            run(&mut app, r#"{"cmd": "arm", "target": "4:cutoff"}"#)
+                .unwrap_err()
+                .contains("press `learn` first")
+        );
+        assert_eq!(run(&mut app, r#"{"cmd": "press", "button": "learn"}"#), ok);
+        assert!(app.learning);
+        assert_eq!(run(&mut app, r#"{"cmd": "select", "modules": [4]}"#), ok);
+        assert_eq!(run(&mut app, r#"{"cmd": "arm", "target": "4:cutoff"}"#), ok);
+        let row = &run(&mut app, r#"{"cmd": "snapshot"}"#).unwrap()["snapshot"]["inspector"]["module"]["params"][0];
+        assert_eq!(row["mode"]["learn"]["armed"], json!(true), "{row}");
+
+        // `cc` answers once the engine has taken the change and the armed
+        // parameter has learned it, so turning learn mode off next cannot
+        // lose the mapping.
+        assert_eq!(run(&mut app, r#"{"cmd": "cc", "controller": 21, "value": 64}"#), ok);
+        assert!(app.armed.is_none(), "the armed parameter learned the control");
+        assert_eq!(run(&mut app, r#"{"cmd": "press", "button": "learn"}"#), ok);
+        assert!(!app.learning);
+        assert_eq!(run(&mut app, r#"{"cmd": "press", "button": "hold"}"#), ok);
+        assert!(app.holding);
+
+        let row = &run(&mut app, r#"{"cmd": "snapshot"}"#).unwrap()["snapshot"]["inspector"]["module"]["params"][0];
+        let mapping = row["mapping"].as_str().unwrap_or_default();
+        assert!(mapping.contains("21"), "{row}");
+    }
+
+    /// `press` refuses what a click could not do: dialogs (rule 9),
+    /// disabled buttons, and unknown names.
+    #[test]
+    fn press_refuses_dialogs_disabled_buttons_and_unknown_names() {
+        // No audio: Hold note is disabled. Nothing done yet: nor are Undo
+        // and Redo.
+        let mut app = App::new(crate::tests::app_args());
+        for name in ["new", "open", "save", "save-as"] {
+            let error = run(&mut app, &format!(r#"{{"cmd": "press", "button": "{name}"}}"#)).unwrap_err();
+            assert!(error.contains("opens a dialog"), "{name}: {error}");
+        }
+        for (name, reason) in [
+            ("hold", "Hold note is disabled"),
+            ("undo", "nothing to undo"),
+            ("redo", "nothing to redo"),
+        ] {
+            let error = run(&mut app, &format!(r#"{{"cmd": "press", "button": "{name}"}}"#)).unwrap_err();
+            assert!(error.contains(reason), "{name}: {error}");
+        }
+        let error = run(&mut app, r#"{"cmd": "press", "button": "MIDI learn"}"#).unwrap_err();
+        assert!(error.contains("buttons: learn, hold, undo, redo"), "{error}");
+        let error = run(&mut app, r#"{"cmd": "press", "button": "add"}"#).unwrap_err();
+        assert!(error.contains("`add` command"), "{error}");
     }
 
     /// A command waiting to be drawn keeps its answer when another patch
