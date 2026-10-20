@@ -1,5 +1,6 @@
-//! Smoke test for `loom-app --screenshot`: it renders an example patch to a
-//! PNG file and exits with status 0. Skipped where no GPU adapter is found.
+//! Smoke test for `loom-app --screenshot` and `--screenshot-window`: they
+//! render an example patch to a PNG file and exit with status 0. Skipped
+//! where no GPU adapter is found.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,11 +43,20 @@ fn screenshot(name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 fn screenshot_of(patch: &Path, name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
+    capture(patch, "--screenshot", name, args)
+}
+
+/// Like [`screenshot`], for the whole window.
+fn window(name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
+    capture(&subtractive(), "--screenshot-window", name, args)
+}
+
+fn capture(patch: &Path, flag: &str, name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_file(&out);
     let result = Command::new(env!("CARGO_BIN_EXE_loom-app"))
         .arg(patch)
-        .arg("--screenshot")
+        .arg(flag)
         .arg(&out)
         .args(args)
         .output()
@@ -66,6 +76,12 @@ fn screenshot_of(patch: &Path, name: &str, args: &[&str]) -> Option<(u32, u32, V
     assert_eq!(info.color_type, png::ColorType::Rgba);
     pixels.truncate(info.buffer_size());
     Some((info.width, info.height, pixels))
+}
+
+/// The RGBA pixels of a rectangle in an image `width` pixels wide.
+fn crop(pixels: &[u8], width: u32, x: std::ops::Range<u32>, y: std::ops::Range<u32>) -> Vec<u8> {
+    let row = |r: u32| &pixels[((r * width + x.start) * 4) as usize..((r * width + x.end) * 4) as usize];
+    y.flat_map(row).copied().collect()
 }
 
 /// Number of distinct colours, to tell a drawn patch from a flat fill.
@@ -132,6 +148,65 @@ fn renders_pointer_pin_and_drags() {
     let pinned = image("pinned.png", &["--pin", "7:out"]).expect("a GPU");
     let dragging = image("depth.png", &["--pin", "7:out", "--depth", "4:cutoff"]).expect("a GPU");
     assert_ne!(dragging, pinned, "the arc drag did not change the arc");
+}
+
+/// The whole window, at the app's window size, with the inspector showing
+/// the selected module. No audio device or MIDI port is opened: the stats
+/// bar says so, and the run needs neither.
+#[test]
+fn renders_the_whole_window_with_a_selection() {
+    let Some((width, height, selected)) = window("window.png", &["--select", "4"]) else {
+        return;
+    };
+    assert_eq!((width, height), (1440, 900));
+    assert!(colours(&selected) > 50, "only {} colours", colours(&selected));
+    // Antialiased text gives each strip hundreds of colours. Without its
+    // labels a strip has about ten: the background and widget shapes. The
+    // strips stay clear of the canvas, which draws its own text.
+    let inspector = 1440 - 270;
+    for (name, x, y) in [
+        ("toolbar", 0..1440, 0..30),
+        ("inspector", inspector..1440, 50..870),
+        ("stats bar", 0..1440, 882..900),
+    ] {
+        let n = colours(&crop(&selected, width, x, y));
+        assert!(n > 50, "the {name} has only {n} colours, so its text is missing");
+    }
+    // Without a selection the inspector shows no module rows, and the
+    // selected tile has no outline.
+    let (_, _, plain) = window("window-plain.png", &[]).expect("a GPU, as above");
+    assert_ne!(selected, plain, "the selection changed nothing in the image");
+}
+
+/// --size and --scale set the image size, and the canvas options apply to
+/// the canvas inside the window.
+#[test]
+fn renders_the_window_at_a_size_with_canvas_options() {
+    let image = |name, focus| {
+        window(
+            name,
+            &["--size", "640x400", "--scale", "2", "--zoom", "2", "--focus", focus],
+        )
+    };
+    let Some((width, height, cutoff)) = image("window-cutoff.png", "4:cutoff") else {
+        return;
+    };
+    assert_eq!((width, height), (1280, 800));
+    let (_, _, resonance) = image("window-resonance.png", "4:resonance").expect("a GPU, as above");
+    assert_ne!(cutoff, resonance, "focus changed nothing in the image");
+}
+
+#[test]
+fn a_window_with_an_unknown_module_fails() {
+    let result = Command::new(env!("CARGO_BIN_EXE_loom-app"))
+        .arg(subtractive())
+        .arg("--screenshot-window")
+        .arg(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("unused-window.png"))
+        .args(["--select", "999"])
+        .output()
+        .expect("loom-app runs");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no module 999"));
 }
 
 fn fails(patch: &Path, args: &[&str]) -> String {

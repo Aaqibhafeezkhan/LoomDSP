@@ -148,7 +148,7 @@ If the window is closed or the dialog cannot be shown, the result is **Not Now**
 
 **A patch path on the command line:** the offer still comes first. Restore replaces the command-line patch, and the status bar says so: `Restored unsaved changes from 20 October, 14:31. drone.ron was not opened.` The other two choices load the command-line patch as usual. *Why:* the player who restarts after a crash usually starts the app the same way as before, and the copy has more recent work.
 
-**Non-interactive runs** never ask and never touch other sessions' folders: `--screenshot`, `--dump-ui`, `--bench`, `--measure`, `--measure-idle`, `--control`, `--control-script`, and `--no-recovery`. They also write no recovery copy. *Why:* scripts and tests must not stop at a dialog, and must not use up or delete a real user's recovery copy.
+**Non-interactive runs** never ask and never touch other sessions' folders: `--screenshot`, `--screenshot-window`, `--dump-ui`, `--bench`, `--measure`, `--measure-idle`, `--control`, `--control-script`, and `--no-recovery`. They also write no recovery copy. *Why:* scripts and tests must not stop at a dialog, and must not use up or delete a real user's recovery copy.
 
 ### When the saved file has changed since the copy
 

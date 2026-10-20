@@ -147,21 +147,27 @@ impl App {
     }
 }
 
-/// `loom-app --dump-ui`: loads the patch as the window does, without audio
-/// or MIDI, selects the modules `--select` names, and returns the snapshot
-/// as JSON.
-pub fn run(args: &Args) -> Result<String, String> {
+/// The app as the window builds it, without audio or MIDI, with the
+/// modules `--select` names selected. For `--dump-ui` and
+/// `--screenshot-window`.
+pub fn headless(args: &Args) -> Result<App, String> {
     let config = loom_core::EngineConfig {
         output_safety: args.output_safety,
         ..loom_core::EngineConfig::with_sample_rate(48_000.0)
     };
     let session = App::session(config, args.source())?;
-    let mut app = App::assemble(Err("dump".to_string()), 48_000.0, session, 1, args, false);
+    let mut app = App::assemble(Err("headless".to_string()), 48_000.0, session, 1, args, false);
     for &id in &args.select {
         if app.controller.graph().node(loom_core::ModuleId(id)).is_none() {
             return Err(format!("no module {id} in the patch"));
         }
         app.selection.insert(id);
     }
-    serde_json::to_string_pretty(&app.ui_snapshot()).map_err(|e| e.to_string())
+    Ok(app)
+}
+
+/// `loom-app --dump-ui`: returns the snapshot of the [`headless`] app as
+/// JSON.
+pub fn run(args: &Args) -> Result<String, String> {
+    serde_json::to_string_pretty(&headless(args)?.ui_snapshot()).map_err(|e| e.to_string())
 }

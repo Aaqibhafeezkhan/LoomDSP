@@ -30,7 +30,7 @@ mod undo;
 
 use clap::Parser;
 use iced::widget::{button, column, container, mouse_area, row, rule, space, stack, text, toggler, tooltip};
-use iced::{Color, Element, Length, Point, Subscription, Task, Theme};
+use iced::{Color, Element, Length, Point, Size, Subscription, Task, Theme};
 use live::Live;
 use loom_canvas::{CanvasEvent, LearnView, PanelValues, PatchCanvas, Scene};
 use loom_core::{
@@ -80,11 +80,11 @@ struct Args {
     view: screenshot::Options,
     /// Print what the UI shows (tiles, inspector, status bar, undo steps,
     /// window title) as JSON and exit, without a window, audio, or MIDI.
-    #[arg(long, conflicts_with = "screenshot")]
+    #[arg(long, conflicts_with = "screenshot", group = "inspect")]
     dump_ui: bool,
-    /// With --dump-ui: select this module, so the inspector shows it.
-    /// Repeat to select several.
-    #[arg(long, value_name = "MODULE", requires = "dump_ui")]
+    /// With --dump-ui or --screenshot-window: select this module, so the
+    /// inspector shows it. Repeat to select several.
+    #[arg(long, value_name = "MODULE", requires = "inspect")]
     select: Vec<u32>,
     /// Keep autosave recovery copies in this folder instead of the
     /// per-user one (docs/design/autosave.md). For tests and scripts.
@@ -131,6 +131,13 @@ fn main() -> iced::Result {
         }
         return Ok(());
     }
+    if let Some(path) = &args.view.screenshot_window {
+        if let Err(e) = screenshot::run_window(&args, path) {
+            eprintln!("loom-app: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.dump_ui {
         match snapshot::run(&args) {
             Ok(json) => println!("{json}"),
@@ -146,10 +153,13 @@ fn main() -> iced::Result {
         .theme(App::theme)
         .subscription(App::subscription)
         .exit_on_close_request(false)
-        .window_size((1440.0, 900.0))
+        .window_size(WINDOW)
         .antialiasing(false)
         .run()
 }
+
+/// The window size the app opens with.
+const WINDOW: Size = Size::new(1440.0, 900.0);
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -371,6 +381,9 @@ struct App {
     /// During an arc drag: the assignment it changes, once picked, or
     /// `Some(None)` when none fits and the drag does nothing.
     depth_drag: Option<Option<AssignmentId>>,
+    /// How the canvas starts, for a still image of the window
+    /// (`--screenshot-window`). `None` in the app.
+    still: Option<loom_canvas::Still>,
     /// The name for the step the edit in progress makes, when a command
     /// names it (cut, paste, duplicate) rather than what changed.
     step_name: Option<String>,
@@ -744,6 +757,7 @@ impl App {
             touched: BTreeSet::new(),
             adding: None,
             depth_drag: None,
+            still: None,
             step_name: None,
         };
         // A patch just loaded is the one on disk.
@@ -2075,13 +2089,16 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let canvas = PatchCanvas::new(&self.scene, &self.selection, Message::Canvas)
+        let mut canvas = PatchCanvas::new(&self.scene, &self.selection, Message::Canvas)
             .values(&self.values)
             .frame_key(self.frame_key)
             .browser_key(self.browser_key)
             .interactive(self.browser.is_none())
             .animate(self.animating)
             .learn(self.learning.then_some(&self.learn_view));
+        if let Some(still) = self.still {
+            canvas = canvas.still(still);
+        }
 
         let body = row![
             container(canvas).width(Length::Fill).height(Length::Fill),

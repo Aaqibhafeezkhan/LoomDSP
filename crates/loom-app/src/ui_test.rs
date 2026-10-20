@@ -49,13 +49,12 @@ use iced_runtime::futures::futures::{FutureExt, StreamExt};
 use iced_runtime::user_interface::{Cache, UserInterface};
 use loom_canvas::{CanvasView, PortRef};
 use loom_core::{ModuleId, OutputSafety};
-use std::any::Any;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
 /// The window size the app opens with.
-pub const WINDOW: Size = Size::new(1440.0, 900.0);
+pub const WINDOW: Size = crate::WINDOW;
 
 /// The app view, driven by events the way the Iced runtime drives it.
 pub struct Ui {
@@ -304,21 +303,9 @@ impl Ui {
 
     /// Where the canvas is in the window, and its camera.
     pub fn canvas(&mut self) -> CanvasView {
-        #[derive(Default)]
-        struct Find(Option<CanvasView>);
-        impl Operation for Find {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Any) {
-                if let Some(view) = state.downcast_ref::<CanvasView>() {
-                    self.0 = Some(*view);
-                }
-            }
-        }
-        let mut find = Find::default();
-        self.with_ui(|ui, renderer, _| ui.operate(renderer, &mut find));
-        find.0.expect("the app view has a patch canvas")
+        let mut view = None;
+        self.with_ui(|ui, renderer, _| view = screenshot::canvas_view(ui, renderer));
+        view.expect("the app view has a patch canvas")
     }
 
     /// The centre of a module's output port, by its stable name.

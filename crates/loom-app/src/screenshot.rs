@@ -1,5 +1,6 @@
 //! `loom-app --screenshot`: draws one frame of the canvas offscreen, saves
-//! it as a PNG file, and exits.
+//! it as a PNG file, and exits. `--screenshot-window` does the same for the
+//! whole window: toolbar, canvas, inspector, and stats bar.
 //!
 //! The frame goes through the same `Scene`, `PanelValues`, and wgpu
 //! primitive as the window, drawn by Iced's headless wgpu renderer. So the
@@ -8,11 +9,16 @@
 //! device, and no MIDI port.
 
 use iced::advanced::renderer::{Headless, Style};
-use iced::advanced::widget::Tree;
+use iced::advanced::widget::operation::Operation;
+use iced::advanced::widget::{Id, Tree};
 use iced::advanced::{Layout, layout, mouse};
 use iced::{Color, Element, Font, Pixels, Point, Rectangle, Size, Theme};
-use loom_canvas::{Camera, MAX_ZOOM, MIN_ZOOM, Palette, PanelValues, PatchCanvas, PortRef, Scene, Still, StillDrag};
-use loom_core::{Controller, ModuleId, OutputRef};
+use iced_runtime::user_interface::{Cache, UserInterface};
+use loom_canvas::{
+    Camera, CanvasView, MAX_ZOOM, MIN_ZOOM, Palette, PanelValues, PatchCanvas, PortRef, Scene, Still, StillDrag,
+};
+use loom_core::{AssignmentId, Controller, ModuleId, OutputRef};
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -26,41 +32,49 @@ pub const NO_GPU: &str = "no GPU adapter for offscreen drawing";
 pub struct Options {
     /// Draw one frame of the canvas to this PNG file and exit, without a
     /// window, audio, or MIDI.
-    #[arg(long, value_name = "PNG")]
+    #[arg(long, value_name = "PNG", group = "image")]
     pub screenshot: Option<std::path::PathBuf>,
-    /// Image size in logical pixels, as WIDTHxHEIGHT.
-    #[arg(long, value_name = "WxH", default_value = "1280x800", requires = "screenshot")]
-    pub size: ImageSize,
+    /// Draw one frame of the whole window to this PNG file and exit,
+    /// without a window, audio, or MIDI. With --select, the inspector shows
+    /// the selected modules. The canvas options below apply to the canvas
+    /// inside it.
+    #[arg(long, value_name = "PNG", groups = ["image", "inspect"])]
+    pub screenshot_window: Option<std::path::PathBuf>,
+    /// Image size in logical pixels, as WIDTHxHEIGHT. The default is
+    /// 1280x800 for the canvas and the app's window size, 1440x900, for the
+    /// whole window.
+    #[arg(long, value_name = "WxH", requires = "image")]
+    pub size: Option<ImageSize>,
     /// Physical pixels per logical pixel. 2 draws like a high-density
     /// screen, with sharper text.
-    #[arg(long, value_name = "FACTOR", default_value_t = 1.0, value_parser = positive, requires = "screenshot")]
+    #[arg(long, value_name = "FACTOR", default_value_t = 1.0, value_parser = positive, requires = "image")]
     pub scale: f32,
     /// Zoom, in screen pixels per world unit. Without it, the whole patch
     /// fits in the image.
-    #[arg(long, value_name = "ZOOM", value_parser = positive, requires = "screenshot")]
+    #[arg(long, value_name = "ZOOM", value_parser = positive, requires = "image")]
     pub zoom: Option<f32>,
     /// Point at the centre of the image, as X,Y in world units, or as
     /// MODULE:NAME like --pointer. Without it, the pointer, or else the
     /// centre of the focused module, or else of the patch.
-    #[arg(long, value_name = "X,Y|MODULE:NAME", requires = "screenshot")]
+    #[arg(long, value_name = "X,Y|MODULE:NAME", requires = "image")]
     pub center: Option<Pointer>,
     /// Give one control keyboard focus, as MODULE:PARAM (for example
     /// 4:cutoff). It draws as after a Tab press: the module selected, the
     /// control with its focus ring and value.
-    #[arg(long, value_name = "MODULE:PARAM", requires = "screenshot")]
+    #[arg(long, value_name = "MODULE:PARAM", requires = "image")]
     pub focus: Option<Named>,
     /// Put the pointer here, as X,Y in world units, or as MODULE:NAME for
     /// the centre of a control (by parameter) or else a port of that name,
     /// outputs first. What is under it draws as hovered.
-    #[arg(long, value_name = "X,Y|MODULE:NAME", requires = "screenshot")]
+    #[arg(long, value_name = "X,Y|MODULE:NAME", requires = "image")]
     pub pointer: Option<Pointer>,
     /// Show hover text for what is under the pointer, or else for the
     /// focused control, as after resting there.
-    #[arg(long, requires = "screenshot")]
+    #[arg(long, requires = "image")]
     pub hover_text: bool,
     /// Pin the badge of this output, as MODULE:OUTPUT, as after a click on
     /// it: its modulation lines show and the badge gets a ring.
-    #[arg(long, value_name = "MODULE:OUTPUT", requires = "screenshot")]
+    #[arg(long, value_name = "MODULE:OUTPUT", requires = "image")]
     pub pin: Option<Named>,
     /// Show a cable being wired from this port, as MODULE:PORT (outputs
     /// first). Its loose end is at --pointer. Over a control that takes
@@ -73,7 +87,7 @@ pub struct Options {
     /// the assignment being changed shows on its arc. The assignment is
     /// picked as in the app: the pinned output's (--pin), then the only
     /// one from the --focus module, then the only enabled one.
-    #[arg(long, value_name = "MODULE:PARAM", requires = "screenshot")]
+    #[arg(long, value_name = "MODULE:PARAM", requires = "image")]
     pub depth: Option<Named>,
 }
 
@@ -81,10 +95,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             screenshot: None,
-            size: ImageSize {
-                width: 1280,
-                height: 800,
-            },
+            screenshot_window: None,
+            size: None,
             scale: 1.0,
             zoom: None,
             center: None,
@@ -97,6 +109,9 @@ impl Default for Options {
         }
     }
 }
+
+/// The canvas image size without --size.
+const CANVAS: Size = Size::new(1280.0, 800.0);
 
 /// Largest image side in pixels, logical or physical. Larger images are
 /// slow to draw and may not fit in GPU memory.
@@ -131,6 +146,12 @@ impl FromStr for ImageSize {
             width: parse(w)?,
             height: parse(h)?,
         })
+    }
+}
+
+impl ImageSize {
+    fn logical(self) -> Size {
+        Size::new(self.width as f32, self.height as f32)
     }
 }
 
@@ -201,21 +222,34 @@ impl FromStr for Pointer {
     }
 }
 
-/// Loads the patch the way the app does, draws it, and writes the PNG.
-pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
-    let config = loom_core::EngineConfig::with_sample_rate(48_000.0);
-    let mut session = crate::App::session(config, args.source())?;
-    let options = &args.view;
+/// What the canvas options ask the first frame to show.
+struct Shown {
+    still: Still,
+    /// The assignment an arc drag changes, for its knob's arc.
+    dragging: Option<AssignmentId>,
+    /// The module with keyboard focus. It is selected, as the focus ring
+    /// draws only on a selected module.
+    selected: Option<u32>,
+}
+
+/// Applies the canvas options to a loaded patch, for a canvas of `size`
+/// logical pixels. A wire from a connected input disconnects its cable, so
+/// this returns the scene built after that.
+fn shown(
+    options: &Options,
+    controller: &mut Controller,
+    positions: &BTreeMap<u32, Point>,
+    size: Size,
+) -> Result<(Scene, Shown), String> {
     // A wire from a connected input picks up its cable, as in the app: the
     // cable leaves the patch and its loose end hangs from the source.
     let wire = match &options.wire {
-        Some(target) => Some(pick_up(&mut session.controller, target)?),
+        Some(target) => Some(pick_up(controller, target)?),
         None => None,
     };
-    let controller = &session.controller;
-    let scene = crate::scene::build(controller, &session.positions);
+    let controller = &*controller;
+    let scene = crate::scene::build(controller, positions);
 
-    let logical = Size::new(options.size.width as f32, options.size.height as f32);
     let focus = options
         .focus
         .as_ref()
@@ -242,15 +276,13 @@ pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
     let dragging = depth
         .map(|knob| depth_assignment(controller, knob, pinned, focus))
         .transpose()?;
-    let mut values = PanelValues::new();
-    crate::scene::update_panel_values_dragging(&mut values, controller, &BTreeMap::new(), dragging);
 
     let centre = options.center.as_ref().map(point).transpose()?.or(pointer).or_else(|| {
         let (module, _) = focus?;
         Some(scene.module(module)?.bounds().center())
     });
     let still = Still {
-        camera: camera(&scene, logical, options.zoom, centre),
+        camera: camera(&scene, size, options.zoom, centre),
         focus,
         pointer,
         pinned,
@@ -261,12 +293,93 @@ pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
         },
         hover_text: options.hover_text,
     };
+    let shown = Shown {
+        still,
+        dragging,
+        selected: focus.map(|(module, _)| module),
+    };
+    Ok((scene, shown))
+}
+
+/// Loads the patch the way the app does, draws the canvas, and writes the
+/// PNG.
+pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
+    let config = loom_core::EngineConfig::with_sample_rate(48_000.0);
+    let mut session = crate::App::session(config, args.source())?;
+    let options = &args.view;
+    let logical = options.size.map_or(CANVAS, ImageSize::logical);
+    let (scene, shown) = shown(options, &mut session.controller, &session.positions, logical)?;
+    let mut values = PanelValues::new();
+    crate::scene::update_panel_values_dragging(&mut values, &session.controller, &BTreeMap::new(), shown.dragging);
     let physical = physical_size(logical, options.scale)?;
-    // Tab moves focus within the selected module, so the focused module is
-    // selected too. The focus ring draws only on a selected module.
-    let selection = focus.map(|(module, _)| module).into_iter().collect();
-    let pixels = render(&scene, &values, &selection, still, physical, options.scale)?;
+    let selection = shown.selected.into_iter().collect();
+    let pixels = render(&scene, &values, &selection, shown.still, physical, options.scale)?;
     write_png(path, physical, &pixels)
+}
+
+/// `loom-app --screenshot-window`: builds the app as `--dump-ui` does, with
+/// no audio and no MIDI, draws the whole window, and writes the PNG.
+pub fn run_window(args: &crate::Args, path: &Path) -> Result<(), String> {
+    let mut app = crate::snapshot::headless(args)?;
+    let options = &args.view;
+    let logical = options.size.map_or(crate::WINDOW, ImageSize::logical);
+    let physical = physical_size(logical, options.scale)?;
+    // The window holds Iced's own widgets and the canvas's wgpu primitive,
+    // which only the wgpu renderer draws.
+    let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        Font::DEFAULT,
+        Pixels(16.0),
+        Some("wgpu"),
+    ))
+    .ok_or(NO_GPU)?;
+
+    // The camera fits the canvas, not the window, so lay the window out
+    // once to find the canvas size.
+    let mut ui = UserInterface::build(app.view(), logical, Cache::default(), &mut renderer);
+    let canvas = canvas_view(&mut ui, &mut renderer).ok_or("the window has no patch canvas")?;
+    drop(ui);
+    let (scene, shown) = shown(options, &mut app.controller, &app.positions, canvas.bounds.size())?;
+    app.scene = scene;
+    app.depth_drag = Some(shown.dragging);
+    app.refresh_values();
+    app.selection.extend(shown.selected);
+    app.still = Some(shown.still);
+
+    // A new cache, so the canvas starts from the still state.
+    let theme = app.theme();
+    let mut ui = UserInterface::build(app.view(), logical, Cache::default(), &mut renderer);
+    let style = Style {
+        text_color: theme.palette().text,
+    };
+    ui.draw(&mut renderer, &theme, &style, mouse::Cursor::Unavailable);
+    // The renderer holds text paragraphs weakly, and the widget tree owns
+    // them, so the tree must live until the frame is drawn.
+    let pixels = Headless::screenshot(&mut renderer, physical, options.scale, theme.palette().background);
+    drop(ui);
+    write_png(path, physical, &pixels)
+}
+
+/// Where the canvas is in the window, and its camera. The canvas reports a
+/// [`CanvasView`] to widget operations.
+pub(crate) fn canvas_view<M>(
+    ui: &mut UserInterface<'_, M, Theme, iced::Renderer>,
+    renderer: &mut iced::Renderer,
+) -> Option<CanvasView> {
+    #[derive(Default)]
+    struct Find(Option<CanvasView>);
+    impl Operation for Find {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Any) {
+            if let Some(view) = state.downcast_ref::<CanvasView>() {
+                self.0 = Some(*view);
+            }
+        }
+    }
+    let mut find = Find::default();
+    ui.operate(renderer, &mut find);
+    find.0
 }
 
 /// The image size in physical pixels. The scale can push it to zero or past
@@ -548,6 +661,24 @@ mod tests {
         assert!(parse(&["--pointer", "1,1", "--wire", "5:out", "--depth", "4:cutoff"]).is_err());
         // Without --screenshot, the state options mean nothing.
         assert!(crate::Args::try_parse_from(["loom-app", "--pin", "5:out"]).is_err());
+    }
+
+    /// The canvas options and --select go with --screenshot-window, and the
+    /// two screenshots exclude each other.
+    #[test]
+    fn parses_window_options() {
+        use clap::Parser;
+        let parse = |args: &[&str]| crate::Args::try_parse_from([&["loom-app", "p.ron"], args].concat());
+        let args = parse(&["--screenshot-window", "o.png", "--select", "4", "--focus", "4:cutoff"]).unwrap();
+        assert_eq!(args.select, [4]);
+        assert!(args.view.screenshot_window.is_some());
+        assert!(parse(&["--screenshot-window", "o.png", "--size", "800x600"]).is_ok());
+        assert!(parse(&["--screenshot-window", "o.png", "--screenshot", "c.png"]).is_err());
+        assert!(parse(&["--screenshot-window", "o.png", "--dump-ui"]).is_err());
+        // --select still needs something that shows the inspector.
+        assert!(parse(&["--select", "4"]).is_err());
+        assert!(parse(&["--screenshot", "c.png", "--select", "4"]).is_err());
+        assert!(parse(&["--dump-ui", "--select", "4"]).is_ok());
     }
 
     #[test]
