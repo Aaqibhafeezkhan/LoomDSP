@@ -5,8 +5,10 @@
 //! canvas against the performance gates in NFR-PERF-04.
 
 mod alerts;
+mod bench;
 mod browser;
 mod clipboard;
+mod control;
 mod files;
 mod inspector;
 mod layout;
@@ -35,7 +37,7 @@ use loom_core::{
 use loom_host_desktop::{AudioOptions, AudioOutput, CallbackStats, MidiConnection, RunningAudio, SharedMidi};
 use loom_patch::Patch;
 use modulation::PolarityChoice;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,9 +53,21 @@ struct Args {
     /// Do not open an audio device.
     #[arg(long)]
     no_audio: bool,
-    /// Start measuring frame rate with the camera moving (performance gate).
-    #[arg(long)]
-    bench: bool,
+    /// Open no audio device, but play the engine from a timer at 48 kHz, so
+    /// live values, lights, and meters move. Nothing is heard. For machines
+    /// without audio and for scripts.
+    #[arg(long, conflicts_with = "no_audio")]
+    fake_audio: bool,
+    /// Save what the engine plays to this WAV file (32-bit float, stereo),
+    /// until the app closes or another patch is opened.
+    #[arg(long, value_name = "WAV", conflicts_with = "no_audio")]
+    record: Option<PathBuf>,
+    /// Measuring the frame rate: --bench, --measure, --bench-seconds.
+    #[command(flatten)]
+    bench: bench::Options,
+    /// The control channel: --control, --control-script.
+    #[command(flatten)]
+    control: control::Options,
     /// Safety stage on the output: low-latency, clean, or off (ADR-0019).
     /// A command-line flag until the app has preferences.
     #[arg(long, default_value_t = OutputSafety::LowLatency)]
@@ -132,6 +146,18 @@ enum Message {
     /// The window asked to close.
     CloseRequested,
     Measure(bool),
+    /// The --bench-seconds run is over.
+    BenchDone,
+    /// A command from the control channel.
+    Control(control::Call),
+    /// A frame while control commands wait to be drawn.
+    ControlFrame,
+    /// The window was searched for a `locate` command.
+    Located {
+        call: control::Call,
+        target: String,
+        found: control::Found,
+    },
     Animate(bool),
     Frame(Instant),
     Tick,
@@ -227,6 +253,7 @@ struct App {
     generation: u64,
     sample_rate: f32,
     no_audio: bool,
+    fake_audio: bool,
     /// The safety stage's mode, for every engine this app builds.
     output_safety: OutputSafety,
     /// Set when the app should exit after this update.
@@ -261,7 +288,17 @@ struct App {
     /// its centre.
     browser_key: u64,
     frame_key: u64,
-    meter: FrameMeter,
+    meter: bench::FrameMeter,
+    /// The stdout report, when started with --bench, --measure, or
+    /// --measure-idle.
+    reporter: Option<bench::Reporter>,
+    /// The control channel's listeners. While there are any, errors go to
+    /// the status bar and the reply, not to a dialog.
+    control: Vec<control::Listener>,
+    /// Commands waiting for the window to draw their change.
+    control_pending: Vec<control::Pending>,
+    /// True once a failed `--record` has been reported.
+    recording_failed: bool,
     measuring: bool,
     animating: bool,
     /// MIDI learn mode (`docs/design/midi-learn.md`).
@@ -317,7 +354,7 @@ struct Session {
 
 impl App {
     fn new(args: Args) -> Self {
-        let output = Self::open_output(args.no_audio);
+        let output = Self::open_output(args.no_audio, args.fake_audio, args.record.as_deref());
         let sample_rate = output.as_ref().map(|o| o.sample_rate() as f32).unwrap_or(48_000.0);
         let source = args.source();
         let mut status = String::new();
@@ -336,12 +373,18 @@ impl App {
         app
     }
 
-    fn open_output(no_audio: bool) -> Result<AudioOutput, String> {
-        if no_audio {
-            Err("audio off".to_string())
+    fn open_output(no_audio: bool, fake_audio: bool, record: Option<&Path>) -> Result<AudioOutput, String> {
+        let mut output = if no_audio {
+            return Err("audio off".to_string());
+        } else if fake_audio {
+            AudioOutput::clock(48_000, 256)
         } else {
-            AudioOutput::open(&AudioOptions::default()).map_err(|e| e.to_string())
+            AudioOutput::open(&AudioOptions::default()).map_err(|e| e.to_string())?
+        };
+        if let Some(path) = record {
+            output.record(path);
         }
+        Ok(output)
     }
 
     /// Builds an engine and loads a patch into it. On failure nothing else
@@ -454,6 +497,7 @@ impl App {
             generation,
             sample_rate,
             no_audio: args.no_audio,
+            fake_audio: args.fake_audio,
             output_safety: args.output_safety,
             quit: false,
             theme: Theme::custom(
@@ -482,9 +526,13 @@ impl App {
             browser: None,
             browser_key: 0,
             frame_key: 0,
-            meter: FrameMeter::default(),
-            measuring: args.bench,
-            animating: args.bench,
+            meter: bench::FrameMeter::default(),
+            reporter: args.bench.reporter(),
+            control: args.control.listeners(),
+            control_pending: Vec::new(),
+            recording_failed: false,
+            measuring: args.bench.redraws(),
+            animating: args.bench.bench,
             learning: false,
             armed: None,
             learn_view: LearnView::default(),
@@ -530,7 +578,7 @@ impl App {
                     "Could not save \"{}\": {e}. Your changes are not saved.",
                     files::display_name(Some(&path))
                 );
-                files::show_error(&message);
+                self.show_error(&message);
                 self.status = message;
                 false
             }
@@ -591,13 +639,14 @@ impl App {
         // Choosing the device does not start a stream, so the old patch keeps
         // playing. The engine is built at the rate of the device that will
         // play it.
-        let output = Self::open_output(self.no_audio);
+        // A recording covers the first patch only: another would overwrite it.
+        let output = Self::open_output(self.no_audio, self.fake_audio, None);
         // Playing now and no device to play on afterwards: keep what plays.
         if let (Err(e), true) = (&output, self._audio.is_some()) {
             let message = format!(
                 "Could not open the patch: the audio device is not available ({e}). The current patch is unchanged."
             );
-            files::show_error(&message);
+            self.show_error(&message);
             self.status = message;
             return false;
         }
@@ -613,7 +662,7 @@ impl App {
             Ok(session) => session,
             Err(e) => {
                 let message = format!("Could not open the patch: {e}. The current patch is unchanged.");
-                files::show_error(&message);
+                self.show_error(&message);
                 self.status = message;
                 return false;
             }
@@ -628,7 +677,13 @@ impl App {
             patch: None,
             generate: None,
             no_audio: self.no_audio,
-            bench: self.measuring,
+            fake_audio: self.fake_audio,
+            record: None,
+            bench: bench::Options {
+                measure: self.measuring,
+                ..Default::default()
+            },
+            control: control::Options::default(),
             output_safety: self.output_safety,
             view: screenshot::Options::default(),
             dump_ui: false,
@@ -636,6 +691,10 @@ impl App {
         };
         let mut fresh = Self::assemble(output, sample_rate, session, self.generation + 1, &args, true);
         fresh.animating = self.animating;
+        fresh.reporter = self.reporter.take();
+        fresh.control = std::mem::take(&mut self.control);
+        // Commands waiting to be drawn still get their answer.
+        fresh.control_pending = std::mem::take(&mut self.control_pending);
         // The canvas keeps its state across the rebuild and compares these
         // keys with the ones it saw: they must keep counting up. A new frame
         // key also resets pan and zoom to show the whole patch.
@@ -643,6 +702,15 @@ impl App {
         fresh.frame_key = self.frame_key + 1;
         *self = fresh;
         true
+    }
+
+    /// Tells the user that something failed, in a dialog, unless the
+    /// control channel is on: a dialog would stop the app with nobody to
+    /// close it (`docs/design/control-channel.md`, rule 9).
+    fn show_error(&self, message: &str) {
+        if self.control.is_empty() {
+            files::show_error(message);
+        }
     }
 
     fn new_patch(&mut self) {
@@ -693,7 +761,33 @@ impl App {
         };
         let telemetry = Subscription::run_with(self.monitor.clone(), monitor::stream).map(Message::Meters);
         let close = iced::window::close_requests().map(|_| Message::CloseRequested);
-        Subscription::batch([main, live, self.light_watch(), telemetry, self.midi_watch(), close])
+        let control = self
+            .control
+            .iter()
+            .map(|listener| Subscription::run_with(listener.clone(), control::stream).map(Message::Control))
+            // Frames only while a command waits to be drawn, so an idle app
+            // stays idle.
+            .chain(
+                self.control_waiting()
+                    .then(|| iced::window::frames().map(|_| Message::ControlFrame)),
+            );
+        let report = match &self.reporter {
+            Some(reporter) => Subscription::run_with(reporter.clone(), bench::stream).map(|()| Message::BenchDone),
+            None => Subscription::none(),
+        };
+        Subscription::batch(
+            [
+                main,
+                live,
+                self.light_watch(),
+                telemetry,
+                self.midi_watch(),
+                close,
+                report,
+            ]
+            .into_iter()
+            .chain(control),
+        )
     }
 
     /// Wakes the UI when control changes arrive, while there is something to
@@ -873,6 +967,14 @@ impl App {
         if let Some(stats) = &self.audio_stats {
             let s = stats.snapshot();
             self.dropouts.update(s.overruns + s.stream_errors, now);
+        }
+        // A recording that stopped early (a full disk) is reported once.
+        if !self.recording_failed
+            && let Some(error) = self._audio.as_ref().and_then(RunningAudio::recording_error)
+        {
+            self.recording_failed = true;
+            self.status = format!("The recording stopped: {error}");
+            eprintln!("loom-app: {}", self.status);
         }
     }
 
@@ -1198,6 +1300,12 @@ impl App {
                     generation,
                 })
             }
+            Message::Control(call) => self.control(call),
+            Message::ControlFrame => self.control_frame(),
+            Message::Located { call, target, found } => {
+                self.located(&call, &target, &found);
+                Task::none()
+            }
             message if self.clipboard_key(&message).is_some() => self.clipboard_command(&message),
             message => {
                 self.handle(message);
@@ -1205,6 +1313,10 @@ impl App {
             }
         };
         if self.quit {
+            // Stop audio now, so a recording is closed before the process
+            // ends, and leave no control socket behind.
+            self._audio = None;
+            control::close(&self.control);
             Task::batch([task, iced::exit()])
         } else if !was_open && self.browser.is_some() {
             Task::batch([task, browser::Browser::focus()])
@@ -1246,7 +1358,8 @@ impl App {
 
     fn handle(&mut self, message: Message) {
         match message {
-            Message::Browser(_) => {}
+            // `update` runs these: they return tasks.
+            Message::Browser(_) | Message::Control(_) | Message::ControlFrame | Message::Located { .. } => {}
             Message::Key(_) if self.browser.is_some() => {}
             Message::Canvas(event) => self.canvas_event(event),
             Message::Param {
@@ -1366,7 +1479,7 @@ impl App {
             }
             Message::Measure(on) => {
                 self.measuring = on;
-                self.meter = FrameMeter::default();
+                self.meter = bench::FrameMeter::default();
                 if !on {
                     self.animating = false;
                 }
@@ -1376,8 +1489,9 @@ impl App {
                 if on {
                     self.measuring = true;
                 }
-                self.meter = FrameMeter::default();
+                self.meter = bench::FrameMeter::default();
             }
+            Message::BenchDone => self.quit = true,
             Message::Frame(now) => {
                 self.meter.record(now);
                 scene::update_live_values(&mut self.values, &self.controller);
@@ -1837,7 +1951,7 @@ impl App {
     fn stats_bar(&self) -> Element<'_, Message> {
         let graph = self.controller.graph();
         let frames = if self.measuring {
-            self.meter.summary()
+            self.meter.stats().summary()
         } else {
             "redraws on change".to_string()
         };
@@ -1953,42 +2067,6 @@ F or Home frames the patch. Delete removes the selection.\n\
 Cmd/Ctrl+C copies, X cuts, V pastes at the pointer, and D duplicates the selection.\n\
 MIDI learn: click a control, then move a knob on your controller. Escape ends it.";
 
-/// Frame timing over the last second.
-#[derive(Default)]
-struct FrameMeter {
-    times: VecDeque<Instant>,
-    seen: u64,
-    worst: Duration,
-}
-
-impl FrameMeter {
-    fn record(&mut self, now: Instant) {
-        self.seen += 1;
-        if let Some(&last) = self.times.back()
-            && self.seen > 10
-        {
-            // Skip the first frames, which include start-up work.
-            self.worst = self.worst.max(now - last);
-        }
-        self.times.push_back(now);
-        while self.times.front().is_some_and(|&t| now - t > Duration::from_secs(1)) {
-            self.times.pop_front();
-        }
-    }
-
-    fn summary(&self) -> String {
-        let fps = self.times.len().saturating_sub(1);
-        let average = match (self.times.front(), self.times.back()) {
-            (Some(first), Some(last)) if fps > 0 => (*last - *first).as_secs_f64() * 1000.0 / fps as f64,
-            _ => 0.0,
-        };
-        format!(
-            "{fps} fps | frame {average:.1} ms (worst {:.1} ms)",
-            self.worst.as_secs_f64() * 1000.0
-        )
-    }
-}
-
 /// The keys the open browser handles, whether or not a widget used them.
 fn browser_key(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
     use iced::keyboard::{Event, Key, key::Named};
@@ -2012,16 +2090,72 @@ mod tests {
     use iced::Rectangle;
 
     fn app() -> App {
-        App::new(Args {
+        App::new(app_args())
+    }
+
+    pub(crate) fn app_args() -> Args {
+        Args {
             patch: None,
             generate: None,
             no_audio: true,
-            bench: false,
+            fake_audio: false,
+            record: None,
+            bench: bench::Options::default(),
+            control: control::Options::default(),
             output_safety: OutputSafety::LowLatency,
             view: screenshot::Options::default(),
             dump_ui: false,
             select: Vec::new(),
-        })
+        }
+    }
+
+    /// `--record` saves what the engine plays. The file is complete once the
+    /// app is dropped.
+    #[test]
+    fn record_writes_a_wav_file() {
+        let dir = std::env::temp_dir().join(format!("loom-app-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        let app = App::new(Args {
+            fake_audio: true,
+            no_audio: false,
+            record: Some(path.clone()),
+            ..app_args()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        drop(app);
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.spec().sample_rate, 48_000);
+        assert!(reader.duration() > 0, "some audio was recorded");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// With `--fake-audio`, a timer thread plays the engine and drains its
+    /// command queue, so edits keep working with no audio device (#220).
+    /// The edits come in bursts with short pauses, as fast as a person
+    /// could turn a knob, many times over.
+    #[test]
+    fn fake_audio_keeps_taking_edits() {
+        let mut app = App::new(Args {
+            fake_audio: true,
+            no_audio: false,
+            ..app_args()
+        });
+        assert!(app._audio.is_some(), "the clock plays the engine");
+        let filter = app.controller.add_module("loom.filter.svf").unwrap();
+        app.commit();
+        for burst in 0..10 {
+            for i in 0..500 {
+                let _ = app.update(Message::Param {
+                    module: filter.0,
+                    index: 0,
+                    position: ((burst * 500 + i) % 100) as f32 / 100.0,
+                });
+                assert!(!app.status.contains("queue is full"), "{}", app.status);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
 
     fn open_at(app: &mut App, world: Point) {
