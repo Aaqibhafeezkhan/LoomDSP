@@ -11,9 +11,14 @@
 //! screenshot, and aim `--pointer` or `--center` without working them out.
 
 use crate::inspector::Inspector;
+use crate::live::Levels;
 use crate::{App, Args};
 use loom_canvas::{ModulationMark, PORT_HIT_RADIUS, PortRef, WidgetViewKind};
 use serde::Serialize;
+
+/// How much of a `--frames` run the meters show: the last 100 ms at
+/// 48 kHz.
+const METER_WINDOW: usize = 4_800;
 
 /// Everything the snapshot holds.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -171,6 +176,39 @@ fn kind_name(kind: &WidgetViewKind) -> &'static str {
 }
 
 impl App {
+    /// Runs the idle engine for `frames` frames, then takes the live values,
+    /// lights, and meter levels it left, through the same messages the
+    /// window uses. With no window to say what is on screen, every module
+    /// counts as shown.
+    fn run_engine(&mut self, frames: usize) {
+        self.visible_displays = self.controller.graph().nodes().map(|(id, _)| id.0).collect();
+        // Meters need their probes before the engine runs.
+        self.sync_probes();
+        let window = frames.min(METER_WINDOW);
+        self.process(frames - window);
+        // The meters show the end of the run: earlier readings are dropped.
+        let _ = self.monitor.take_readings();
+        // The queue is read after every block, so it holds at most one
+        // reading per meter and never fills, up to its capacity in meters.
+        let block = self.controller.config().max_block;
+        let mut readings = Vec::new();
+        let mut remaining = window;
+        while remaining > 0 {
+            let n = remaining.min(block);
+            self.process(n);
+            readings.extend(self.monitor.take_readings());
+            remaining -= n;
+        }
+        // One update, so the levels do not fall with the time the run took.
+        let mut levels = Levels::default();
+        levels.update(&readings, std::time::Instant::now());
+        let _ = self.update(crate::Message::Meters(levels.all().collect()));
+        let _ = self.update(crate::Message::LiveFrame);
+        if let Some(watch) = self.watched_lights() {
+            let _ = self.update(crate::Message::Lights(watch.read()));
+        }
+    }
+
     /// What the user sees now.
     pub(crate) fn ui_snapshot(&self) -> UiSnapshot {
         let tiles = self
@@ -257,8 +295,8 @@ impl App {
 }
 
 /// The app as the window builds it, without audio or MIDI, with the
-/// modules `--select` names selected. For `--dump-ui` and
-/// `--screenshot-window`.
+/// modules `--select` names selected and the engine run for `--frames`
+/// frames. For `--dump-ui` and `--screenshot-window`.
 pub fn headless(args: &Args) -> Result<App, String> {
     let config = loom_core::EngineConfig {
         output_safety: args.output_safety,
@@ -271,6 +309,9 @@ pub fn headless(args: &Args) -> Result<App, String> {
             return Err(format!("no module {id} in the patch"));
         }
         app.selection.insert(id);
+    }
+    if let Some(frames) = args.frames {
+        app.run_engine(frames);
     }
     Ok(app)
 }

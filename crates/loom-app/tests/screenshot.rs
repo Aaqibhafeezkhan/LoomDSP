@@ -51,6 +51,11 @@ fn window(name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
     capture(&subtractive(), "--screenshot-window", name, args)
 }
 
+/// The `--frames` test patch: see the comment at its top.
+fn running() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/patches/running.ron")
+}
+
 fn capture(patch: &Path, flag: &str, name: &str, args: &[&str]) -> Option<(u32, u32, Vec<u8>)> {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_file(&out);
@@ -194,6 +199,19 @@ fn renders_the_window_at_a_size_with_canvas_options() {
     assert_eq!((width, height), (1280, 800));
     let (_, _, resonance) = image("window-resonance.png", "4:resonance").expect("a GPU, as above");
     assert_ne!(cutoff, resonance, "focus changed nothing in the image");
+}
+
+/// --frames runs the engine before the window is drawn, so the lit light,
+/// the full meter, and the live dot change the image.
+#[test]
+fn renders_the_window_after_running_the_engine() {
+    let patch = running();
+    let Some((_, _, still)) = capture(&patch, "--screenshot-window", "window-still.png", &[]) else {
+        return;
+    };
+    let (_, _, ran) =
+        capture(&patch, "--screenshot-window", "window-ran.png", &["--frames", "4800"]).expect("a GPU, as above");
+    assert_ne!(still, ran, "running the engine changed nothing in the image");
 }
 
 #[test]

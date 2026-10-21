@@ -86,6 +86,11 @@ struct Args {
     /// inspector shows it. Repeat to select several.
     #[arg(long, value_name = "MODULE", requires = "inspect")]
     select: Vec<u32>,
+    /// With --dump-ui or --screenshot-window: first run the engine for N
+    /// frames at 48 kHz on silent input, so live values, lights, and meters
+    /// show where the engine left them.
+    #[arg(long, value_name = "N", requires = "inspect")]
+    frames: Option<usize>,
     /// Keep autosave recovery copies in this folder instead of the
     /// per-user one (docs/design/autosave.md). For tests and scripts.
     #[arg(long, value_name = "FOLDER", conflicts_with = "no_recovery")]
@@ -906,6 +911,7 @@ impl App {
             view: screenshot::Options::default(),
             dump_ui: false,
             select: Vec::new(),
+            frames: None,
             recovery_dir: None,
             no_recovery: true,
         };
@@ -1077,12 +1083,19 @@ impl App {
     }
 
     /// Runs the engine for `frames` frames on silent buffers, as an audio
-    /// device would. Tests only: the app never runs the idle engine.
-    #[cfg(test)]
+    /// device would. For tests and `--frames`: the window never runs the
+    /// idle engine. Runs in chunks, so a long run needs no long buffers;
+    /// the engine gives the same output at any block size.
     fn process(&mut self, frames: usize) {
+        const CHUNK: usize = 4096;
         let engine = self.idle_engine.as_mut().expect("an audio device plays the engine");
-        let (mut left, mut right) = (vec![0.0; frames], vec![0.0; frames]);
-        engine.process(&mut left, &mut right);
+        let (mut left, mut right) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+        let mut remaining = frames;
+        while remaining > 0 {
+            let n = remaining.min(CHUNK);
+            engine.process(&mut left[..n], &mut right[..n]);
+            remaining -= n;
+        }
     }
 
     /// Rebuilds the scene after the graph changed.
@@ -2346,6 +2359,7 @@ mod tests {
             view: screenshot::Options::default(),
             dump_ui: false,
             select: Vec::new(),
+            frames: None,
             recovery_dir: None,
             no_recovery: false,
         }
