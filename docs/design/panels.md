@@ -3,8 +3,8 @@
 How modules, sub-patches, and patches show controls and displays, and how users build them.
 
 - **Kind:** living specification. It changes as panels are built and used.
-- **Status:** Draft, except [Module panels on tiles](#module-panels-on-tiles-p1) and [Level meters and audio load](#level-meters-and-audio-load-p1), which are Implemented. [Labels and hover text](#labels-and-hover-text) is Implemented.
-- **Decision behind it:** [ADR-0013](../adr/0013-modules-carry-their-own-panel.md) (modules carry their own panel).
+- **Status:** Draft, except [Module panels on tiles](#module-panels-on-tiles-p1) and [Level meters and audio load](#level-meters-and-audio-load-p1), which are Implemented. [Labels and hover text](#labels-and-hover-text) is Implemented. [Default panels](#default-panels) and [Exposed controls in a sub-patch](#exposed-controls-in-a-sub-patch) are Draft.
+- **Decision behind it:** [ADR-0013](../adr/0013-modules-carry-their-own-panel.md) (modules carry their own panel), [ADR-0025](../adr/0025-one-design-language-and-derived-panels.md) (one design language, and panels derived from the declaration).
 - **Requirements:** FR-PANEL-*, FR-CANVAS-10, FR-CANVAS-11, FR-LIB-18, FR-VIS-01 to 04, FR-ENCAP-03, NFR-PERF-04, NFR-UX-01.
 - **Builds on:** [Telemetry](telemetry.md) for live data, [ADR-0010](../adr/0010-own-patch-canvas.md) for the canvas, [parameter mapping](modulation.md#parameter-mapping) for control values.
 - **Issues:** [#7](https://github.com/brylie/LoomDSP/issues/7) (umbrella), [#67](https://github.com/brylie/LoomDSP/issues/67) (panel declarations), [#68](https://github.com/brylie/LoomDSP/issues/68) (controls on tiles), [#69](https://github.com/brylie/LoomDSP/issues/69) (display values), [#9](https://github.com/brylie/LoomDSP/issues/9) (level meter, audio load).
@@ -47,6 +47,8 @@ Every panel uses the same widget set.
 | Label | Static text. |
 
 *Why one set:* users learn each control once. A new widget is added to the set, not drawn by one module, so every module and every panel can use it.
+
+The widgets after P1, with their bindings, modulation display, keyboard use, and the catalogue entries that need them, are planned in [Panel widgets](panel-widgets.md) (Draft, [ADR-0024](../adr/0024-widgets-follow-the-kind-of-value.md)). It names the slider "fader", the selector "select list", and the graph "curve", and adds a number, a readout, an XY scope, and a waveform.
 
 ## Bindings
 
@@ -390,9 +392,86 @@ What P1 builds. The rest of this spec is P2.
 - Restyling built-in panels.
 - Docked views at the window edge. Displays are modules.
 
+## Default panels
+
+**Status:** Draft, P2. Decision: [ADR-0025](../adr/0025-one-design-language-and-derived-panels.md). Requirements: FR-PANEL-09, FR-SDK-01, NFR-UX-01.
+
+A module that declares no panel gets one derived from its parameters, display values, and data slots. The author can change one parameter's widget with a hint, or write the whole panel. *Why:* most of a panel follows from the parameters. P1 panels are already "a knob for every parameter", with a few kept in the inspector. Deriving them means every module, built-in or third-party, gets a consistent, keyboard-reachable panel with no layout work.
+
+### Which widget
+
+Each declared item gets one widget, by the first rule that matches:
+
+| Declared item | Widget |
+|---|---|
+| A parameter with a hint | The widget the hint names, or none for "inspector only" |
+| A whole-number parameter from 0 to 1, with no choice names | Toggle |
+| A whole-number parameter with choice names, 5 or fewer | Radio buttons |
+| A whole-number parameter with choice names, more than 5 | Select list |
+| Any other parameter | Knob |
+| A display value | Light |
+| A data slot | Its kind's editor: curve, step grid, or waveform |
+
+- The choice between radio buttons and a select list follows [Radio buttons or a select list?](panel-widgets.md#radio-buttons-or-a-select-list). Choice names come from the parameter ([#160](https://github.com/brylie/LoomDSP/issues/160)).
+- A widget that binds more than one parameter (button, XY pad) is never derived. *Why:* the rules cannot know which two parameters belong together. A module that wants one writes its panel by hand, as the Button module does today.
+- A whole-number parameter without names gets a knob, as in P1. Leaning: the number widget, once it exists ([panel-widgets.md, Number](panel-widgets.md#number)).
+
+### Hints
+
+A hint is an option on the parameter, in `ParamOptions`. It names one widget from the parameter's group in [the baseline set](panel-widgets.md#the-baseline-set), such as a fader instead of a knob, or "inspector only".
+
+- The registry refuses a hint outside the parameter's group, such as a toggle on a continuous parameter. *Why:* a hint picks a way to show the same kind of value. It cannot change what the value is.
+- "Inspector only" is for parameters that are set once and rarely played: a noise seed, a MIDI channel, a bend range.
+- A hint is not a position or a size. *Why:* layout belongs to the panel. A hint lives on the parameter, so it also reaches a sub-patch surface that exposes it (see below).
+
+### Layout
+
+- Data editors come first, each on its own row, at the full panel width. Then the parameter widgets in the order the parameters are declared. Then the display values, in their declared order.
+- Widgets flow left to right on the panel grid and wrap at 12 grid units, four knobs wide. Each row is as tall as its tallest widget. Leaning: check the width against real modules and the estimated label widths ([#120](https://github.com/brylie/LoomDSP/issues/120)).
+- The panel's size is the space its widgets fill. A module with nothing to show gets an empty panel, as today.
+- Focus order is the order above, so Tab follows what the user reads.
+- *Why declaration order:* the author already puts parameters in a meaningful order for the inspector. Deriving from it keeps the tile and the inspector alike.
+
+### Writing a panel by hand
+
+- A module can still declare its panel in full. Then nothing is derived for it, and the registry checks it as today ([Panel declaration](#panel-declaration-67)).
+- **A module's hand-written panel shows every parameter that is not "inspector only".** The registry refuses a module panel that leaves one out, and names it. *Why:* the hint is then the one place that says a parameter is not on the tile. A forgotten knob is caught at registration, and a reader of the descriptor sees the choice. This rule is for module panels only. A sub-patch panel and a front panel show what their user chose, because a performance panel with every parameter on it is not minimal. The inspector shows every parameter either way.
+- *Why keep "inspector only" at all:* some parameters are set once and never played, such as a seed or a MIDI channel. On a tile they take space from the controls that are played, and every derived panel would show them.
+- The derived panel is a pure function of the descriptor, computed once when the module type is registered. *Why:* the same module must always look the same, and nothing about it may be rebuilt per frame.
+
+### Acceptance criteria: default panels
+
+- [ ] Each built-in module except Button gets its panel derived, with "inspector only" hints where P1 keeps a parameter in the inspector. Its widgets, bindings, and focus order equal today's hand-written panel (test). Positions may change.
+- [ ] Deriving the panel twice from one descriptor gives equal panels (test).
+- [ ] The registry refuses a hint outside its parameter's group, with a message that names the parameter (test).
+- [ ] The registry refuses a hand-written module panel that leaves out a parameter without an "inspector only" hint, with a message that names the parameter (test).
+- [ ] A test module with a 2-choice named parameter gets radio buttons, a 0 to 1 parameter without names a toggle, and a 12-choice named parameter a select list (test, once the select list exists).
+
+## Exposed controls in a sub-patch
+
+**Status:** Draft, P2. Decision: [ADR-0025](../adr/0025-one-design-language-and-derived-panels.md). Requirements: FR-ENCAP-03, FR-PANEL-03, FR-PANEL-09.
+
+A sub-patch's surface is made of the same widgets as its inside. *Why:* a user who enters a sub-patch, or leaves it, must not have to learn a new set of widgets. The knob outside is the knob inside, and so is the light, the scope, and the curve.
+
+**Any widget can be exposed:** a control, a light, a readout, a meter, a scope, a curve, a step grid, or a waveform. The surface widget binds to the same inner item: a parameter, a display value, an output's probe, or a data slot. Parameters follow the rules below. A display shows the same live value inside and out. An editor on the surface edits the inner module's data, and each edit is one undo step, whichever side it is made on.
+
+- **Exposing copies the parameter's spec.** When an inner parameter is exposed (FR-ENCAP-03), the sub-patch's new parameter takes its label, description, unit, mapping, choice names, and hint. The user can give it a new name and a narrower range. The mapping and the kind of value stay. *Why:* a logarithmic cutoff must still turn like a cutoff, and a named choice must still show its names.
+- **The same widget on both sides.** The surface shows the widget the inner tile shows for that parameter: a fader inside is a fader outside. In the panel editor, the user can switch it for another widget in the same group, as a hint does.
+- **One parameter, two controls.** Both controls are bound to the same parameter, so they move together, show the same modulation, and an edit on either is one undo step (FR-PANEL-03).
+- **A sub-patch with no designed panel** gets a panel derived from what it exposes. Each exposed item keeps the widget it has inside, and the widgets are placed by the [Default panels layout](#layout-1) rules, in the order the items were exposed. When the user opens the panel editor, it starts from that panel.
+- **Seeing the link.** Inside the sub-patch, a widget that is exposed has a small mark, a shape and not only a colour (NFR-UX-03), and its hover text adds "Exposed as" and the surface label. On the surface, the hover text adds which inner module and parameter it controls. *Why:* entering a sub-patch, the user should find the knob they just turned outside without searching.
+
+### Acceptance criteria: exposed controls
+
+- [ ] Exposing a parameter shown as a fader puts a fader on the sub-patch surface (`Ui` harness).
+- [ ] Turning the surface control moves the inner control, and the reverse. One undo step reverts either (`Ui` harness).
+- [ ] A sub-patch with three exposed parameters and no designed panel shows three widgets in the order exposed.
+- [ ] An exposed control inside the sub-patch has its mark and its "Exposed as" hover text (UI snapshot).
+- [ ] A light and a curve exposed from inside a sub-patch show on its surface. The light follows the inner display value, and a point dragged on the surface curve moves on the inner curve. One undo step reverts it (`Ui` harness).
+
 ## Open points
 
-- Can users restyle a built-in module's panel, or only their own sub-patches?
+- Can users change the layout of a built-in module's panel? Its look cannot change (ADR-0025).
 - How third-party modules add display kinds through the SDK.
 - The exact format of display values: how many per module, and whether they share the meter queue or use a latest-value buffer.
-- How a sub-patch tile looks before its panel has been designed. Leaning: its exposed parameters as knobs, in order.
+- A derived display value gets a light. Once display values carry a unit and range ([#118](https://github.com/brylie/LoomDSP/issues/118)), should those with a unit get a readout or a meter instead?
