@@ -18,14 +18,20 @@
 //!     .check(reference!("sine"));
 //! ```
 //!
+//! [`modules`] holds test-only modules (IDs under `test.`) with every
+//! panel widget, parameter mapping, and output polarity, for tests that the
+//! built-in modules do not cover.
+//!
 //! References are 32-bit float WAV files, so a reviewer can listen to them.
 //! Create or update them with `LOOM_UPDATE_REFERENCES=1 cargo test`.
 //!
-//! This crate reads and writes files, so it is for tests on the desktop
-//! only. The engine crates never depend on it.
+//! This crate reads and writes files, so it is for tests and developer
+//! tools on the desktop only (the app uses [`modules`] for
+//! `--test-modules`). The engine crates never depend on it.
 
 #![warn(missing_docs)]
 
+pub mod modules;
 mod reference;
 mod signal;
 

@@ -6,7 +6,7 @@ A test harness for module authors: render one module with given inputs and param
 - **Status:** Implemented, P1
 - **Decision behind it:** [ADR-0002](../adr/0002-graph-execution-and-feedback.md) ("The SDK harness must cover this").
 - **Use case and requirements:** FR-SDK-02, NFR-OSS-05.
-- **Issues:** [#42](https://github.com/brylie/LoomDSP/issues/42)
+- **Issues:** [#42](https://github.com/brylie/LoomDSP/issues/42), [#208](https://github.com/brylie/LoomDSP/issues/208) (test modules)
 - **Code:** `crates/loom-test`; the built-in modules use it in `crates/loom-modules/tests/reference.rs`.
 
 ## Goal
@@ -79,6 +79,16 @@ Every render fails if a port or parameter has an empty label or description, and
 - A file with a different sample rate, channel count, or length fails, and the message says what differs.
 - When a sample differs by more than the tolerance, the test fails. The message names the output, the first frame that differs, the expected and actual values, and the largest difference.
 - Keep references short, normally 0.25 s or less, so each file stays well under 100 KB.
+
+### Test modules
+
+`loom_test::modules` holds small modules for tests only. The built-in modules do not cover every panel widget or parameter mapping yet, so engine, app, and canvas tests share these instead of each declaring its own descriptor.
+
+- `test.panel` has one of every widget kind (a knob for a continuous and a whole-number parameter, a toggle, radio buttons with three options, a button, a light, and a meter), every parameter mapping (linear, logarithmic, whole-number, and one smoothed parameter), and one unipolar and one bipolar output.
+- `test.linear`, `test.log`, `test.steps`, and `test.smooth` each have one parameter and one bipolar output `out`, which writes what the engine gave that parameter. A test reads it to see the modulated value.
+- `loom_test::modules::register` adds them all to a registry, which checks their panels.
+- Their IDs start with `test.`, so they never clash with a real module.
+- The app registers them in its own tests, and in a normal run only with `--test-modules`. Only with that flag does its module browser list them. `examples/dev/test-widgets.ron` uses them: one of each widget, with an assignment on each control. Open it with `--test-modules`, `--dump-ui`, `--screenshot-window`, or the control channel to check a widget by hand. *Why:* some widgets are on no built-in module yet, so a manual check of them needs a patch, and a normal user should never see these modules.
 
 ## Rules
 

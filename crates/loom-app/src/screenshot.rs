@@ -305,7 +305,7 @@ fn shown(
 /// PNG.
 pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
     let config = loom_core::EngineConfig::with_sample_rate(48_000.0);
-    let mut session = crate::App::session(config, args.source())?;
+    let mut session = crate::App::session(config, args.test_modules, args.source())?;
     let options = &args.view;
     let logical = options.size.map_or(CANVAS, ImageSize::logical);
     let (scene, shown) = shown(options, &mut session.controller, &session.positions, logical)?;

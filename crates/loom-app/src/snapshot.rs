@@ -302,7 +302,7 @@ pub fn headless(args: &Args) -> Result<App, String> {
         output_safety: args.output_safety.unwrap_or_default(),
         ..loom_core::EngineConfig::with_sample_rate(48_000.0)
     };
-    let session = App::session(config, args.source())?;
+    let session = App::session(config, args.test_modules, args.source())?;
     let mut app = App::assemble(
         Err("headless".to_string()),
         48_000.0,

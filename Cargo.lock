@@ -2035,6 +2035,7 @@ dependencies = [
  "loom-host-desktop",
  "loom-modules",
  "loom-patch",
+ "loom-test",
  "png",
  "rfd",
  "ron",

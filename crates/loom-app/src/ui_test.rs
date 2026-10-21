@@ -106,6 +106,7 @@ impl Ui {
             frames: None,
             recovery_dir: None,
             no_recovery: false,
+            test_modules: false,
         });
         // `ICED_TEST_BACKEND=tiny-skia` forces the renderer CI falls back
         // to without a GPU, as for Iced's own test crate.

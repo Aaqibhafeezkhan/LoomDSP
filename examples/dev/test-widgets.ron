@@ -1,0 +1,29 @@
+// Every panel widget, with a few modulation assignments on them, for
+// checking the canvas and inspector by hand. It uses the `test.` modules,
+// so it loads only with --test-modules:
+//
+//   cargo run --release -p loom-app -- examples/dev/test-widgets.ron --test-modules
+//
+// Module 1 is the source: its `uni` (unipolar) and `bi` (bipolar) outputs
+// both send its `level`. Module 2 is the target, with one assignment on
+// each kind of control.
+Patch(
+    version: 1,
+    name: "Test widgets",
+    modules: [
+        PatchModule(id: 1, kind: "test.panel@1", params: {"level": 1.0, "on": 1.0}),
+        PatchModule(id: 2, kind: "test.panel@1", params: {"level": 0.25, "cutoff": 200.0, "steps": 3.0}),
+    ],
+    modulation: [
+        // Knobs: a range arc on a linear, a logarithmic, and a whole-number one.
+        PatchModulation(source: (1, "uni"), target: (2, "level"), depth: 0.25),
+        PatchModulation(source: (1, "bi"), target: (2, "cutoff"), depth: -0.25),
+        PatchModulation(source: (1, "uni"), target: (2, "steps"), depth: 0.3),
+        // Toggle, radio, and button: the depths a drop gives them (one step).
+        PatchModulation(source: (1, "uni"), target: (2, "on"), depth: 1.0),
+        PatchModulation(source: (1, "bi"), target: (2, "choice"), depth: 0.5),
+        PatchModulation(source: (1, "uni"), target: (2, "gate"), depth: 1.0),
+        // An assignment that is off shows as a ring.
+        PatchModulation(source: (1, "uni"), target: (2, "glide"), depth: 0.5, enabled: false),
+    ],
+)

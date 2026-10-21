@@ -1,88 +1,17 @@
 //! Engine acceptance tests for parameter modulation.
 
 use loom_core::{
-    AssignmentId, Channels, Controller, EngineConfig, EngineParts, MidiEvent, Module, ModuleConfig, ModuleDescriptor,
-    ModuleId, ModuleRole, OutputSafety, Panel, ParamOptions, ParamSpec, Polarity, PortDefault, PortIo, PortSpec,
-    ProbeKind, ProcessContext, SignalType, create_engine,
+    AssignmentId, Controller, EngineConfig, EngineParts, MidiEvent, ModuleId, OutputSafety, Polarity, ProbeKind,
+    create_engine,
 };
 use loom_modules::register_all;
+use loom_test::modules as test_modules;
 use std::sync::Arc;
-
-struct Mirror {
-    value: f32,
-}
-
-impl Module for Mirror {
-    fn process(&mut self, _ctx: &ProcessContext<'_>, io: &mut PortIo<'_>) {
-        let samples = io.modulated(0);
-        let ([], [out]) = io.split::<0, 1>();
-        for (i, sample) in out.iter_mut().enumerate() {
-            *sample = samples.map(|values| values[i]).unwrap_or(self.value);
-        }
-    }
-
-    fn set_param(&mut self, _index: usize, value: f32) {
-        self.value = value;
-    }
-}
-
-fn mirror(_config: &ModuleConfig) -> Box<dyn Module> {
-    Box::new(Mirror { value: 0.0 })
-}
-
-const fn test_param(name: &'static str, min: f32, max: f32, default: f32, unit: &'static str) -> ParamSpec {
-    ParamSpec {
-        name,
-        label: name,
-        description: "A test parameter.",
-        min,
-        max,
-        default,
-        unit,
-        options: ParamOptions::DEFAULT,
-    }
-}
-
-macro_rules! mirror_module {
-    ($name:ident, $id:literal, $param:expr) => {
-        static $name: ModuleDescriptor = ModuleDescriptor {
-            id: $id,
-            version: 1,
-            name: $id,
-            category: "Test",
-            description: "Writes its parameter, or the modulated buffer.",
-            inputs: &[],
-            outputs: &[PortSpec {
-                name: "out",
-                label: "Out",
-                signal: SignalType::Modulation,
-                description: "The parameter, or its modulated value.",
-                default: PortDefault::Value(0.0),
-                polarity: Polarity::Bipolar,
-                channels: Channels::PerChannel,
-            }],
-            params: &[$param],
-            role: ModuleRole::Dsp(mirror),
-            panel: Panel::EMPTY,
-            displays: &[],
-        };
-    };
-}
-
-mirror_module!(LINEAR, "test.linear", test_param("level", 0.0, 1.0, 0.0, ""));
-mirror_module!(
-    LOG,
-    "test.log",
-    test_param("cutoff", 20.0, 20_000.0, 1_000.0, "Hz").logarithmic()
-);
-mirror_module!(STEPS, "test.steps", test_param("steps", 0.0, 10.0, 0.0, "").integer());
 
 fn engine() -> EngineParts {
     let mut registry = loom_core::Registry::new();
     register_all(&mut registry).expect("built-ins");
-    registry.register(&LINEAR).expect("linear");
-    registry.register(&LOG).expect("log");
-    registry.register(&STEPS).expect("steps");
+    test_modules::register(&mut registry).expect("test modules");
     // These tests read exact parameter values through Audio Out, so the
     // safety stage is off (ADR-0019).
     let config = EngineConfig {
@@ -160,7 +89,7 @@ fn constant_source_lands_on_the_midpoint() {
 
 #[test]
 fn cutoff_depth_moves_a_tenth_of_the_knob() {
-    let spec = test_param("cutoff", 20.0, 20_000.0, 1_000.0, "Hz").logarithmic();
+    let spec = test_modules::LOG.params[0];
     let expected = spec.denormalize(spec.normalize(1_000.0) + 0.1);
 
     let mut parts = engine();
@@ -208,7 +137,7 @@ fn assignments_sum_then_clamp_and_integers_stay_whole() {
     parts.controller.commit().unwrap();
     assert!(render(&mut parts, 4, 4).iter().all(|&sample| sample == 1.0));
 
-    let spec = test_param("steps", 0.0, 10.0, 0.0, "").integer();
+    let spec = test_modules::STEPS.params[0];
     let expected = spec.denormalize(0.125);
     assert_eq!(expected, 1.0);
 
@@ -684,7 +613,7 @@ fn a_unipolar_source_at_one_turns_an_off_toggle_on() {
 fn engine_with_live_cells(cells: usize) -> EngineParts {
     let mut registry = loom_core::Registry::new();
     register_all(&mut registry).expect("built-ins");
-    registry.register(&LINEAR).expect("linear");
+    test_modules::register(&mut registry).expect("test modules");
     // Exact values through Audio Out, as in `engine`: safety off, and
     // past the fade-in (ADR-0019).
     let config = EngineConfig {
@@ -801,7 +730,7 @@ fn a_moved_cell_never_shows_another_parameters_value() {
 #[test]
 fn a_full_queue_leaves_the_assignment_unchanged() {
     let mut registry = loom_core::Registry::new();
-    registry.register(&LINEAR).expect("linear");
+    registry.register(&test_modules::LINEAR).expect("linear");
     let config = EngineConfig {
         // Two inserts and one swap fill it.
         command_capacity: 3,

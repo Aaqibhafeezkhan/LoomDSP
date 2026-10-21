@@ -43,6 +43,7 @@ cargo run --release -p loom-app -- examples/patches/subtractive.ron --screenshot
 cargo run --release -p loom-app -- examples/patches/subtractive.ron --screenshot-window /tmp/window.png --select 4   # whole window to PNG, inspector showing module 4; no window, audio, or MIDI
 cargo run --release -p loom-app -- examples/patches/subtractive.ron --dump-ui --select 4   # what the UI shows, as JSON
 cargo run --release -p loom-app -- examples/patches/subtractive.ron --dump-ui --frames 4800   # run the engine first, so live values, lights, and meters show; also with --screenshot-window
+cargo run --release -p loom-app -- examples/dev/test-widgets.ron --test-modules   # the `test.` modules: every panel widget, with assignments on each
 cargo run --release -p loom-app -- examples/patches/subtractive.ron --screenshot /tmp/wire.png --zoom 2 --pointer 4:resonance --wire 3:out   # also --hover-text, --pin, --depth
 ```
 
