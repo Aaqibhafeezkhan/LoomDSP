@@ -36,6 +36,25 @@ fn saw() {
         .check(reference!("saw"));
 }
 
+/// Reference render for `loom.osc.pulse`.
+#[test]
+fn pulse() {
+    Harness::new(&osc::PULSE)
+        .seconds(0.05)
+        .input("phase", Signal::phase(220.0))
+        .param("width", 0.25)
+        .check(reference!("pulse"));
+}
+
+/// Reference render for `loom.osc.triangle`.
+#[test]
+fn triangle() {
+    Harness::new(&osc::TRIANGLE)
+        .seconds(0.05)
+        .input("phase", Signal::phase(220.0))
+        .check(reference!("triangle"));
+}
+
 #[test]
 fn noise() {
     Harness::new(&osc::NOISE)
@@ -192,6 +211,8 @@ fn every_dsp_module_has_a_reference_test() {
         &phase::PHASE_TRIGGER,
         &osc::SINE,
         &osc::SAW,
+        &osc::PULSE,
+        &osc::TRIANGLE,
         &osc::NOISE,
         &filter::SVF,
         &env::ADSR,
