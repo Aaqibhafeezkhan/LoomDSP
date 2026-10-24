@@ -4,14 +4,14 @@ A script for the two manual checks in [preferences.md](../../design/preferences.
 
 The automated tests already cover the logic with a fake host. This script checks what only real hardware shows: clicks, thumps, device names, and the real preferences file.
 
-`--record` saves what the engine rendered, before the device, so it cannot show a stream cut before the device played its fade. Where a click or thump at a stop is the question, the script also plays into a loopback device and records what reached it with `loom capture` ([audio QA, Part 4](../../design/audio-qa.md#part-4-capture-what-reached-a-device)). Your ears still check the real interface and the built-in output.
+`--record` saves what the engine rendered, before the device, so it cannot show a stream cut before the device played its fade. Where a click or thump at a stop is the question, the script also plays into a loopback device and records what reached it with `loom capture` ([audio QA, Device capture](../../design/audio-qa.md#device-capture)). Your ears still check the real interface and the built-in output.
 
 ## What you need
 
 - The repository at the commit you are checking, with Rust installed.
 - Headphones or monitors. **Keep the volume low.** Part 1 plays noise far over full scale.
 - A USB audio interface that offers 96 kHz.
-- Two MIDI controllers. Call them **Keys** (the one you keep on) and **Pad** (the one you turn off).
+- Two MIDI inputs. Call them **Keys** (the one you keep on) and **Pad** (the one you turn off). On macOS and Linux, the MIDI inputs part makes them as virtual controllers with `loom midi-port`, so no hardware is needed. On Linux this needs the ALSA sequencer: `/dev/snd/seq` must exist (`sudo modprobe snd-seq` if not). On Windows, use two MIDI controllers.
 - The built-in output of the computer (speakers or headphone jack).
 - A loopback device: BlackHole 2ch on macOS, or a PipeWire or PulseAudio null sink on Linux (`pactl load-module module-null-sink sink_name=loom-loop`, captured from its monitor). On Windows, skip the steps marked **(loopback)**.
 
@@ -27,7 +27,7 @@ Commit:
 Built-in output name:
 Audio interface (name as listed):
 Smallest buffer offered at 96 kHz:
-MIDI controllers (names as listed):
+MIDI inputs (virtual or hardware, names as listed):
 Loopback device (name as listed, or none):
 
 Set up:
@@ -57,7 +57,8 @@ Restart:
 [ ] interface-unplugged
 
 MIDI inputs:
-[ ] both-controllers
+[ ] virtual-midi-tests
+[ ] both-inputs
 [ ] pad-off-while-held
 [ ] pad-stays-off
 
@@ -72,13 +73,13 @@ Notes (anything odd, with the step's name):
 cargo build --release -p loom-app -p loom-cli
 ```
 
-**`list-devices`: List the devices.** Plug in the interface and both controllers first.
+**`list-devices`: List the devices.** Plug in the interface first, and on Windows both controllers.
 
 ```sh
 cargo run --release -p loom-cli -- devices
 ```
 
-Write down the exact names of the built-in output, the interface, both controllers, and the loopback device. The loopback is listed under both Audio outputs and Audio inputs.
+Write down the exact names of the built-in output, the interface, and the loopback device, and on Windows both controllers. The loopback is listed under both Audio outputs and Audio inputs.
 
 **`set-aside-preferences`: Set the preferences file aside.** This check needs a fresh start, and it writes to the real per-user file, because remembering it between runs is part of the check.
 
@@ -100,7 +101,7 @@ Set the loopback's output volume to full first (on macOS: Audio MIDI Setup, Blac
 LOOM_DEVICE="<part of the interface name>" LOOM_LOOPBACK="<part of the loopback name>" cargo test -p loom-host-desktop -- --ignored --test-threads=1
 ```
 
-On a PipeWire null sink, the cut check cannot pass: PipeWire plays out what it was handed after a stream closes, so a stop never cuts there ([audio QA, Part 4, CI](../../design/audio-qa.md#part-4-capture-what-reached-a-device)). Skip it there, and write "cut check skipped (PipeWire)" in Notes:
+On a PipeWire null sink, the cut check cannot pass: PipeWire plays out what it was handed after a stream closes, so a stop never cuts there ([audio QA, Device capture](../../design/audio-qa.md#device-capture)). Skip it there, and write "cut check skipped (PipeWire)" in Notes:
 
 ```sh
 LOOM_DEVICE="<part of the interface name>" LOOM_LOOPBACK=pipewire cargo test -p loom-host-desktop -- --ignored --test-threads=1 --skip a_fixed_100_ms_stop_limit_shows_as_a_cut
@@ -303,27 +304,49 @@ Quit, and plug the interface back in.
 
 ## Part 5: MIDI inputs
 
-**`both-controllers`: Both controllers play.**
+**`make-keys-and-pad`: Make Keys and Pad.** On macOS and Linux, open two more terminals and start a virtual controller in each. Leave both running until the end of this part: the app finds MIDI inputs only when it starts, and on Linux a new port can get a new number.
+
+```sh
+cargo run --release -p loom-cli -- midi-port "Loom Keys"
+```
+
+```sh
+cargo run --release -p loom-cli -- midi-port "Loom Pad"
+```
+
+Each prints `MIDI input: <name>`. That is the name the app shows: `Loom Keys` on macOS, and something like `LoomDSP virtual:Loom Keys 128:0` on Linux. To play, type a line and press Enter: `on 60` holds middle C, `off 60` lets it go. A key stays held until you type its `off` line. Any controllers you have plugged in show in the app too. Leave them alone.
+
+On Windows, use the two hardware controllers. Where a step says "type `on 60` in Pad", hold middle C on Pad instead.
+
+**`virtual-midi-tests`: Run the virtual MIDI tests.** The same checks also run as tests, through two virtual ports the test makes itself. On macOS and Linux, run them once. Skip this on Windows.
+
+```sh
+cargo test -p loom-host-desktop -p loom-app -- --ignored real_input
+```
+
+**`both-inputs`: Both inputs play.**
 
 ```sh
 cargo run --release -p loom-app -- examples/patches/subtractive.ron
 ```
 
-- Play a note on Keys, then on Pad. Both play the patch.
-- Look: Preferences lists both controllers with their check boxes checked, and the line `New MIDI inputs are on until you turn them off.`
+- Type `on 60` in Keys, then `off 60`. Then the same in Pad. Both play the patch.
+- Look: Preferences lists Keys and Pad with their check boxes checked, and the line `New MIDI inputs are on until you turn them off.`
 
-**`pad-off-while-held`: Turn Pad off while a note is held.** Hold a note on Pad. While you hold it, uncheck Pad in Preferences.
+**`pad-off-while-held`: Turn Pad off while a note is held.** Type `on 60` in Pad, and do not type `off 60`. While the note sounds, uncheck Pad in Preferences.
 
-- Listen: the held note stops, even though you still hold the key. Audio does not stop.
-- Play Pad again: nothing. Play Keys: it plays.
-- Look: the preferences file has `off: ["<Pad name>"]`.
+- Listen: the held note stops, even though Pad still holds it. Audio does not stop.
+- Type `off 60`, then `on 62` and `off 62` in Pad: nothing. The same in Keys: it plays.
+- Look: the preferences file has `off: ["<Pad name>"]`, with the name exactly as the app shows it.
 
-Quit.
+Quit the app. Leave Keys and Pad running.
 
 **`pad-stays-off`: Start again.** Use the same command.
 
 - Look: Pad is still unchecked in Preferences.
-- Play Pad: nothing. Play Keys: it plays.
+- Type `on 60` and `off 60` in Pad: nothing. In Keys: it plays.
+
+Quit the app. Press Ctrl+D in the Keys and Pad terminals to end them.
 
 ## Clean up
 

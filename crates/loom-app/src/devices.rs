@@ -434,8 +434,13 @@ pub mod fake {
         pub ports: RefCell<Vec<(String, Rc<RefCell<MidiInputState>>)>>,
         /// With a tape, every device is a stepped output on it: it plays
         /// only when the test steps the tape, and keeps every sample
-        /// (audio-qa.md, Part 1). Without one, devices run on a timer.
+        /// (audio-qa.md, Stepped test output). Without one, devices run on a timer.
         pub tape: Option<loom_host_desktop::Tape>,
+        /// With a text, MIDI goes through the real `midir` inputs instead
+        /// of `midi`, but only those whose names contain the text, so a
+        /// test with virtual ports never opens a real controller
+        /// (audio-qa.md, Virtual MIDI controllers).
+        pub real_midi: Option<String>,
         /// Devices that start, make [`STALL_AFTER`] callbacks, and then
         /// stop calling back with no error, as a macOS device did after a
         /// rate change. They play on [`Fake::stall_tape`].
@@ -564,10 +569,17 @@ pub mod fake {
         }
 
         fn midi_inputs(&self) -> Result<Vec<String>, String> {
-            Ok(self.0.midi.clone())
+            match &self.0.real_midi {
+                Some(only) => Ok(System.midi_inputs()?.into_iter().filter(|n| n.contains(only)).collect()),
+                None => Ok(self.0.midi.clone()),
+            }
         }
 
         fn open_midi(&self, name: &str, midi: SharedMidi) -> Result<Box<dyn MidiPort>, String> {
+            if let Some(only) = &self.0.real_midi {
+                assert!(name.contains(only), "a test opens only its own MIDI ports");
+                return System.open_midi(name, midi);
+            }
             if !self.0.midi.iter().any(|n| n == name) {
                 return Err(format!("no MIDI input port found matching `{name}`"));
             }

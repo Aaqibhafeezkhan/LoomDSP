@@ -17,13 +17,15 @@
 //! a timer thread instead of a device, [`AudioOutput::stepped`] plays it only
 //! when a test asks and keeps every sample on a [`Tape`], and
 //! [`AudioOutput::record`] saves what the engine plays to a WAV file through
-//! a [`Recorder`] that can outlive many streams.
+//! a [`Recorder`] that can outlive many streams. A [`VirtualController`]
+//! plays MIDI into the app through a virtual port, on macOS and Linux.
 
 #![warn(missing_docs)]
 
 mod capture;
 mod record;
 mod stepped;
+mod virtual_midi;
 
 pub use capture::{Capture, CaptureReport};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -36,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 pub use stepped::Tape;
+pub use virtual_midi::VirtualController;
 
 /// Errors from the desktop host.
 #[derive(Debug, thiserror::Error)]
@@ -305,7 +308,7 @@ impl AudioOutput {
     /// [`Tape::step`], `block` frames at a time, and keeps every sample on
     /// `tape`. Many streams can share one tape, one after another. Time is
     /// counted in frames, never on the clock, so a test gives the same tape
-    /// on any machine (`docs/design/audio-qa.md`, Part 1).
+    /// on any machine (`docs/design/audio-qa.md`, Stepped test output).
     pub fn stepped(sample_rate: u32, block: u32, tape: &Tape) -> Self {
         Self {
             kind: Kind::Stepped {
@@ -825,18 +828,69 @@ pub fn send_midi(midi: &SharedMidi, event: MidiEvent) -> bool {
         .send(event)
 }
 
+/// Which notes are held, one bit per note on each of the 16 channels. A
+/// MIDI input and a virtual controller each keep one, so each can release
+/// exactly the notes it holds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HeldNotes([u128; 16]);
+
+impl HeldNotes {
+    /// Follows one MIDI message: a note on holds its note, and a note off
+    /// (or a note on with velocity 0) lets it go. Other messages change
+    /// nothing.
+    pub fn track(&mut self, bytes: &[u8]) {
+        if let [status, note, velocity] = *bytes
+            && note < 128
+        {
+            let bit = 1u128 << note;
+            let held = &mut self.0[usize::from(status & 0x0F)];
+            match status & 0xF0 {
+                0x90 if velocity > 0 => *held |= bit,
+                0x80 | 0x90 => *held &= !bit,
+                _ => {}
+            }
+        }
+    }
+
+    /// The held notes as `(channel, note)`, in order. The iterator owns a
+    /// copy, so the caller can send, and change what is held, while it walks.
+    pub fn notes(&self) -> impl Iterator<Item = (u8, u8)> + use<> {
+        let held = self.0;
+        (0..16u8).flat_map(move |channel| {
+            (0..128u8)
+                .filter(move |&note| held[usize::from(channel)] & (1u128 << note) != 0)
+                .map(move |note| (channel, note))
+        })
+    }
+
+    /// The held notes, as [`notes`](Self::notes) gives them. None is held
+    /// after.
+    pub fn take(&mut self) -> impl Iterator<Item = (u8, u8)> + use<> {
+        let notes = self.notes();
+        *self = Self::default();
+        notes
+    }
+
+    /// True if any note is held.
+    pub fn any(&self) -> bool {
+        self.0.iter().any(|&h| h != 0)
+    }
+}
+
 /// One MIDI input's path into the engine. It remembers which notes are held
 /// on that input, so closing the input can release them.
 pub struct MidiInputState {
     midi: SharedMidi,
-    /// One bit per note, per channel.
-    held: [u128; 16],
+    held: HeldNotes,
 }
 
 impl MidiInputState {
     /// A path into `midi` with no notes held.
     pub fn new(midi: SharedMidi) -> Self {
-        Self { midi, held: [0; 16] }
+        Self {
+            midi,
+            held: HeldNotes::default(),
+        }
     }
 
     /// Sends one message from the input to the engine, applied at the start
@@ -846,17 +900,7 @@ impl MidiInputState {
         if status == 0xF0 || bytes.len() > 3 {
             return;
         }
-        if let [status, note, velocity] = *bytes
-            && note < 128
-        {
-            let channel = usize::from(status & 0x0F);
-            let bit = 1u128 << note;
-            match status & 0xF0 {
-                0x90 if velocity > 0 => self.held[channel] |= bit,
-                0x80 | 0x90 => self.held[channel] &= !bit,
-                _ => {}
-            }
-        }
+        self.held.track(bytes);
         // Frame 0: applied at the start of the next audio buffer
         // (NFR-PERF-07). Sub-buffer timestamps come later.
         send_midi(&self.midi, MidiEvent::from_bytes(0, bytes));
@@ -864,19 +908,14 @@ impl MidiInputState {
 
     /// Sends a note off for every note held on this input.
     pub fn release_all(&mut self) {
-        for (channel, held) in self.held.iter_mut().enumerate() {
-            for note in 0..128u8 {
-                if *held & (1u128 << note) != 0 {
-                    send_midi(&self.midi, MidiEvent::note_off(0, channel as u8, note));
-                }
-            }
-            *held = 0;
+        for (channel, note) in self.held.take() {
+            send_midi(&self.midi, MidiEvent::note_off(0, channel, note));
         }
     }
 
     /// True if any note is held on this input.
     pub fn holds_notes(&self) -> bool {
-        self.held.iter().any(|&h| h != 0)
+        self.held.any()
     }
 }
 
@@ -1324,6 +1363,27 @@ mod tests {
         assert_eq!(gate(&mut parts.engine), 0.0, "and is released");
     }
 
+    /// Held notes are kept per channel, a note on with velocity 0 lets go,
+    /// and other messages change nothing.
+    #[test]
+    fn held_notes_follow_note_on_and_off() {
+        let mut held = HeldNotes::default();
+        held.track(&[0x90, 60, 100]);
+        held.track(&[0x93, 60, 100]);
+        held.track(&[0x9F, 127, 1]);
+        held.track(&[0x93, 62, 100]);
+        held.track(&[0x93, 62, 0]);
+        held.track(&[0xB0, 61, 100]);
+        held.track(&[0x90, 200, 100]);
+        held.track(&[0x90, 61]);
+        assert!(held.any());
+        assert_eq!(held.take().collect::<Vec<_>>(), [(0, 60), (3, 60), (15, 127)]);
+        assert!(!held.any(), "none is held after take");
+        held.track(&[0x90, 60, 100]);
+        held.track(&[0x80, 60, 64]);
+        assert_eq!(held, HeldNotes::default());
+    }
+
     #[test]
     fn sysex_and_long_messages_are_not_sent() {
         let parts = create_engine(loom_modules::registry(), EngineConfig::default());
@@ -1338,3 +1398,52 @@ mod tests {
 /// Checks on a real audio device, ignored by default.
 #[cfg(test)]
 mod device_tests;
+
+/// Checks through virtual MIDI ports (`docs/design/audio-qa.md`, Virtual MIDI controllers).
+/// They need the operating system's MIDI service, so they are ignored by
+/// default: run them with `cargo test -p loom-host-desktop -- --ignored` on
+/// macOS, or on Linux with the ALSA sequencer.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod virtual_midi_tests {
+    use super::*;
+    use loom_core::{EngineConfig, OutputSafety, create_engine};
+
+    /// A note played on a virtual controller reaches the engine through
+    /// `connect_midi_named`, and closing the connection releases it.
+    #[test]
+    #[ignore = "needs virtual MIDI ports (macOS, or Linux with ALSA)"]
+    fn closing_a_real_input_releases_its_held_notes() {
+        let config = EngineConfig {
+            output_safety: OutputSafety::Off,
+            ..EngineConfig::with_sample_rate(48_000.0)
+        };
+        let mut parts = create_engine(loom_modules::registry(), config);
+        let c = &mut parts.controller;
+        let note = c.add_module("loom.midi.note").unwrap();
+        let out = c.add_module("loom.io.audio-out").unwrap();
+        c.connect_named(note, "gate", out, "left").unwrap();
+        c.commit().unwrap();
+        let mut gate = || {
+            let (mut left, mut right) = (vec![0.0; 256], vec![0.0; 256]);
+            parts.engine.process(&mut left, &mut right);
+            left[255]
+        };
+        let mut wait_for = |value: f32| {
+            (0..200).any(|_| {
+                std::thread::sleep(Duration::from_millis(5));
+                gate() == value
+            })
+        };
+
+        let mut keys = VirtualController::create(&format!("Loom test {}", std::process::id())).unwrap();
+        let name = keys.input_name().unwrap();
+        let input = connect_midi_named(&name, share_midi(parts.midi)).unwrap();
+        assert_eq!(input.port_name(), name);
+        keys.note_on(0, 60, 100).unwrap();
+        assert!(wait_for(1.0), "the note plays");
+
+        input.close();
+        assert!(wait_for(0.0), "closing the input releases the held note");
+        assert!(keys.holds_notes(), "while the key is still held");
+    }
+}
