@@ -131,6 +131,18 @@ fn constant() {
         .check(reference!("constant"));
 }
 
+/// Reference render for `loom.math.convert`: pitch to Hz on a rising ramp.
+#[test]
+fn convert() {
+    Harness::new(&math::CONVERT)
+        .seconds(0.01)
+        .input("in", Signal::from_fn(|frame| frame as f32 / 480.0 * 0.2 - 0.1))
+        .param("mode", 2.0)
+        // Hz values reach hundreds, so one float step differs between maths libraries.
+        .tolerance(1e-3)
+        .check(reference!("convert"));
+}
+
 #[test]
 fn note_in() {
     Harness::new(&midi::NOTE_IN)
@@ -291,6 +303,7 @@ fn every_dsp_module_has_a_reference_test() {
         &math::ADD,
         &math::MUL,
         &math::CONSTANT,
+        &math::CONVERT,
         &level::AMP,
         &midi::NOTE_IN,
         &display::METER,
