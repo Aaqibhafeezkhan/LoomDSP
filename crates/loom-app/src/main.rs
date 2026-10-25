@@ -488,9 +488,14 @@ impl App {
         Self::boot(args, &mut recovery::Dialogs)
     }
 
-    /// Starts the app on the real devices.
+    /// Starts the app on the real devices. Tests get the real audio but no
+    /// MIDI inputs, so connected hardware cannot change their results.
     fn boot(args: Args, prompt: &mut dyn recovery::Prompt) -> Self {
-        Self::boot_with(args, prompt, Rc::new(devices::System))
+        #[cfg(test)]
+        let host: Rc<dyn devices::Host> = Rc::new(devices::fake::NoMidi);
+        #[cfg(not(test))]
+        let host: Rc<dyn devices::Host> = Rc::new(devices::System);
+        Self::boot_with(args, prompt, host)
     }
 
     /// Starts the app: reads the preferences, opens this run's recovery
@@ -2547,6 +2552,16 @@ mod tests {
 
     fn app() -> App {
         App::new(app_args())
+    }
+
+    /// The test constructors never open a real MIDI port (issue 221): the
+    /// app built by `App::new` has no open inputs, and the host it uses
+    /// reports none, whatever is plugged into the machine.
+    #[test]
+    fn test_app_opens_no_midi_ports() {
+        let app = app();
+        assert!(app.rig.ports.is_empty());
+        assert!(devices::Host::midi_inputs(&devices::fake::NoMidi).unwrap().is_empty());
     }
 
     pub(crate) fn app_args() -> Args {
