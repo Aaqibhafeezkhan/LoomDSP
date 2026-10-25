@@ -121,7 +121,9 @@ The inspector stays, as the place for:
 
 - every parameter, including those not on the tile;
 - typing exact values;
-- modulation ranges, MIDI learn, and other settings that do not fit on a control.
+- modulation ranges, MIDI mappings, and other settings that do not fit on a control.
+
+MIDI learn grew past the inspector. ADR-0013 places it there, and that ADR is frozen, so the change is recorded here: learn mode arms controls on tiles as well as inspector rows, and the inspector shows each parameter's mapping and removes it ([MIDI learn](midi-learn.md#seeing-and-removing-mappings)). *Why:* touching the control you want, then the hardware, is the order the user thinks in.
 
 ### Removing an item
 
@@ -408,7 +410,7 @@ A user zooms in on Clock Divide. The knob says "Division", not `n`. They rest th
 
 - Translation (NFR-UX-04). Text is looked up by module ID and name when it comes.
 - Labels and descriptions for display values and panel widgets, so lights keep showing names.
-- Help pages (#43), and module descriptions in the module picker.
+- [Help pages](help-pages.md) (#43), and module descriptions in the module picker.
 - Touch: long-press for hover text.
 - A shorter delay for the next hover text once one has shown. Consider it if reading a column of ports feels slow in use.
 
@@ -638,5 +640,4 @@ A sub-patch's surface is made of the same widgets as its inside. *Why:* a user w
 
 - Can users change the layout of a built-in module's panel? Its look cannot change (ADR-0025).
 - How third-party modules add display kinds through the SDK.
-- The exact format of display values: how many per module, and whether they share the meter queue or use a latest-value buffer.
 - A derived display value gets a light. Once display values carry a unit and range ([#118](https://github.com/brylie/LoomDSP/issues/118)), should those with a unit get a readout or a meter instead?
