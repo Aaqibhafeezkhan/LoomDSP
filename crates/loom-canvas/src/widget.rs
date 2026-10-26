@@ -604,7 +604,9 @@ fn relative(cursor: mouse::Cursor, bounds: Rectangle) -> Option<Point> {
 
 fn reset_zoom(camera: &mut Camera, bounds: Rectangle) {
     let centre = Point::new(bounds.width * 0.5, bounds.height * 0.5);
-    camera.zoom_at(centre, 1.0 / camera.zoom);
+    let world_centre = camera.to_world(centre);
+    camera.zoom = 1.0;
+    camera.origin = Point::new(world_centre.x - centre.x, world_centre.y - centre.y);
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for PatchCanvas<'_, Message>
@@ -878,6 +880,12 @@ impl<Message> PatchCanvas<'_, Message> {
                     && over =>
             {
                 reset_zoom(&mut state.camera, bounds);
+                if let Some(screen) = screen {
+                    let world = state.camera.to_world(screen);
+                    state.cursor = Some(world);
+                    state.hover_text.restart(Instant::now());
+                    state.hover = Some(self.scene.hit(world, state.hit_radius()));
+                }
                 shell.request_redraw();
                 shell.capture_event();
             }
@@ -3876,7 +3884,7 @@ mod tests {
 
         reset_zoom(&mut camera, bounds);
 
-        assert!((camera.zoom - 1.0).abs() < 1e-6);
+        assert_eq!(camera.zoom, 1.0);
         assert!((camera.to_world(centre).x - world_centre.x).abs() < 1e-3);
         assert!((camera.to_world(centre).y - world_centre.y).abs() < 1e-3);
     }
