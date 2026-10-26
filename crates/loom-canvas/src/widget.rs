@@ -602,6 +602,7 @@ fn relative(cursor: mouse::Cursor, bounds: Rectangle) -> Option<Point> {
     cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))
 }
 
+/// Resets zoom to 1.0 while keeping the world point at the viewport centre fixed.
 fn reset_zoom(camera: &mut Camera, bounds: Rectangle) {
     let centre = Point::new(bounds.width * 0.5, bounds.height * 0.5);
     let world_centre = camera.to_world(centre);
@@ -885,6 +886,9 @@ impl<Message> PatchCanvas<'_, Message> {
                     state.cursor = Some(world);
                     state.hover_text.restart(Instant::now());
                     state.hover = Some(self.scene.hit(world, state.hit_radius()));
+                    if let Interaction::Selecting { current, .. } = &mut state.interaction {
+                        *current = world;
+                    }
                 }
                 shell.request_redraw();
                 shell.capture_event();
@@ -3872,6 +3876,7 @@ mod tests {
         assert!(later.is_empty(), "{later:?}");
     }
 
+    /// Checks that zoom reset sets 1.0 and preserves the viewport-centre world point.
     #[test]
     fn reset_zoom_sets_one_and_keeps_the_viewport_centre_anchored() {
         let mut camera = Camera {
