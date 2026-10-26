@@ -602,6 +602,11 @@ fn relative(cursor: mouse::Cursor, bounds: Rectangle) -> Option<Point> {
     cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))
 }
 
+fn reset_zoom(camera: &mut Camera, bounds: Rectangle) {
+    let centre = Point::new(bounds.width * 0.5, bounds.height * 0.5);
+    camera.zoom_at(centre, 1.0 / camera.zoom);
+}
+
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for PatchCanvas<'_, Message>
 where
     Renderer: iced_wgpu::primitive::Renderer + text::Renderer<Font = Font>,
@@ -866,6 +871,15 @@ impl<Message> PatchCanvas<'_, Message> {
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if matches!(key.as_ref(), keyboard::Key::Character("0"))
+                    && (modifiers.command() || modifiers.control())
+                    && over =>
+            {
+                reset_zoom(&mut state.camera, bounds);
+                shell.request_redraw();
+                shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key, modifiers, repeat, ..
@@ -3848,6 +3862,23 @@ mod tests {
         assert_eq!(lost, vec![CanvasEvent::GestureEnd]);
         let later = drive(&canvas, &mut state, &released(), knob);
         assert!(later.is_empty(), "{later:?}");
+    }
+
+    #[test]
+    fn reset_zoom_sets_one_and_keeps_the_viewport_centre_anchored() {
+        let mut camera = Camera {
+            origin: Point::new(-40.0, 25.0),
+            zoom: 2.5,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let centre = Point::new(400.0, 300.0);
+        let world_centre = camera.to_world(centre);
+
+        reset_zoom(&mut camera, bounds);
+
+        assert!((camera.zoom - 1.0).abs() < 1e-6);
+        assert!((camera.to_world(centre).x - world_centre.x).abs() < 1e-3);
+        assert!((camera.to_world(centre).y - world_centre.y).abs() < 1e-3);
     }
 
     /// A second button pressed in a drag replaces the interaction, and must

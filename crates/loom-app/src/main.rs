@@ -2541,10 +2541,10 @@ fn severity_colour(severity: alerts::Severity) -> Color {
 
 const HELP: &str = "A or a double-click on empty canvas opens the module browser at the pointer; type, then Enter adds.\n\
 Drag from a port to patch a cable. Drag a connected input to move or remove its cable.\n\
-Drag tiles to move them. Shift-click or drag a box to select several.\n\
+Drag tiles to move them. Shift-click or drag a box to select several. Cmd/Ctrl+A selects all modules.\n\
 Drag a knob up or down; Shift for fine steps; double-click resets it.\n\
 With a module selected, Tab moves between its controls and the arrow keys change them.\n\
-Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom.\n\
+Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom. Cmd/Ctrl+0 resets zoom to 100%.\n\
 Right-click an output or a cable to add a scope or a meter fed by it.\n\
 F or Home frames the patch. Delete removes the selection.\n\
 Cmd/Ctrl+C copies, X cuts, V pastes at the pointer, and D duplicates the selection.\n\
