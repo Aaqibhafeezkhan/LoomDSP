@@ -102,6 +102,8 @@ pub(crate) enum Command {
         id: u32,
         /// How many display values it publishes.
         displays: u8,
+        /// Bit `i` set when display value `i` is a trigger.
+        triggers: u8,
     },
     RemoveModule {
         slot: usize,
@@ -470,12 +472,13 @@ impl Engine {
                     module,
                     id,
                     displays,
+                    triggers,
                 } => {
                     if let Some(old) = self.slots[slot].replace(module) {
                         self.discard(Garbage::Module(old));
                     }
                     self.display_counts[slot] = displays;
-                    self.displays.claim(slot, id);
+                    self.displays.claim(slot, id, triggers);
                 }
                 Command::RemoveModule { slot } => {
                     if let Some(old) = self.slots[slot].take() {
@@ -680,7 +683,7 @@ impl Engine {
             let maps = &self.schedule.midi_maps;
             let start = maps.partition_point(|map| map.control < control);
             for map in maps[start..].iter().take_while(|map| map.control == control) {
-                let base = crate::midi_map::control_value(map.spec, value);
+                let base = crate::midi_map::control_value(&map.spec, value);
                 set_base(
                     &mut self.slots,
                     &mut self.schedule.fills,
@@ -705,7 +708,7 @@ impl Engine {
             let (token, edited) = self.midi_feedback.read_edit(map.control);
             let newest = token == 0 || later(entry.sequence, edited);
             if entry.id == map.id && Some(entry.sequence) != map.synced && newest {
-                let base = crate::midi_map::control_value(map.spec, entry.value);
+                let base = crate::midi_map::control_value(&map.spec, entry.value);
                 set_base(
                     &mut self.slots,
                     &mut self.schedule.fills,

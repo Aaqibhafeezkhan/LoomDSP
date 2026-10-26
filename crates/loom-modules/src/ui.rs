@@ -43,7 +43,8 @@ pub static BUTTON: ModuleDescriptor = ModuleDescriptor {
             unit: "",
             options: ParamOptions::DEFAULT,
         }
-        .integer(),
+        .integer()
+        .choices(&["Toggle", "Momentary"]),
         ParamSpec {
             name: "on",
             label: "On",

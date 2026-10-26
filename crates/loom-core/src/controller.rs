@@ -1,7 +1,7 @@
 //! The control-thread side of the engine.
 
 use crate::compile::{CompileReport, compile};
-use crate::descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole, Polarity};
+use crate::descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole, ParamRange, Polarity};
 use crate::display::{DisplayReader, DisplaySource, DisplayTable};
 use crate::engine::{Command, Engine, EngineConfig, EngineStats, Garbage};
 use crate::error::LoomError;
@@ -213,6 +213,12 @@ impl Controller {
                     module,
                     id: id.0,
                     displays: descriptor.displays.len() as u8,
+                    triggers: descriptor
+                        .displays
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.kind == crate::descriptor::DisplayKind::Trigger)
+                        .fold(0, |mask, (i, _)| mask | (1 << i)),
                 };
                 if let Err(rtrb::PushError::Full(_)) = self.commands.push(insert) {
                     self.free_slots.push(slot);
@@ -222,14 +228,7 @@ impl Controller {
             }
             ModuleRole::UnitDelay | ModuleRole::AudioOutput => None,
         };
-        self.graph.nodes.insert(
-            id,
-            Node {
-                descriptor,
-                params: descriptor.default_params(),
-                slot,
-            },
-        );
+        self.graph.nodes.insert(id, Node::new(descriptor, slot));
         self.next_id = self.next_id.max(id.0 + 1);
         self.dirty = true;
         Ok(())
@@ -464,8 +463,12 @@ impl Controller {
         param: usize,
     ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
         let result = self.map_midi(seen.control, target, param)?;
-        let spec = &self.node(target)?.descriptor.params[param];
-        self.set_param(target, param, control_value(spec, seen.value))?;
+        // The control spans the selected range (control-ranges.md, rule 4).
+        let spec = self.node(target)?.spec(param).ok_or_else(|| LoomError::NoSuchParam {
+            module: target,
+            param: param.to_string(),
+        })?;
+        self.set_param(target, param, control_value(&spec, seen.value))?;
         Ok(result)
     }
 
@@ -529,9 +532,9 @@ impl Controller {
             }
             if apply
                 && let Some(node) = self.graph.nodes.get_mut(&mapping.target)
-                && let Some(spec) = node.descriptor.params.get(mapping.param)
+                && let Some(spec) = node.spec(mapping.param)
             {
-                node.params[mapping.param] = control_value(spec, entry.value);
+                node.params[mapping.param] = control_value(&spec, entry.value);
                 changed.push((mapping.target, mapping.param));
             }
         }
@@ -583,14 +586,11 @@ impl Controller {
         let node = self.graph.nodes.get(&module).ok_or(LoomError::UnknownModule(module))?;
         let mut clamped = Vec::with_capacity(changes.len());
         for &(index, value) in changes {
-            let spec = node
-                .descriptor
-                .params
-                .get(index)
-                .ok_or_else(|| LoomError::NoSuchParam {
-                    module,
-                    param: index.to_string(),
-                })?;
+            // Clamped to the selected range (control-ranges.md, rule 8).
+            let spec = node.spec(index).ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: index.to_string(),
+            })?;
             clamped.push((index, spec.clamp(value)));
         }
         // Mapped parameters carry an edit token, as in `set_param`.
@@ -653,14 +653,11 @@ impl Controller {
             .nodes
             .get_mut(&module)
             .ok_or(LoomError::UnknownModule(module))?;
-        let spec = node
-            .descriptor
-            .params
-            .get(index)
-            .ok_or_else(|| LoomError::NoSuchParam {
-                module,
-                param: index.to_string(),
-            })?;
+        // Clamped to the selected range (control-ranges.md, rule 8).
+        let spec = node.spec(index).ok_or_else(|| LoomError::NoSuchParam {
+            module,
+            param: index.to_string(),
+        })?;
         let value = spec.clamp(value);
         node.params[index] = value;
         let edit = mapping.map(|(_, control)| (control, self.next_edit));
@@ -697,6 +694,54 @@ impl Controller {
         self.set_param(module, index, value)
     }
 
+    /// Selects the control range of parameter `index` (control-ranges.md).
+    ///
+    /// A smaller range clamps the value into it. A wider range keeps the
+    /// value (rule 6). The knob, the inspector, MIDI, and modulation then
+    /// span the range. `range` must be one the parameter offers, or its
+    /// full range. Modulation and MIDI follow it after the next
+    /// [`Controller::commit`], which puts the bounds into the schedule
+    /// (rule 8). An error leaves the range and the value as they were.
+    pub fn set_range(&mut self, module: ModuleId, index: usize, range: ParamRange) -> Result<(), LoomError> {
+        let node = self
+            .graph
+            .nodes
+            .get_mut(&module)
+            .ok_or(LoomError::UnknownModule(module))?;
+        let spec = node
+            .descriptor
+            .params
+            .get(index)
+            .ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: index.to_string(),
+            })?;
+        // The full range is allowed too: a loaded value that no listed range
+        // holds keeps it, so the value does not change (rule 7).
+        let full = ParamRange::new(spec.min, spec.max);
+        if spec.options.ranges.is_empty() || !(spec.options.ranges.contains(&range) || range == full) {
+            return Err(LoomError::NoSuchRange {
+                module,
+                param: spec.name.to_string(),
+                range: range.to_string(),
+            });
+        }
+        let previous = node.ranges[index].replace(range);
+        let value = node.params[index];
+        let clamped = value.clamp(range.min, range.max);
+        if clamped != value
+            && let Err(error) = self.set_param(module, index, clamped)
+        {
+            if let Some(node) = self.graph.nodes.get_mut(&module) {
+                node.ranges[index] = previous;
+                node.params[index] = value;
+            }
+            return Err(error);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Clears a module's internal state.
     pub fn reset_module(&mut self, module: ModuleId) -> Result<(), LoomError> {
         if let Some(slot) = self.node(module)?.slot {
@@ -710,7 +755,7 @@ impl Controller {
     /// Display value `index` of a module, as of the last block the engine
     /// ran, for a light on its panel (ADR-0013). `None` if the module does
     /// not exist or has no such value. A module the engine has not run yet
-    /// reads 0.
+    /// reads 0. Reading a trigger value clears it (see [`DisplayReader::read`]).
     pub fn display(&self, module: ModuleId, index: usize) -> Option<f32> {
         self.display_source(module, index)
             .map(|source| self.display_reader().read(source))
@@ -732,7 +777,8 @@ impl Controller {
     pub fn display_source(&self, module: ModuleId, index: usize) -> Option<DisplaySource> {
         let node = self.graph.nodes.get(&module)?;
         let slot = node.slot?;
-        (index < node.descriptor.displays.len()).then(|| DisplaySource::new(slot, module.0, index))
+        let spec = node.descriptor.displays.get(index)?;
+        Some(DisplaySource::new(slot, module.0, index, spec.kind))
     }
 
     /// A handle that reads display values from any thread.

@@ -299,6 +299,20 @@ enum Message {
         index: usize,
         value: f32,
     },
+    /// A choice name was picked in the inspector: value `min + choice` of
+    /// the parameter, as one undo step (panels.md, Choice names).
+    Choice {
+        module: u32,
+        index: usize,
+        choice: usize,
+    },
+    /// A range was picked in a parameter's **Range** selector: index
+    /// `range` of the ranges it offers (`docs/design/control-ranges.md`).
+    Range {
+        module: u32,
+        index: usize,
+        range: usize,
+    },
     /// An inspector slider was let go.
     SliderReleased,
     /// Open or close the **Add modulation** list under a parameter.
@@ -344,6 +358,16 @@ enum Message {
     },
 }
 
+/// `opened <path>`, followed by the load notes when there are any, so a note
+/// about what loaded differently stays in view.
+fn opened_status(path: &std::path::Path, notes: &[String]) -> String {
+    if notes.is_empty() {
+        format!("opened {}", path.display())
+    } else {
+        format!("opened {}: {}", path.display(), notes.join("; "))
+    }
+}
+
 struct App {
     controller: Controller,
     positions: BTreeMap<u32, Point>,
@@ -353,6 +377,9 @@ struct App {
     values: PanelValues,
     /// Last brightness of each light, by module and widget.
     lights: BTreeMap<lights::Light, f32>,
+    /// What the last loaded patch loaded differently from its file, such
+    /// as a saved control range that was not kept (control-ranges.md).
+    load_notes: Vec<String>,
     /// Latest level of each meter probe.
     meter_levels: std::collections::HashMap<ProbeId, live::Level>,
     /// Modules whose lights or meters are on screen, as the canvas reports.
@@ -479,6 +506,9 @@ struct Session {
     name: String,
     file: Option<PathBuf>,
     stamp: Option<recovery::Stamp>,
+    /// What loaded differently from the file, such as a saved control
+    /// range that was not kept (control-ranges.md, rule 7).
+    notes: Vec<String>,
 }
 
 impl App {
@@ -676,8 +706,9 @@ impl App {
             telemetry,
         } = create_engine(registry(test_modules), config);
         let mut positions = BTreeMap::new();
+        let mut notes = Vec::new();
         let mut load = |patch: &Patch, controller: &mut Controller| -> Result<String, String> {
-            patch.load_into(controller).map_err(|e| e.to_string())?;
+            notes = patch.load_into(controller).map_err(|e| e.to_string())?;
             for m in &patch.modules {
                 if let Some((x, y)) = m.position {
                     positions.insert(m.id, Point::new(x, y));
@@ -702,6 +733,9 @@ impl App {
             Source::Empty => ("Untitled".to_string(), None, None),
         };
         layout::auto_layout(&controller, &mut positions);
+        for note in &notes {
+            eprintln!("loom-app: {note}");
+        }
         Ok(Session {
             controller,
             engine,
@@ -711,6 +745,7 @@ impl App {
             name,
             file,
             stamp,
+            notes,
         })
     }
 
@@ -736,8 +771,10 @@ impl App {
             name,
             file,
             stamp,
+            notes,
         } = session;
-        let mut status = String::new();
+        let mut status = notes.join("; ");
+        let load_notes = notes;
 
         // Every MIDI input plays the patch, and the "Hold note" button works
         // alongside them, so a keyboard is never hidden behind another port.
@@ -775,6 +812,7 @@ impl App {
             scene,
             values,
             lights: BTreeMap::new(),
+            load_notes,
             meter_levels: std::collections::HashMap::new(),
             visible_displays: Vec::new(),
             selection: BTreeSet::new(),
@@ -1042,8 +1080,14 @@ impl App {
         let Some(path) = files::pick_open(self.file.as_deref()) else {
             return;
         };
-        if self.replace(Source::File(&path)) {
-            self.status = format!("opened {}", path.display());
+        self.open_path(&path);
+    }
+
+    /// Opens the patch at `path` in place of this one, and says so in the
+    /// status bar, with any notes about what loaded differently.
+    fn open_path(&mut self, path: &std::path::Path) {
+        if self.replace(Source::File(path)) {
+            self.status = opened_status(path, &self.load_notes);
         }
     }
 
@@ -1366,6 +1410,33 @@ impl App {
         self.set_param(module, index, value);
     }
 
+    /// Selects a parameter's control range, as one undo step. A smaller
+    /// range clamps the value into it, a wider one keeps it (control-ranges.md,
+    /// rule 6). The commit puts the bounds into the schedule for modulation
+    /// and MIDI (rule 8).
+    fn set_range(&mut self, module: u32, index: usize, range: usize) {
+        let Some(range) = self
+            .controller
+            .graph()
+            .node(ModuleId(module))
+            .and_then(|n| n.descriptor.params.get(index))
+            .and_then(|spec| spec.options.ranges.get(range))
+            .copied()
+        else {
+            return;
+        };
+        self.close_slider_gesture();
+        self.edit(|app| {
+            if let Err(e) = app.controller.set_range(ModuleId(module), index, range) {
+                app.status = format!("error: {e}");
+                return;
+            }
+            app.edits.touch(module, index);
+            app.commit();
+        });
+        self.refresh_values();
+    }
+
     /// Sets a parameter from a control on a tile or in the inspector.
     fn set_param(&mut self, module: u32, index: usize, value: f32) {
         if let Err(e) = self.controller.set_param(ModuleId(module), index, value) {
@@ -1422,7 +1493,7 @@ impl App {
     /// assignment).
     fn assign(&mut self, source: OutputRef, target: ModuleId, index: usize) {
         let graph = self.controller.graph();
-        let Some(spec) = graph.node(target).and_then(|n| n.descriptor.params.get(index)).copied() else {
+        let Some(spec) = graph.node(target).and_then(|n| n.spec(index)) else {
             return;
         };
         let (from, to) = (
@@ -1812,7 +1883,7 @@ impl App {
                     .controller
                     .graph()
                     .node(ModuleId(module))
-                    .and_then(|n| n.descriptor.params.get(index))
+                    .and_then(|n| n.spec(index))
                     .map(|spec| spec.denormalize(position));
                 if let Some(value) = value {
                     self.turn_param(module, index, value);
@@ -1823,12 +1894,25 @@ impl App {
                     .controller
                     .graph()
                     .node(ModuleId(module))
-                    .and_then(|n| n.descriptor.params.get(index))
+                    .and_then(|n| n.spec(index))
                     .map(|spec| spec.clamp(value));
                 if let Some(value) = value {
                     self.turn_param(module, index, value);
                 }
             }
+            Message::Choice { module, index, choice } => {
+                let value = self
+                    .controller
+                    .graph()
+                    .node(ModuleId(module))
+                    .and_then(|n| n.spec(index))
+                    .map(|spec| spec.clamp(spec.min + choice as f32));
+                if let Some(value) = value {
+                    self.turn_param(module, index, value);
+                    self.close_slider_gesture();
+                }
+            }
+            Message::Range { module, index, range } => self.set_range(module, index, range),
             Message::SliderReleased => self.close_slider_gesture(),
             Message::AddModulation { module, index } => {
                 self.adding = if self.adding == Some((module, index)) {
@@ -3561,9 +3645,236 @@ mod tests {
         app.controller.connect_named(gate, "out", env, "gate").unwrap();
         app.commit();
         app.process(4_800);
-        let _ = app.update(Message::Lights(watch.read()));
+        // A level light draws its value as it is, with no fade.
+        let mut fades = vec![lights::Fade::default(); watch.lights.len()];
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, Instant::now())));
         let level = tile_widget(&app, env, light).position;
         assert!(level > 0.5, "the gate is held: {level}");
+    }
+
+    /// Button's mode shows its choice names, "Toggle" and "Momentary", as
+    /// radio buttons, and a parameter without names keeps its slider. No
+    /// module is special-cased: the names come from the descriptor
+    /// (panels.md, Choice names). A pick is one undo step.
+    #[test]
+    fn the_inspector_names_the_choices_of_a_whole_number_parameter() {
+        let mut app = app();
+        let button = app.controller.add_module("loom.ui.button").unwrap();
+        let lfo = app.controller.add_module("loom.mod.lfo").unwrap();
+        app.commit();
+        let rows = |app: &App, module: ModuleId| {
+            let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+                panic!("one module is selected");
+            };
+            assert_eq!(rows.id, module.0);
+            rows.params
+        };
+        let control = |row: &inspector::ParamRow| match &row.mode {
+            inspector::ParamMode::Edit { control, .. } => control.clone(),
+            inspector::ParamMode::Learn { .. } => panic!("not in learn mode"),
+        };
+        let _ = app.update(Message::SelectModule(button.0));
+        let params = rows(&app, button);
+        let mode = params.iter().find(|p| p.label == "Mode").unwrap();
+        assert_eq!(
+            control(mode),
+            inspector::ParamControl::Radio {
+                choices: vec!["Toggle", "Momentary"],
+                selected: 0
+            }
+        );
+        assert_eq!(mode.value, "Toggle", "the value is the name, never the bare number");
+        let on = params.iter().find(|p| p.label != "Mode").unwrap();
+        assert_eq!(control(on), inspector::ParamControl::Slider);
+
+        let undo = app.edits.history.undo_step().map(|s| s.name().to_string());
+        let _ = app.update(Message::Choice {
+            module: button.0,
+            index: mode.index,
+            choice: 1,
+        });
+        assert_eq!(app.controller.graph().node(button).unwrap().params[mode.index], 1.0);
+        let mode = rows(&app, button).into_iter().find(|p| p.label == "Mode").unwrap();
+        assert_eq!(mode.value, "Momentary");
+        assert_ne!(
+            app.edits.history.undo_step().map(|s| s.name().to_string()),
+            undo,
+            "one step"
+        );
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.controller.graph().node(button).unwrap().params[mode.index], 0.0);
+
+        // More than four names: a pick list.
+        let _ = app.update(Message::SelectModule(lfo.0));
+        let shape = rows(&app, lfo).into_iter().find(|p| p.label == "Shape").unwrap();
+        let inspector::ParamControl::PickList { choices, selected } = control(&shape) else {
+            panic!("five shapes are a pick list: {shape:?}");
+        };
+        assert_eq!(choices.len(), 5);
+        assert_eq!(selected, 0);
+    }
+
+    /// A saved range that does not hold its value loads with the smallest
+    /// range that does, the value unchanged, and a note in the status bar
+    /// (control-ranges.md, rule 7).
+    #[test]
+    fn a_range_note_shows_in_the_status_bar() {
+        let dir = std::env::temp_dir().join(format!("loom-app-range-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("range.ron");
+        std::fs::write(
+            &path,
+            r#"Patch(version: 1, modules: [(id: 1, kind: "loom.math.mul@1", params: {"gain": 5.0}, ranges: {"gain": (-0.1, 0.1)})])"#,
+        )
+        .unwrap();
+        let app = App::new(Args {
+            patch: Some(path),
+            ..app_args()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = app.controller.graph().node(ModuleId(1)).unwrap();
+        assert_eq!(
+            (node.params[0], node.range(0)),
+            (5.0, Some(loom_core::ParamRange::new(-5.0, 5.0)))
+        );
+        assert!(app.status.contains("-0.1 to 0.1"), "{}", app.status);
+    }
+
+    /// Opening a patch that loads as saved says only "opened <path>". One
+    /// with a load note says the note after it.
+    #[test]
+    fn opening_a_patch_names_only_its_load_notes() {
+        let mut app = app();
+        let clean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches/subtractive.ron");
+        app.open_path(&clean);
+        assert_eq!(app.status, format!("opened {}", clean.display()));
+
+        let dir = std::env::temp_dir().join(format!("loom-app-open-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let noted = dir.join("noted.ron");
+        std::fs::write(
+            &noted,
+            r#"Patch(version: 1, modules: [(id: 1, kind: "loom.math.mul@1", params: {"gain": 5.0}, ranges: {"gain": (-0.1, 0.1)})])"#,
+        )
+        .unwrap();
+        app.open_path(&noted);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            app.status.starts_with(&format!("opened {}: module 1", noted.display())),
+            "{}",
+            app.status
+        );
+
+        app.open_path(&clean);
+        assert_eq!(
+            app.status,
+            format!("opened {}", clean.display()),
+            "the old note is gone"
+        );
+    }
+
+    /// control-ranges.md: Multiply's gain shows a **Range** selector. A
+    /// smaller range clamps the value, as one undo step, and the tile knob
+    /// then spans the selected range. Undo brings back range and value.
+    #[test]
+    fn the_inspector_selects_a_control_range() {
+        let mut app = app();
+        let mul = app.controller.add_module("loom.math.mul").unwrap();
+        app.controller.set_param(mul, 0, 0.5).unwrap();
+        app.commit();
+        let _ = app.update(Message::SelectModule(mul.0));
+        let gain_row = |app: &App| {
+            let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+                panic!("one module is selected");
+            };
+            rows.params.into_iter().find(|p| p.label == "Gain").unwrap()
+        };
+        let range = gain_row(&app).range.expect("a Range selector");
+        assert_eq!(range.choices.len(), 7);
+        assert_eq!(range.choices[0], "-0.1 to 0.1");
+        assert_eq!(range.choices[range.selected.unwrap()], "-1 to 1");
+
+        let _ = app.update(Message::Range {
+            module: mul.0,
+            index: 0,
+            range: 0,
+        });
+        let row = gain_row(&app);
+        assert_eq!(row.range.unwrap().selected, Some(0));
+        assert_eq!(app.controller.graph().node(mul).unwrap().params[0], 0.1, "clamped");
+        assert_eq!(
+            app.edits.history.undo_step().map(|s| s.name().to_string()).as_deref(),
+            Some("change Multiply Gain range")
+        );
+        // The tile knob and its keyboard steps span -0.1 to 0.1.
+        let widget = app
+            .controller
+            .graph()
+            .node(mul)
+            .unwrap()
+            .descriptor
+            .panel
+            .widgets
+            .iter()
+            .position(|w| w.bind == "gain")
+            .unwrap();
+        let (_, _, spec) = scene::control_param(&app.controller, mul.0, widget).unwrap();
+        assert_eq!((spec.min, spec.max), (-0.1, 0.1));
+        assert!(
+            (spec.denormalize(0.51) - spec.denormalize(0.5) - 0.002).abs() < 1e-6,
+            "1% of the range"
+        );
+
+        let _ = app.update(Message::Undo);
+        let node = app.controller.graph().node(mul).unwrap();
+        assert_eq!(
+            (node.params[0], node.range(0)),
+            (0.5, Some(loom_core::ParamRange::new(-1.0, 1.0)))
+        );
+        // A parameter without ranges has no selector.
+        let lfo = app.controller.add_module("loom.mod.lfo").unwrap();
+        app.commit();
+        let _ = app.update(Message::SelectModule(lfo.0));
+        let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+            panic!("one module is selected");
+        };
+        assert!(rows.params.iter().all(|p| p.range.is_none()));
+    }
+
+    /// A one-sample trigger lights Clock Divide's trigger light, though the
+    /// output went low again long before the light is read. The light fades
+    /// out in 120 ms, and a second read without a trigger is dark
+    /// (panels.md, Lights for one-sample triggers).
+    #[test]
+    fn a_one_sample_trigger_lights_the_divide_light() {
+        let mut app = app();
+        let gate = app.controller.add_module("loom.math.constant").unwrap();
+        app.controller.set_param_named(gate, "value", 1.0).unwrap();
+        let divide = app.controller.add_module("loom.logic.divide").unwrap();
+        app.controller.set_param_named(divide, "n", 1.0).unwrap();
+        app.controller.connect_named(gate, "out", divide, "trigger").unwrap();
+        app.commit();
+        let d = app.controller.graph().node(divide).unwrap().descriptor;
+        let light = d.panel.widgets.iter().position(|w| w.bind == "fired").unwrap();
+        let _ = app.update(Message::Canvas(CanvasEvent::VisibleDisplays(vec![divide.0])));
+        let watch = app.watched_lights().expect("the trigger light is on screen");
+
+        // The constant's rise is one trigger in the first frame, then 4 799
+        // frames of 0.
+        app.process(4_800);
+        let start = Instant::now();
+        let mut fades = vec![lights::Fade::default(); watch.lights.len()];
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, start)));
+        assert_eq!(tile_widget(&app, divide, light).position, 1.0, "the trigger lit it");
+
+        app.process(4_800);
+        let later = start + lights::FADE;
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, later)));
+        assert_eq!(
+            tile_widget(&app, divide, light).position,
+            0.0,
+            "faded, and no new trigger"
+        );
     }
 
     /// A meter on screen follows the engine through the app's `Meters`

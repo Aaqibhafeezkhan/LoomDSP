@@ -58,6 +58,16 @@ pub enum LoomError {
         /// The parameter name or index.
         param: String,
     },
+    /// A control range a parameter does not offer.
+    #[error("parameter `{param}` of module {module} offers no range {range}")]
+    NoSuchRange {
+        /// The module.
+        module: ModuleId,
+        /// The parameter name.
+        param: String,
+        /// The range asked for, as its name.
+        range: String,
+    },
     /// A transient parameter cannot be modulated or mapped to MIDI, because
     /// it carries a live gesture, not a setting (transient-params.md).
     #[error("parameter `{param}` of module {module} is a live control and cannot be modulated or mapped")]

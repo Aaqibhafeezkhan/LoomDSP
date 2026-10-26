@@ -1201,15 +1201,33 @@ impl<Message> PatchCanvas<'_, Message> {
             Some(Hit::Widget { module, widget }) if self.is_control(module, widget) => {
                 Some(HoverTarget::Control(module, widget))
             }
-            // A port's label, or the bar standing in for it, hovers like
-            // the port (panels.md, Hover text).
-            Some(Hit::Module(_)) => state
+            // A light or meter belongs to the tile for presses, so the hit
+            // is the module. Its hover text still shows. A port's label, or
+            // the bar standing in for it, hovers like the port (panels.md,
+            // Hover text).
+            Some(Hit::Module(id)) => state
                 .cursor
-                .and_then(|world| tile_text::port_label_at(self.scene, world))
-                .map(HoverTarget::Port)
+                .and_then(|world| {
+                    let display = self
+                        .scene
+                        .module(id)
+                        .and_then(|m| m.display_at(world))
+                        .filter(|&widget| self.has_hover_text(id, widget))
+                        .map(|widget| HoverTarget::Control(id, widget));
+                    display.or_else(|| tile_text::port_label_at(self.scene, world).map(HoverTarget::Port))
+                })
                 .or(focused),
             _ => focused,
         }
+    }
+
+    /// True for controls, and for lights and meters with a description
+    /// (port-and-parameter-text.md, Display values).
+    fn has_hover_text(&self, module: u32, widget: usize) -> bool {
+        self.scene
+            .module(module)
+            .and_then(|m| m.panel.widgets.get(widget))
+            .is_some_and(|w| w.is_control() || !w.hover.description.is_empty())
     }
 
     fn is_control(&self, module: u32, widget: usize) -> bool {
@@ -2244,7 +2262,11 @@ impl<Message> PatchCanvas<'_, Message> {
     }
 
     /// The label, hover text, and world bounds of what hover text is about.
-    fn hover_content(&self, target: HoverTarget) -> Option<(&str, &HoverText, Rectangle)> {
+    /// The label, hover text, value line, and anchor of a hover target. Only
+    /// lights and meters have a value line: their current value, which the
+    /// app writes as the widget's text (port-and-parameter-text.md, Display
+    /// values). A control's value shows on the control itself.
+    fn hover_content(&self, target: HoverTarget) -> Option<(&str, &HoverText, Option<&str>, Rectangle)> {
         match target {
             HoverTarget::Port(port) => {
                 let view = self.scene.port(port)?;
@@ -2253,12 +2275,17 @@ impl<Message> PatchCanvas<'_, Message> {
                     Point::new(at.x - PORT_RADIUS, at.y - PORT_RADIUS),
                     Size::new(2.0 * PORT_RADIUS, 2.0 * PORT_RADIUS),
                 );
-                Some((&view.label, &view.hover, anchor))
+                Some((&view.label, &view.hover, None, anchor))
             }
-            HoverTarget::Control(module, widget) => {
-                let module = self.scene.module(module)?;
+            HoverTarget::Control(id, widget) => {
+                let module = self.scene.module(id)?;
                 let view = module.panel.widgets.get(widget)?;
-                Some((&view.label, &view.hover, module.widget_bounds(widget)?))
+                let value = (!view.is_control())
+                    .then(|| self.values.and_then(|v| v.get(id, widget)))
+                    .flatten()
+                    .map(|v| v.text.as_str())
+                    .filter(|text| !text.is_empty());
+                Some((&view.label, &view.hover, value, module.widget_bounds(widget)?))
             }
         }
     }
@@ -2271,14 +2298,14 @@ impl<Message> PatchCanvas<'_, Message> {
     where
         Renderer: text::Renderer<Font = Font>,
     {
-        let Some((label, hover, world)) = state.hover_text.shown().and_then(|t| self.hover_content(t)) else {
+        let Some((label, hover, value, world)) = state.hover_text.shown().and_then(|t| self.hover_content(t)) else {
             return;
         };
         let font = renderer.default_font();
         let inner = crate::hover::text_width(bounds.width);
         // Each line is measured as a paragraph, then drawn as text in that
         // size, wrapped at word boundaries.
-        let line = |content: &str, size: f32, colour: Color| {
+        let line = |content: &str, size: f32, colour: Color, font: Font| {
             let text = Text {
                 content: content.to_string(),
                 bounds: Size::new(inner, f32::INFINITY),
@@ -2299,12 +2326,22 @@ impl<Message> PatchCanvas<'_, Message> {
                 colour,
             )
         };
-        let mut lines = vec![line(label, HOVER_TEXT_PX, self.palette.text)];
+        // A light's or meter's label is bold, so it stands apart from its
+        // value line (port-and-parameter-text.md, Display values).
+        let bold = Font {
+            weight: iced::font::Weight::Bold,
+            ..font
+        };
+        let title = if value.is_some() { bold } else { font };
+        let mut lines = vec![line(label, HOVER_TEXT_PX, self.palette.text, title)];
         if !hover.description.is_empty() {
-            lines.push(line(&hover.description, HOVER_TEXT_PX, self.palette.text_dim));
+            lines.push(line(&hover.description, HOVER_TEXT_PX, self.palette.text_dim, font));
+        }
+        if let Some(value) = value {
+            lines.push(line(value, HOVER_TEXT_PX, self.palette.text, font));
         }
         if let Some(name) = &hover.name {
-            lines.push(line(name, HOVER_TEXT_PX - 1.0, self.palette.text_dim));
+            lines.push(line(name, HOVER_TEXT_PX - 1.0, self.palette.text_dim, font));
         }
         const LINE_GAP: f32 = 3.0;
         let width = lines.iter().map(|(t, _)| t.bounds.width).fold(0.0, f32::max);
@@ -2426,6 +2463,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WidgetValue;
     use crate::scene::{CableView, ModuleView, PanelView, PortShape, PortView, WidgetView};
 
     fn module(id: u32, x: f32) -> ModuleView {
@@ -2580,6 +2618,68 @@ mod tests {
             ..on(Hit::Module(1))
         };
         assert_eq!(canvas.hover_target(&on_label), Some(HoverTarget::Port(port)));
+    }
+
+    /// A light with a description hovers like a control, and its hover
+    /// text has the value line the app wrote. A light with no description
+    /// shows none (port-and-parameter-text.md, Display values).
+    #[test]
+    fn a_light_shows_its_description_and_value() {
+        let mut m = module(1, 0.0);
+        m.panel = panel();
+        let plain = m.clone();
+        m.panel.widgets[1].hover = HoverText::new("Gate", "Lit while a key is held.", "gate");
+        let mut meter = module(2, 600.0);
+        meter.panel = PanelView {
+            width: 3,
+            height: 6,
+            widgets: vec![widget(WidgetViewKind::Meter, 0)],
+        };
+        meter.panel.widgets[0].hover = HoverText::new("Out", "The signal.", "out");
+        let mut values = PanelValues::new();
+        values.set(
+            1,
+            1,
+            WidgetValue {
+                position: 1.0,
+                text: "Gate: 1.00".to_string(),
+                ..WidgetValue::default()
+            },
+        );
+        let scene = Scene::new(vec![m, meter], Vec::new());
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e).values(&values);
+        // The pointer rests on the middle of a display widget. The hit is
+        // the tile, so a press there still moves it.
+        let resting_on = |scene: &Scene, module: u32, widget: usize| {
+            let point = scene.module(module).unwrap().widget_bounds(widget).unwrap().center();
+            let hit = scene.hit(point, 8.0);
+            assert_eq!(hit, Hit::Module(module), "a display belongs to the tile");
+            State {
+                hover: Some(hit),
+                cursor: Some(point),
+                ..State::default()
+            }
+        };
+        assert_eq!(
+            canvas.hover_target(&resting_on(&scene, 1, 1)),
+            Some(HoverTarget::Control(1, 1))
+        );
+        assert_eq!(
+            canvas.hover_target(&resting_on(&scene, 2, 0)),
+            Some(HoverTarget::Control(2, 0))
+        );
+        let (_, hover, value, _) = canvas.hover_content(HoverTarget::Control(1, 1)).unwrap();
+        assert_eq!(hover.description, "Lit while a key is held.");
+        assert_eq!(value, Some("Gate: 1.00"));
+        // A knob's value shows on the knob, not in the hover text.
+        let (_, _, value, _) = canvas.hover_content(HoverTarget::Control(1, 0)).unwrap();
+        assert_eq!(value, None);
+
+        // A light with no description shows none.
+        let scene = Scene::new(vec![plain], Vec::new());
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        assert_eq!(canvas.hover_target(&resting_on(&scene, 1, 1)), None);
     }
 
     #[test]

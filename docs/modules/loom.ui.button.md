@@ -24,7 +24,7 @@ None.
 
 | Parameter | Range | Default | Description |
 |---|---|---|---|
-| **Mode** (`mode`) | 0 to 1, whole numbers | 0 | Toggle keeps the gate. Momentary is high only while the button is held. |
+| **Mode** (`mode`) | 0 to 1, whole numbers, choices Toggle, Momentary | 0 | Toggle keeps the gate. Momentary is high only while the button is held. |
 | **On** (`on`) | 0 to 1, whole numbers | 0 | The gate the button keeps in Toggle mode. |
 | **Hold** (`hold`) | 0 to 1, whole numbers, not saved | 0 | High while the button is held in Momentary mode. Never saved. |
 

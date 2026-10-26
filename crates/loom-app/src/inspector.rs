@@ -7,7 +7,9 @@
 
 use crate::modulation::{self, PolarityChoice};
 use crate::{App, DIM, HELP, Message, param, remove_button};
-use iced::widget::{button, column, container, pick_list, row, scrollable, slider, space, text, toggler, tooltip};
+use iced::widget::{
+    button, column, container, pick_list, radio, row, scrollable, slider, space, text, toggler, tooltip,
+};
 use iced::{Element, Length};
 use loom_core::{AssignmentId, ModuleId, OutputRef};
 use serde::Serialize;
@@ -56,7 +58,20 @@ pub struct ParamRow {
     pub value: String,
     /// The MIDI control mapped to it.
     pub mapping: Option<String>,
+    /// The **Range** selector, for a parameter that offers ranges.
+    pub range: Option<RangeRow>,
     pub mode: ParamMode,
+}
+
+/// The **Range** selector next to a parameter's slider
+/// (`docs/design/control-ranges.md`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RangeRow {
+    /// Each range's name, such as "-0.1 to 0.1", from the smallest up.
+    pub choices: Vec<String>,
+    /// Index of the selected range, or `None` for the parameter's full
+    /// range when no listed range held a loaded value.
+    pub selected: Option<usize>,
 }
 
 /// How a parameter row behaves.
@@ -66,17 +81,61 @@ pub enum ParamMode {
     /// MIDI learn mode: the row arms its parameter, and shows `detail` in
     /// place of the value (`docs/design/midi-learn.md`).
     Learn { armed: bool, detail: String },
-    /// A slider, the assignments on the parameter, and **Add modulation**.
+    /// A slider, or the choice names, then the assignments on the
+    /// parameter, and **Add modulation**.
     Edit {
         /// Slider position from 0 to 1.
         position: f32,
         /// Slider step, as a position.
         step: f32,
+        /// What edits the value: a slider, or its choice names.
+        control: ParamControl,
         /// One per assignment, in engine order.
         assignments: Vec<AssignmentRow>,
         /// The **Add modulation** list, while it is open.
         adding: Option<Vec<SourceRow>>,
     },
+}
+
+/// What edits a parameter in the inspector (panels.md, Choice names).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamControl {
+    /// A slider, for a parameter without choice names.
+    Slider,
+    /// Radio buttons, one per choice name, for 4 names or fewer.
+    Radio {
+        choices: Vec<&'static str>,
+        /// Index of the current value's name.
+        selected: usize,
+    },
+    /// A pick list, for more than 4 names.
+    PickList {
+        choices: Vec<&'static str>,
+        /// Index of the current value's name.
+        selected: usize,
+    },
+}
+
+/// Most choice names the inspector shows as radio buttons. More get a pick
+/// list, so a long list does not push the other rows down.
+pub const MAX_RADIO_CHOICES: usize = 4;
+
+impl ParamControl {
+    /// The control for `spec`, showing `value`.
+    pub fn of(spec: &loom_core::ParamSpec, value: f32) -> Self {
+        let choices = spec.options.choices;
+        if choices.is_empty() {
+            return Self::Slider;
+        }
+        let selected = (spec.clamp(value) - spec.min).max(0.0) as usize;
+        let choices = choices.to_vec();
+        if choices.len() <= MAX_RADIO_CHOICES {
+            Self::Radio { choices, selected }
+        } else {
+            Self::PickList { choices, selected }
+        }
+    }
 }
 
 /// One modulation assignment on a parameter.
@@ -151,7 +210,15 @@ impl App {
             // A transient parameter has no row: it is played on its panel
             // widget only (transient-params.md).
             .filter(|(_, (spec, _))| !spec.is_transient())
-            .map(|(index, (spec, &value))| {
+            .map(|(index, (_, &value))| {
+                // The control spans the selected range (control-ranges.md).
+                let spec = &node.spec(index).expect("one spec per value");
+                let range = spec.options.ranges.first().map(|_| RangeRow {
+                    choices: spec.options.ranges.iter().map(ToString::to_string).collect(),
+                    selected: node
+                        .range(index)
+                        .and_then(|r| spec.options.ranges.iter().position(|&o| o == r)),
+                });
                 // Hovering the label shows what the canvas hover text shows
                 // (panels.md, Labels and hover text).
                 let hover = loom_canvas::HoverText::new(spec.label, spec.description, spec.name);
@@ -172,6 +239,7 @@ impl App {
                     ParamMode::Edit {
                         position: spec.normalize(value),
                         step: param::slider_step(spec),
+                        control: ParamControl::of(spec, value),
                         assignments: self.assignment_rows(id, index),
                         adding: (self.adding == Some((id, index))).then(|| self.sources(id, index)),
                     }
@@ -183,6 +251,7 @@ impl App {
                     name: hover.name,
                     value: param::format(spec, value),
                     mapping,
+                    range,
                     mode,
                 }
             })
@@ -317,6 +386,7 @@ fn module_view<'a>(m: ModuleRows) -> Element<'a, Message> {
             ParamMode::Edit {
                 position,
                 step,
+                control,
                 assignments,
                 adding,
             } => {
@@ -334,13 +404,16 @@ fn module_view<'a>(m: ModuleRows) -> Element<'a, Message> {
                         space::horizontal(),
                         text(p.value).size(12).color(DIM),
                     ],
-                    slider(0.0..=1.0, position, move |position| Message::Param {
-                        module: id,
-                        index,
-                        position,
-                    })
-                    .on_release(Message::SliderReleased)
-                    .step(step),
+                    match p.range {
+                        Some(range) => row![
+                            value_control(id, index, control, position, step),
+                            range_view(id, index, range),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center)
+                        .into(),
+                        None => value_control(id, index, control, position, step),
+                    },
                 ]
                 .spacing(2);
                 if let Some(control) = p.mapping {
@@ -362,6 +435,102 @@ fn module_view<'a>(m: ModuleRows) -> Element<'a, Message> {
         items = items.push(drives_view(m.drives));
     }
     items.into()
+}
+
+/// The slider of a parameter, or its choice names as radio buttons or a
+/// pick list. A pick is one undo step, as a click on a radio tile is.
+fn value_control<'a>(
+    module: u32,
+    index: usize,
+    control: ParamControl,
+    position: f32,
+    step: f32,
+) -> Element<'a, Message> {
+    // A choice is the parameter's minimum plus its index. The model gives
+    // the index; the message turns it into a value.
+    let pick = move |choice: usize| Message::Choice { module, index, choice };
+    match control {
+        ParamControl::Slider => slider(0.0..=1.0, position, move |position| Message::Param {
+            module,
+            index,
+            position,
+        })
+        .on_release(Message::SliderReleased)
+        .step(step)
+        .into(),
+        ParamControl::Radio { choices, selected } => {
+            let mut list = column![].spacing(3);
+            for (i, name) in choices.into_iter().enumerate() {
+                list = list.push(radio(name, i, Some(selected), pick).size(12).text_size(12));
+            }
+            list.into()
+        }
+        ParamControl::PickList { choices, selected } => {
+            let options: Vec<Choice> = choices
+                .iter()
+                .enumerate()
+                .map(|(i, &name)| Choice { index: i, name })
+                .collect();
+            let current = options.get(selected).copied();
+            pick_list(options, current, move |c: Choice| pick(c.index))
+                .text_size(12)
+                .width(Length::Fill)
+                .into()
+        }
+    }
+}
+
+/// The **Range** selector: a pick list of the range names. A pick is one
+/// undo step.
+fn range_view<'a>(module: u32, index: usize, range: RangeRow) -> Element<'a, Message> {
+    let options: Vec<Named> = range
+        .choices
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Named { index: i, name })
+        .collect();
+    let current = range.selected.and_then(|i| options.get(i).cloned());
+    tooltip(
+        pick_list(options, current, move |n: Named| Message::Range {
+            module,
+            index,
+            range: n.index,
+        })
+        .placeholder("Full")
+        .text_size(11)
+        .width(96),
+        container(text("Range: what a full turn of the control covers.").size(12))
+            .padding(6)
+            .style(container::rounded_box),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
+/// One entry of the **Range** list: its index and its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Named {
+    index: usize,
+    name: String,
+}
+
+impl std::fmt::Display for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// One entry of a parameter's pick list: its index and its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Choice {
+    index: usize,
+    name: &'static str,
+}
+
+impl std::fmt::Display for Choice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
 }
 
 /// Under a parameter's slider: one row per assignment, then **Add
