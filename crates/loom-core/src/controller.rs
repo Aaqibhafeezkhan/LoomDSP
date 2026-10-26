@@ -175,6 +175,8 @@ impl Controller {
     }
 
     /// Adds a module by kind (`"id@version"` or `"id"`). Returns its new ID.
+    /// Fails with [`LoomError::ModuleIdOutOfRange`] once the next free ID
+    /// would pass [`ModuleId::MAX`].
     pub fn add_module(&mut self, kind: &str) -> Result<ModuleId, LoomError> {
         let descriptor = self.registry.resolve(kind)?;
         let id = ModuleId(self.next_id);
@@ -183,6 +185,9 @@ impl Controller {
     }
 
     /// Adds a module with a specific ID, for example when loading a patch.
+    /// Fails with [`LoomError::ModuleIdOutOfRange`] for an ID above
+    /// [`ModuleId::MAX`], and with [`LoomError::DuplicateModuleId`] for one
+    /// already in use.
     pub fn add_module_with_id(&mut self, id: ModuleId, kind: &str) -> Result<(), LoomError> {
         let descriptor = self.registry.resolve(kind)?;
         self.add_descriptor(id, descriptor)
@@ -191,6 +196,9 @@ impl Controller {
     fn add_descriptor(&mut self, id: ModuleId, descriptor: &'static ModuleDescriptor) -> Result<(), LoomError> {
         if self.graph.nodes.contains_key(&id) {
             return Err(LoomError::DuplicateModuleId(id));
+        }
+        if id > ModuleId::MAX {
+            return Err(LoomError::ModuleIdOutOfRange(id));
         }
         self.collect_garbage();
         let slot = match descriptor.role {
@@ -1067,6 +1075,7 @@ mod tests {
     use super::*;
     use crate::module::{Module, PortIo, ProcessContext};
     use crate::{Panel, ParamOptions, ParamSpec, Widget};
+    use std::sync::atomic::Ordering;
 
     struct Silent;
 
@@ -1146,5 +1155,55 @@ mod tests {
         let error = room.map_midi(control, id, 2).unwrap_err();
         assert!(matches!(error, LoomError::TransientParam { .. }), "{error}");
         assert!(room.map_midi(control, id, 1).is_ok());
+    }
+
+    /// The largest module ID is refused with an error, not an overflow
+    /// panic, and an ID just below it still leaves room for the next free
+    /// one (#44).
+    #[test]
+    fn module_ids_past_the_largest_are_refused() {
+        let mut room = controller(8);
+        let error = room.add_module_with_id(ModuleId(u32::MAX), GATE.id).unwrap_err();
+        assert!(matches!(error, LoomError::ModuleIdOutOfRange(_)), "{error}");
+        room.add_module_with_id(ModuleId::MAX, GATE.id).unwrap();
+        let error = room.add_module(GATE.id).unwrap_err();
+        assert!(matches!(error, LoomError::ModuleIdOutOfRange(_)), "{error}");
+    }
+
+    /// An engine that no device plays takes edits for as long as someone
+    /// calls `Engine::apply_pending` (#220). It renders nothing: no buffer
+    /// is counted, and nothing leaks, because replaced schedules come back
+    /// to the controller.
+    #[test]
+    fn apply_pending_drains_the_queue_without_rendering() {
+        let mut registry = Registry::new();
+        registry.register(&GATE).expect("test module is valid");
+        let config = EngineConfig {
+            command_capacity: 4,
+            ..EngineConfig::default()
+        };
+        let parts = create_engine(Arc::new(registry), config);
+        let (mut room, mut engine) = (parts.controller, parts.engine);
+        let id = room.add_module(GATE.id).unwrap();
+        room.commit().unwrap();
+        engine.apply_pending();
+        let setup_swaps = room.stats().schedule_swaps.load(Ordering::Relaxed);
+        let mut extra = None;
+        for i in 0..1000 {
+            room.set_param_named(id, "on", (i % 2) as f32).unwrap();
+            // Adding or removing a module makes the commit swap in a new
+            // schedule, so the old one comes back as garbage.
+            match extra.take() {
+                None => extra = Some(room.add_module(GATE.id).unwrap()),
+                Some(module) => room.remove_module(module).unwrap(),
+            }
+            room.commit().unwrap();
+            engine.apply_pending();
+            room.collect_garbage();
+        }
+        let stats = room.stats();
+        assert_eq!(stats.buffers.load(Ordering::Relaxed), 0, "nothing rendered");
+        assert_eq!(stats.schedule_swaps.load(Ordering::Relaxed), setup_swaps + 1000);
+        assert_eq!(stats.leaked.load(Ordering::Relaxed), 0, "nothing leaked");
     }
 }
