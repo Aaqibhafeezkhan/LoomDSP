@@ -33,6 +33,7 @@ use loom_core::{Engine, MidiEvent, MidiSender};
 use loom_rt::ScopedFlushDenormals;
 pub use record::Recorder;
 use record::Tap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -79,6 +80,44 @@ pub enum HostError {
     /// The recording file could not be created or written.
     #[error("recording: {0}")]
     Record(String),
+}
+
+/// An error that prevented an audio stream from starting, returning the
+/// [`AudioOutput`] and [`Engine`] that could not be started.
+pub struct StartError {
+    /// The output device that could not start.
+    pub output: AudioOutput,
+    /// The engine that was to be played on `output`.
+    pub engine: Engine,
+    /// The error that stopped the stream from starting.
+    pub error: HostError,
+}
+
+impl fmt::Debug for StartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartError")
+            .field("output", &self.output.name())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl fmt::Display for StartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for StartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<StartError> for HostError {
+    fn from(e: StartError) -> Self {
+        e.error
+    }
 }
 
 impl HostError {
@@ -477,8 +516,11 @@ impl AudioOutput {
         }
     }
 
-    /// Starts audio. The engine moves to the audio thread.
-    pub fn start(mut self, engine: Engine) -> Result<RunningAudio, HostError> {
+    /// Starts audio. The engine moves to the audio thread. On failure,
+    /// [`StartError`] returns both the [`AudioOutput`] and the [`Engine`] so
+    /// the session can keep the engine and retry.
+    #[allow(clippy::result_large_err)]
+    pub fn start(mut self, engine: Engine) -> Result<RunningAudio, StartError> {
         let stats = Arc::new(CallbackStats::default());
         let sample_rate = self.sample_rate();
         let mut render = Render::new(
@@ -492,8 +534,16 @@ impl AudioOutput {
         render.count_overruns = matches!(self.kind, Kind::Device { .. });
 
         let player = match self.kind {
-            Kind::Device { device, config } => {
-                let data_callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| render.render(data);
+            Kind::Device { ref device, config } => {
+                let render_box = Box::new(render);
+                let render_ptr = Box::into_raw(render_box);
+                let ptr = RenderPtr(render_ptr);
+                let data_callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    // SAFETY: render_ptr is kept alive until StreamHandle drops.
+                    unsafe {
+                        ptr.render(data);
+                    }
+                };
                 let error_stats = stats.clone();
                 let error_callback = move |error: cpal::Error| {
                     // Printing here could block the audio thread on some backends.
@@ -501,18 +551,64 @@ impl AudioOutput {
                     error_stats.stream_error(error.kind());
                 };
                 #[cfg(target_os = "macos")]
-                let switched = settle_rate(&device, &config);
-                let stream = device
-                    .build_output_stream::<f32, _, _>(config, data_callback, error_callback, None)
-                    .map_err(audio_error)?;
-                stream.play().map_err(audio_error)?;
-                #[cfg(target_os = "macos")]
-                if switched {
-                    resume_after_switch(&stream, &stats)?;
+                let switched = settle_rate(device, &config);
+                let stream = match device.build_output_stream::<f32, _, _>(config, data_callback, error_callback, None)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // SAFETY: stream was not created, callback will never run.
+                        let render = unsafe { *Box::from_raw(render_ptr) };
+                        let (engine, tap) = render.into_parts();
+                        self.record = tap;
+                        return Err(StartError {
+                            output: self,
+                            engine,
+                            error: audio_error(e),
+                        });
+                    }
+                };
+                if let Err(e) = stream.play() {
+                    drop(stream);
+                    // SAFETY: stream play failed, dropped stream; reclaiming Render box.
+                    let render = unsafe { *Box::from_raw(render_ptr) };
+                    let (engine, tap) = render.into_parts();
+                    self.record = tap;
+                    return Err(StartError {
+                        output: self,
+                        engine,
+                        error: audio_error(e),
+                    });
                 }
-                Player::Device(stream)
+                #[cfg(target_os = "macos")]
+                if switched && let Err(e) = resume_after_switch(&stream, &stats) {
+                    drop(stream);
+                    // SAFETY: stream dropped; reclaiming Render box.
+                    let render = unsafe { *Box::from_raw(render_ptr) };
+                    let (engine, tap) = render.into_parts();
+                    self.record = tap;
+                    return Err(StartError {
+                        output: self,
+                        engine,
+                        error: e,
+                    });
+                }
+                Player::Device(StreamHandle {
+                    stream: Some(stream),
+                    render: render_ptr,
+                })
             }
-            Kind::Clock { sample_rate, block } => Player::Clock(Clock::start(render, sample_rate, block)?),
+            Kind::Clock { sample_rate, block } => match Clock::start(render, sample_rate, block) {
+                Ok(clock) => Player::Clock(clock),
+                Err((render, e)) => {
+                    let (engine, tap) = render.into_parts();
+                    self.record = tap;
+                    return Err(StartError {
+                        output: self,
+                        engine,
+                        error: e,
+                    });
+                }
+            },
             Kind::Stepped { block, tape, .. } => Player::Stepped(tape.attach(render, block as usize)),
         };
         Ok(RunningAudio {
@@ -583,9 +679,11 @@ fn resume_after_switch(stream: &cpal::Stream, stats: &CallbackStats) -> Result<(
         if now != errors {
             errors = now;
             stream.play().map_err(audio_error)?;
+            stats.clear_dead();
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    stats.clear_dead();
     Ok(())
 }
 
@@ -657,12 +755,51 @@ impl Render {
         let load = started.elapsed().as_secs_f64() / budget.max(1e-9);
         self.stats.record(frames, load, self.count_overruns);
     }
+
+    /// Takes the engine and recording tap back, for returning them when an
+    /// audio output fails to start.
+    pub(crate) fn into_parts(self) -> (Engine, Option<Tap>) {
+        (self.engine, self.tap)
+    }
+}
+
+/// Wrapper for passing raw pointer to the audio callback closure or clock thread.
+struct RenderPtr(*mut Render);
+
+// SAFETY: Rendering access is exclusive to the audio callback or clock thread, respectively,
+// and stream teardown or thread joining completes before Render is reclaimed.
+unsafe impl Send for RenderPtr {}
+
+impl RenderPtr {
+    /// Calls render on the underlying Render pointer.
+    unsafe fn render(&self, data: &mut [f32]) {
+        // SAFETY: caller guarantees the pointee is valid and exclusively accessed.
+        unsafe {
+            (*self.0).render(data);
+        }
+    }
+}
+
+/// Keeps a cpal stream and its render state alive until dropped.
+struct StreamHandle {
+    stream: Option<cpal::Stream>,
+    render: *mut Render,
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        drop(self.stream.take());
+        // SAFETY: the stream is dropped, stopping the audio callback, so no other thread accesses render.
+        unsafe {
+            drop(Box::from_raw(self.render));
+        }
+    }
 }
 
 /// What keeps audio playing. Never read: dropping it stops audio.
 #[allow(dead_code)]
 enum Player {
-    Device(cpal::Stream),
+    Device(StreamHandle),
     Clock(Clock),
     Stepped(stepped::Attached),
 }
@@ -671,20 +808,28 @@ enum Player {
 struct Clock {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    render: *mut Render,
 }
 
 impl Clock {
-    fn start(mut render: Render, sample_rate: u32, block: u32) -> Result<Self, HostError> {
+    #[allow(clippy::result_large_err)]
+    fn start(render: Render, sample_rate: u32, block: u32) -> Result<Self, (Render, HostError)> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let mut buffer = vec![0.0f32; block as usize * 2];
         let period = Duration::from_secs_f64(f64::from(block) / f64::from(sample_rate));
-        let thread = std::thread::Builder::new()
+        let render_box = Box::new(render);
+        let render_ptr = Box::into_raw(render_box);
+        let ptr = RenderPtr(render_ptr);
+        let thread = match std::thread::Builder::new()
             .name("loom-audio-clock".to_string())
             .spawn(move || {
                 let mut next = Instant::now();
                 while !thread_stop.load(Ordering::Relaxed) {
-                    render.render(&mut buffer);
+                    // SAFETY: render_ptr stays valid until Clock drops.
+                    unsafe {
+                        ptr.render(&mut buffer);
+                    }
                     next += period;
                     let now = Instant::now();
                     if next > now {
@@ -695,11 +840,18 @@ impl Clock {
                         next = now;
                     }
                 }
-            })
-            .map_err(audio_error)?;
+            }) {
+            Ok(thread) => thread,
+            Err(e) => {
+                // SAFETY: thread spawn failed, so the raw pointer was never used on another thread.
+                let render = unsafe { *Box::from_raw(render_ptr) };
+                return Err((render, audio_error(e)));
+            }
+        };
         Ok(Self {
             stop,
             thread: Some(thread),
+            render: render_ptr,
         })
     }
 }
@@ -709,6 +861,10 @@ impl Drop for Clock {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        // SAFETY: the clock thread has joined, so render is no longer accessed by any thread.
+        unsafe {
+            drop(Box::from_raw(self.render));
         }
     }
 }
@@ -807,6 +963,24 @@ impl RunningAudio {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    /// True when the stream encountered an error that stopped it (e.g. device
+    /// was disconnected).
+    pub fn is_dead(&self) -> bool {
+        self.stats.is_dead()
+    }
+
+    /// Marks the stream as dead (e.g. when tests simulate device loss).
+    pub fn mark_dead(&self) {
+        self.stats.mark_dead();
+    }
+
+    /// Stops audio immediately without waiting for a fade-out. Used when the
+    /// device was lost or disconnected and no fade-out is possible (output
+    /// safety, rule 14).
+    pub fn stop_immediate(mut self) {
+        self.player = None;
+    }
 }
 
 /// Audio callback timing, updated by the audio thread.
@@ -830,6 +1004,8 @@ pub struct CallbackStats {
     largest_buffer: AtomicU64,
     /// Buffers rendered after the engine reported silence.
     silent_buffers: AtomicU64,
+    /// True when the stream encountered a fatal error (e.g. device unplugged).
+    stream_dead: AtomicBool,
 }
 
 /// A copy of [`CallbackStats`] at one moment.
@@ -859,19 +1035,41 @@ pub struct StatsSnapshot {
     pub largest_buffer: u64,
     /// Buffers handed to the device after the engine faded out to silence.
     pub silent_buffers: u64,
+    /// True if the stream encountered an error that stopped it.
+    pub is_dead: bool,
 }
 
 impl CallbackStats {
     /// Counts an error the backend reported. An overload notice before the
     /// first callback goes to `start_overloads`, not `stream_errors`: the
     /// stream had rendered nothing, so nothing was lost (panels.md, Audio
-    /// load and dropouts). Every other error is a stream error.
+    /// load and dropouts). Every other error is a stream error, and non-xrun
+    /// errors mark the stream as dead.
     fn stream_error(&self, kind: cpal::ErrorKind) {
         if kind == cpal::ErrorKind::Xrun && self.callbacks.load(Ordering::Relaxed) == 0 {
             self.start_overloads.fetch_add(1, Ordering::Relaxed);
         } else {
             self.stream_errors.fetch_add(1, Ordering::Relaxed);
+            if kind != cpal::ErrorKind::Xrun && kind != cpal::ErrorKind::DeviceChanged {
+                self.stream_dead.store(true, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// True if the stream encountered an error that stopped it.
+    pub fn is_dead(&self) -> bool {
+        self.stream_dead.load(Ordering::Relaxed)
+    }
+
+    /// Marks the stream as dead.
+    pub fn mark_dead(&self) {
+        self.stream_dead.store(true, Ordering::Relaxed);
+    }
+
+    /// Clears the dead flag (used when a stream successfully recovers,
+    /// such as after a sample rate switch).
+    pub fn clear_dead(&self) {
+        self.stream_dead.store(false, Ordering::Relaxed);
     }
 
     fn record(&self, frames: usize, load: f64, count_overrun: bool) {
@@ -904,6 +1102,7 @@ impl CallbackStats {
             smallest_buffer: self.smallest_buffer.load(Ordering::Relaxed),
             largest_buffer: self.largest_buffer.load(Ordering::Relaxed),
             silent_buffers: self.silent_buffers.load(Ordering::Relaxed),
+            is_dead: self.stream_dead.load(Ordering::Relaxed),
         }
     }
 }
@@ -1573,6 +1772,94 @@ mod tests {
         state.receive(&[0x90, 60, 100, 1]);
         state.receive(&[]);
         assert!(!state.holds_notes());
+    }
+
+    /// Marking a running stream dead stops it and reports `is_dead`.
+    #[test]
+    fn marking_a_running_stream_dead_reports_is_dead() {
+        let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+        let audio = AudioOutput::clock(48_000, 64).start(parts.engine).unwrap();
+        assert!(!audio.is_dead());
+        assert!(!audio.stats().is_dead());
+        audio.mark_dead();
+        assert!(audio.is_dead());
+        assert!(audio.stats().is_dead());
+        assert!(audio.stats().snapshot().is_dead);
+        audio.stop_immediate();
+    }
+
+    /// StartError implements formatting, source, and conversion to HostError.
+    #[test]
+    fn start_error_formatting_and_traits() {
+        let output = AudioOutput::clock(48_000, 256);
+        let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+        let err = StartError {
+            output,
+            engine: parts.engine,
+            error: HostError::Audio("backend failed".into()),
+        };
+        assert_eq!(format!("{err}"), "audio error: backend failed");
+        assert!(format!("{err:?}").contains("StartError"));
+        use std::error::Error;
+        assert!(err.source().is_some());
+        let host_err: HostError = err.into();
+        assert_eq!(format!("{host_err}"), "audio error: backend failed");
+    }
+
+    /// CallbackStats supports clearing the dead flag and non-fatal error kinds.
+    #[test]
+    fn callback_stats_dead_flag_clearing() {
+        let stats = CallbackStats::default();
+        assert!(!stats.is_dead());
+        stats.mark_dead();
+        assert!(stats.is_dead());
+        stats.clear_dead();
+        assert!(!stats.is_dead());
+        stats.stream_error(cpal::ErrorKind::DeviceChanged);
+        assert!(!stats.is_dead());
+        stats.stream_error(cpal::ErrorKind::StreamInvalidated);
+        assert!(stats.is_dead());
+    }
+
+    /// StreamHandle drops its stream and safely frees the Render pointer.
+    #[test]
+    fn stream_handle_drops_safely() {
+        let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+        let stats = Arc::new(CallbackStats::default());
+        let render = Render::new(parts.engine, 2, 48_000, stats, None);
+        let render_ptr = Box::into_raw(Box::new(render));
+        let handle = StreamHandle {
+            stream: None,
+            render: render_ptr,
+        };
+        drop(handle);
+    }
+
+    /// RenderPtr safely delegates render calls.
+    #[test]
+    fn render_ptr_delegates_render() {
+        let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+        let stats = Arc::new(CallbackStats::default());
+        let render = Render::new(parts.engine, 2, 48_000, stats, None);
+        let render_ptr = Box::into_raw(Box::new(render));
+        let ptr = RenderPtr(render_ptr);
+        let mut buffer = [0.0f32; 64];
+        // SAFETY: render_ptr is uniquely owned in this test and freed after render completes.
+        unsafe {
+            ptr.render(&mut buffer);
+            drop(Box::from_raw(render_ptr));
+        }
+    }
+
+    /// Render::into_parts returns engine and optional tap.
+    #[test]
+    fn render_into_parts_returns_engine_and_tap() {
+        let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+        let stats = Arc::new(CallbackStats::default());
+        let render = Render::new(parts.engine, 2, 48_000, stats, None);
+        let (engine, tap) = render.into_parts();
+        assert!(tap.is_none());
+        assert!(!engine.is_silent());
     }
 }
 
