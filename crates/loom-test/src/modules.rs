@@ -12,8 +12,8 @@
 //!   parameter, so a test can read it.
 
 use loom_core::{
-    Channels, LoomError, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, Polarity,
-    PortDefault, PortIo, PortSpec, ProcessContext, Registry, SignalType, Widget,
+    Channels, DisplayKind, DisplaySpec, LoomError, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel,
+    ParamOptions, ParamSpec, Polarity, PortDefault, PortIo, PortSpec, ProcessContext, Registry, SignalType, Widget,
 };
 
 /// Every test module.
@@ -70,9 +70,10 @@ const ON: usize = 4;
 /// | `steps` | whole-number, 0 to 10 | knob |
 /// | `glide` | linear, smoothed over 50 ms | knob |
 /// | `on` | whole-number, 0 to 1 | toggle |
-/// | `choice` | whole-number, 0 to 2 | radio, 3 options |
+/// | `choice` | whole-number, 0 to 2, named `a`, `b`, `c` | radio |
 /// | `gate` | whole-number, 0 to 1 | button |
 /// | `mode` | whole-number, 0 to 1 | none (the button's mode) |
+/// | `held` | whole-number, 0 to 1, transient | none (the button's hold) |
 ///
 /// Outputs `uni` (unipolar) and `bi` (bipolar) both write `level`. The
 /// light `lit` shows `on`, modulated, as of the last frame of the block.
@@ -91,36 +92,42 @@ pub static PANEL: ModuleDescriptor = ModuleDescriptor {
         param("steps", 0.0, 10.0, 0.0, "").integer(),
         param("glide", 0.0, 1.0, 0.0, "").smooth(0.05),
         param("on", 0.0, 1.0, 0.0, "").integer(),
-        param("choice", 0.0, 2.0, 0.0, "").integer(),
+        param("choice", 0.0, 2.0, 0.0, "").integer().choices(&["a", "b", "c"]),
         param("gate", 0.0, 1.0, 0.0, "").integer(),
         param("mode", 0.0, 1.0, 0.0, "").integer(),
+        param("held", 0.0, 1.0, 0.0, "").integer().transient(),
     ],
     role: ModuleRole::Dsp(|_| {
         Box::new(TestPanel {
-            params: [0.0; 8],
+            params: [0.0; 9],
             lit: 0.0,
         })
     }),
     panel: Panel::new(
-        15,
+        18,
         8,
         &[
             Widget::knob(0, 0, "level"),
             Widget::knob(3, 0, "cutoff"),
             Widget::knob(6, 0, "steps"),
             Widget::knob(9, 0, "glide"),
-            Widget::meter(12, 0, "uni"),
+            Widget::meter(15, 0, "uni"),
             Widget::toggle(0, 3, "on"),
-            Widget::radio(3, 3, "choice", &["a", "b", "c"]),
-            Widget::light(6, 3, "lit"),
-            Widget::button(6, 5, "gate", "mode"),
+            Widget::radio(3, 3, "choice"),
+            Widget::light(9, 3, "lit"),
+            Widget::button(9, 5, "gate", "held", "mode"),
         ],
     ),
-    displays: &["lit"],
+    displays: &[DisplaySpec {
+        name: "lit",
+        label: "Lit",
+        description: "Shows `on`, modulated, as of the last frame of the block.",
+        kind: DisplayKind::Level,
+    }],
 };
 
 struct TestPanel {
-    params: [f32; 8],
+    params: [f32; 9],
     /// `on` at the last frame of the last block, for the light.
     lit: f32,
 }
@@ -253,10 +260,11 @@ mod tests {
         assert!(!knob("level").options.integer);
         assert!(knob("steps").options.integer);
         assert!(kinds.contains(&WidgetKind::Toggle));
-        assert!(kinds.contains(&WidgetKind::Radio {
-            options: &["a", "b", "c"]
+        assert!(kinds.contains(&WidgetKind::Radio));
+        assert!(kinds.contains(&WidgetKind::Button {
+            mode: "mode",
+            hold: "held"
         }));
-        assert!(kinds.contains(&WidgetKind::Button { mode: "mode" }));
         assert!(kinds.contains(&WidgetKind::Light));
         assert!(kinds.contains(&WidgetKind::Meter));
     }

@@ -39,7 +39,7 @@ pub mod modules;
 mod reference;
 mod signal;
 
-pub use reference::UPDATE_VAR;
+pub use reference::{UPDATE_VAR, check_channels};
 pub use signal::Signal;
 
 use loom_core::{
@@ -337,7 +337,7 @@ impl Harness {
 
     /// Renders with each of [`BLOCK_SIZES`] and panics unless the outputs
     /// are bit-identical and finite. Returns the render in blocks of
-    /// [`MAX_BLOCK`].
+    /// [`MAX_BLOCK`]. `docs/learn/block-size-invariance.md` explains why.
     #[track_caller]
     pub fn check_block_sizes(&self) -> Render {
         let reference = self.render();
@@ -443,9 +443,9 @@ impl Harness {
     #[track_caller]
     fn compare_or_update(&self, render: &Render, path: &Path, update: bool) {
         if update {
-            reference::write(render, path);
+            reference::write(&reference::Channels::of(render), path);
         } else {
-            reference::compare(render, path, self.tolerance);
+            reference::compare(&reference::Channels::of(render), path, self.tolerance);
         }
     }
 }

@@ -932,6 +932,14 @@ impl<Message> PatchCanvas<'_, Message> {
                         }
                         shell.capture_event();
                     }
+                    // Cmd/Ctrl+0 resets the zoom to 100%, about the pointer
+                    // like the wheel, so what the user points at stays put.
+                    keyboard::Key::Character("0") if modifiers.command() => {
+                        let at = screen.unwrap_or(Point::new(bounds.width / 2.0, bounds.height / 2.0));
+                        state.camera.zoom_to(at, 1.0);
+                        shell.request_redraw();
+                        shell.capture_event();
+                    }
                     keyboard::Key::Character("a") if modifiers.command() => {
                         let all = self.scene.modules().iter().map(|m| m.id).collect();
                         self.emit(shell, CanvasEvent::Select(all));
@@ -1227,15 +1235,33 @@ impl<Message> PatchCanvas<'_, Message> {
             Some(Hit::Widget { module, widget }) if self.is_control(module, widget) => {
                 Some(HoverTarget::Control(module, widget))
             }
-            // A port's label, or the bar standing in for it, hovers like
-            // the port (panels.md, Hover text).
-            Some(Hit::Module(_)) => state
+            // A light or meter belongs to the tile for presses, so the hit
+            // is the module. Its hover text still shows. A port's label, or
+            // the bar standing in for it, hovers like the port (panels.md,
+            // Hover text).
+            Some(Hit::Module(id)) => state
                 .cursor
-                .and_then(|world| tile_text::port_label_at(self.scene, world))
-                .map(HoverTarget::Port)
+                .and_then(|world| {
+                    let display = self
+                        .scene
+                        .module(id)
+                        .and_then(|m| m.display_at(world))
+                        .filter(|&widget| self.has_hover_text(id, widget))
+                        .map(|widget| HoverTarget::Control(id, widget));
+                    display.or_else(|| tile_text::port_label_at(self.scene, world).map(HoverTarget::Port))
+                })
                 .or(focused),
             _ => focused,
         }
+    }
+
+    /// True for controls, and for lights and meters with a description
+    /// (port-and-parameter-text.md, Display values).
+    fn has_hover_text(&self, module: u32, widget: usize) -> bool {
+        self.scene
+            .module(module)
+            .and_then(|m| m.panel.widgets.get(widget))
+            .is_some_and(|w| w.is_control() || !w.hover.description.is_empty())
     }
 
     fn is_control(&self, module: u32, widget: usize) -> bool {
@@ -1253,12 +1279,9 @@ impl<Message> PatchCanvas<'_, Message> {
     /// lost its last assignment, or whose module is gone, counts as none:
     /// it draws nothing, so it must not take Escape or pick an arc drag.
     fn pin(&self, state: &State) -> Option<PortRef> {
-        state.pinned.filter(|p| {
-            self.scene
-                .module(p.module)
-                .and_then(|m| m.badge_bounds(p.index))
-                .is_some()
-        })
+        state
+            .pinned
+            .filter(|p| self.scene.badge_bounds(p.module, p.index).is_some())
     }
 
     /// The cursor for the pointer resting over the canvas with no gesture.
@@ -2097,7 +2120,7 @@ impl<Message> PatchCanvas<'_, Message> {
     fn build_modulation_lines(&self, state: &State, overlay: &mut Overlay) {
         let p = &self.palette;
         if let Some(port) = self.pin(state)
-            && let Some(badge) = self.scene.module(port.module).and_then(|m| m.badge_bounds(port.index))
+            && let Some(badge) = self.scene.badge_bounds(port.module, port.index)
         {
             let ring = badge.expand(1.5);
             overlay
@@ -2241,11 +2264,13 @@ impl<Message> PatchCanvas<'_, Message> {
             });
         }
 
-        // Badge numbers sit outside their tile, so they are checked against
-        // their own bounds, not the tile's, and clip to the canvas. Too small
-        // to read, the pill alone shows.
+        // Badge numbers usually sit outside their tile, so they are checked
+        // against their own bounds, not the tile's, and clip to the canvas.
+        // They show exactly when port labels do (#249): with its own
+        // threshold, a badge could show as an empty pill beside labels.
+        // Zoomed out further, the pill alone shows.
         let badge_px = quantise(BADGE_TEXT_SIZE * zoom);
-        if badge_px < LABEL_MIN_PX * 0.8 {
+        if !show_labels {
             return;
         }
         for module in self.scene.modules() {
@@ -2256,7 +2281,11 @@ impl<Message> PatchCanvas<'_, Message> {
                 continue;
             }
             for (index, port) in module.outputs.iter().enumerate() {
-                if let Some(rect) = module.badge_bounds(index).filter(|r| r.intersects(&visible)) {
+                if let Some(rect) = self
+                    .scene
+                    .badge_bounds(module.id, index)
+                    .filter(|r| r.intersects(&visible))
+                {
                     let label = port.badge.to_string();
                     renderer.fill_text(
                         text(&label, badge_px, rect.width * zoom, text::Alignment::Center),
@@ -2270,21 +2299,40 @@ impl<Message> PatchCanvas<'_, Message> {
     }
 
     /// The label, hover text, and world bounds of what hover text is about.
-    fn hover_content(&self, target: HoverTarget) -> Option<(&str, &HoverText, Rectangle)> {
+    /// The label, hover text, value line, and anchor of a hover target. Only
+    /// lights and meters have a value line: their current value, which the
+    /// app writes as the widget's text (port-and-parameter-text.md, Display
+    /// values). A control's value shows on the control itself.
+    fn hover_content(&self, target: HoverTarget) -> Option<(&str, &HoverText, Option<&str>, Rectangle)> {
         match target {
             HoverTarget::Port(port) => {
                 let view = self.scene.port(port)?;
                 let at = self.scene.port_position(port)?;
-                let anchor = Rectangle::new(
+                let marker = Rectangle::new(
                     Point::new(at.x - PORT_RADIUS, at.y - PORT_RADIUS),
                     Size::new(2.0 * PORT_RADIUS, 2.0 * PORT_RADIUS),
                 );
-                Some((&view.label, &view.hover, anchor))
+                // An output's hover text goes above its badge too, so it
+                // does not cover the count (#249).
+                let anchor = match port
+                    .output
+                    .then(|| self.scene.badge_bounds(port.module, port.index))
+                    .flatten()
+                {
+                    Some(badge) => marker.union(&badge),
+                    None => marker,
+                };
+                Some((&view.label, &view.hover, None, anchor))
             }
-            HoverTarget::Control(module, widget) => {
-                let module = self.scene.module(module)?;
+            HoverTarget::Control(id, widget) => {
+                let module = self.scene.module(id)?;
                 let view = module.panel.widgets.get(widget)?;
-                Some((&view.label, &view.hover, module.widget_bounds(widget)?))
+                let value = (!view.is_control())
+                    .then(|| self.values.and_then(|v| v.get(id, widget)))
+                    .flatten()
+                    .map(|v| v.text.as_str())
+                    .filter(|text| !text.is_empty());
+                Some((&view.label, &view.hover, value, module.widget_bounds(widget)?))
             }
         }
     }
@@ -2297,14 +2345,14 @@ impl<Message> PatchCanvas<'_, Message> {
     where
         Renderer: text::Renderer<Font = Font>,
     {
-        let Some((label, hover, world)) = state.hover_text.shown().and_then(|t| self.hover_content(t)) else {
+        let Some((label, hover, value, world)) = state.hover_text.shown().and_then(|t| self.hover_content(t)) else {
             return;
         };
         let font = renderer.default_font();
         let inner = crate::hover::text_width(bounds.width);
         // Each line is measured as a paragraph, then drawn as text in that
         // size, wrapped at word boundaries.
-        let line = |content: &str, size: f32, colour: Color| {
+        let line = |content: &str, size: f32, colour: Color, font: Font| {
             let text = Text {
                 content: content.to_string(),
                 bounds: Size::new(inner, f32::INFINITY),
@@ -2325,12 +2373,22 @@ impl<Message> PatchCanvas<'_, Message> {
                 colour,
             )
         };
-        let mut lines = vec![line(label, HOVER_TEXT_PX, self.palette.text)];
+        // A light's or meter's label is bold, so it stands apart from its
+        // value line (port-and-parameter-text.md, Display values).
+        let bold = Font {
+            weight: iced::font::Weight::Bold,
+            ..font
+        };
+        let title = if value.is_some() { bold } else { font };
+        let mut lines = vec![line(label, HOVER_TEXT_PX, self.palette.text, title)];
         if !hover.description.is_empty() {
-            lines.push(line(&hover.description, HOVER_TEXT_PX, self.palette.text_dim));
+            lines.push(line(&hover.description, HOVER_TEXT_PX, self.palette.text_dim, font));
+        }
+        if let Some(value) = value {
+            lines.push(line(value, HOVER_TEXT_PX, self.palette.text, font));
         }
         if let Some(name) = &hover.name {
-            lines.push(line(name, HOVER_TEXT_PX - 1.0, self.palette.text_dim));
+            lines.push(line(name, HOVER_TEXT_PX - 1.0, self.palette.text_dim, font));
         }
         const LINE_GAP: f32 = 3.0;
         let width = lines.iter().map(|(t, _)| t.bounds.width).fold(0.0, f32::max);
@@ -2452,6 +2510,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WidgetValue;
     use crate::scene::{CableView, ModuleView, PanelView, PortShape, PortView, WidgetView};
 
     fn module(id: u32, x: f32) -> ModuleView {
@@ -2606,6 +2665,68 @@ mod tests {
             ..on(Hit::Module(1))
         };
         assert_eq!(canvas.hover_target(&on_label), Some(HoverTarget::Port(port)));
+    }
+
+    /// A light with a description hovers like a control, and its hover
+    /// text has the value line the app wrote. A light with no description
+    /// shows none (port-and-parameter-text.md, Display values).
+    #[test]
+    fn a_light_shows_its_description_and_value() {
+        let mut m = module(1, 0.0);
+        m.panel = panel();
+        let plain = m.clone();
+        m.panel.widgets[1].hover = HoverText::new("Gate", "Lit while a key is held.", "gate");
+        let mut meter = module(2, 600.0);
+        meter.panel = PanelView {
+            width: 3,
+            height: 6,
+            widgets: vec![widget(WidgetViewKind::Meter, 0)],
+        };
+        meter.panel.widgets[0].hover = HoverText::new("Out", "The signal.", "out");
+        let mut values = PanelValues::new();
+        values.set(
+            1,
+            1,
+            WidgetValue {
+                position: 1.0,
+                text: "Gate: 1.00".to_string(),
+                ..WidgetValue::default()
+            },
+        );
+        let scene = Scene::new(vec![m, meter], Vec::new());
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e).values(&values);
+        // The pointer rests on the middle of a display widget. The hit is
+        // the tile, so a press there still moves it.
+        let resting_on = |scene: &Scene, module: u32, widget: usize| {
+            let point = scene.module(module).unwrap().widget_bounds(widget).unwrap().center();
+            let hit = scene.hit(point, 8.0);
+            assert_eq!(hit, Hit::Module(module), "a display belongs to the tile");
+            State {
+                hover: Some(hit),
+                cursor: Some(point),
+                ..State::default()
+            }
+        };
+        assert_eq!(
+            canvas.hover_target(&resting_on(&scene, 1, 1)),
+            Some(HoverTarget::Control(1, 1))
+        );
+        assert_eq!(
+            canvas.hover_target(&resting_on(&scene, 2, 0)),
+            Some(HoverTarget::Control(2, 0))
+        );
+        let (_, hover, value, _) = canvas.hover_content(HoverTarget::Control(1, 1)).unwrap();
+        assert_eq!(hover.description, "Lit while a key is held.");
+        assert_eq!(value, Some("Gate: 1.00"));
+        // A knob's value shows on the knob, not in the hover text.
+        let (_, _, value, _) = canvas.hover_content(HoverTarget::Control(1, 0)).unwrap();
+        assert_eq!(value, None);
+
+        // A light with no description shows none.
+        let scene = Scene::new(vec![plain], Vec::new());
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        assert_eq!(canvas.hover_target(&resting_on(&scene, 1, 1)), None);
     }
 
     #[test]
@@ -2880,6 +3001,44 @@ mod tests {
             assert!(
                 !events.iter().any(|e| matches!(e, CanvasEvent::OpenBrowser { .. })),
                 "{modifiers:?}: {events:?}"
+            );
+        }
+    }
+
+    /// #16: Cmd/Ctrl+0 over the canvas sets the zoom to 100% from any
+    /// zoom, keeping the point under the pointer in place. Without the
+    /// command modifier, 0 does nothing.
+    #[test]
+    fn command_zero_resets_the_zoom_to_100_percent() {
+        let scene = chain();
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        let zero = |modifiers| {
+            let key = keyboard::Key::Character("0".into());
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit0),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            })
+        };
+        let at = Point::new(300.0, 200.0);
+        for start in [crate::camera::MIN_ZOOM, 0.5, 1.0, 2.25, crate::camera::MAX_ZOOM] {
+            let mut state = State::default();
+            state.camera.zoom = start;
+            state.camera.origin = Point::new(-40.0, 60.0);
+            let before = state.camera.to_world(at);
+            drive(&canvas, &mut state, &zero(keyboard::Modifiers::default()), at);
+            assert_eq!(state.camera.zoom, start, "0 alone leaves the zoom at {start}");
+            drive(&canvas, &mut state, &zero(keyboard::Modifiers::COMMAND), at);
+            assert_eq!(state.camera.zoom, 1.0, "from {start}");
+            let after = state.camera.to_world(at);
+            assert!(
+                (after.x - before.x).abs() < 1e-3 && (after.y - before.y).abs() < 1e-3,
+                "from {start}: {before:?} moved to {after:?}"
             );
         }
     }
@@ -3469,6 +3628,30 @@ mod tests {
         (scene, values)
     }
 
+    /// #249: an output's hover text is placed above its badge as well as
+    /// its port, so the box never covers the count. An input's stays on
+    /// its port.
+    #[test]
+    fn output_hover_text_goes_above_its_badge() {
+        let (scene, _) = modulated_scene();
+        let none = BTreeSet::new();
+        let canvas = PatchCanvas::new(&scene, &none, |e| e);
+        let out = PortRef {
+            module: 1,
+            output: true,
+            index: 0,
+        };
+        let badge = scene.badge_bounds(1, 0).unwrap();
+        let (_, _, _, anchor) = canvas.hover_content(HoverTarget::Port(out)).unwrap();
+        assert!(
+            anchor.y <= badge.y && anchor.x + anchor.width >= badge.x + badge.width,
+            "{anchor:?}"
+        );
+        let input = PortRef { output: false, ..out };
+        let (_, _, _, anchor) = canvas.hover_content(HoverTarget::Port(input)).unwrap();
+        assert!(anchor.width <= 2.0 * PORT_RADIUS + 1e-3, "{anchor:?}");
+    }
+
     fn escape() -> Event {
         let key = keyboard::Key::Named(keyboard::key::Named::Escape);
         Event::Keyboard(keyboard::Event::KeyPressed {
@@ -3547,7 +3730,7 @@ mod tests {
         let none = BTreeSet::new();
         let canvas = PatchCanvas::new(&scene, &none, |e| e).values(&values);
         let lines = |state: &State| canvas.overlay(state).cables.len();
-        let badge = scene.module(1).unwrap().badge_bounds(0).unwrap().center();
+        let badge = scene.badge_bounds(1, 0).unwrap().center();
         assert_eq!(scene.hit(badge, PORT_HIT_RADIUS), Hit::Badge(OUT));
         let knob = scene.module(2).unwrap().widget_bounds(0).unwrap().center();
         let port = scene.port_position(OUT).unwrap();

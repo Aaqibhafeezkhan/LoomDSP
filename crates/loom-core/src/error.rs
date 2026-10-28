@@ -34,6 +34,10 @@ pub enum LoomError {
     /// A module ID is already used.
     #[error("module id {0} is already in use")]
     DuplicateModuleId(ModuleId),
+    /// A module ID is out of range. The largest `u32` is kept to mean "no
+    /// module" (#44).
+    #[error("module id {0} is too large (the largest is {max})", max = ModuleId::MAX.0)]
+    ModuleIdOutOfRange(ModuleId),
     /// A port name or index does not exist.
     #[error("module {module} has no {direction} port `{port}`")]
     NoSuchPort {
@@ -58,6 +62,28 @@ pub enum LoomError {
         /// The parameter name or index.
         param: String,
     },
+    /// A control range a parameter does not offer.
+    #[error("parameter `{param}` of module {module} offers no range {range}")]
+    NoSuchRange {
+        /// The module.
+        module: ModuleId,
+        /// The parameter name.
+        param: String,
+        /// The range asked for, as its name.
+        range: String,
+    },
+    /// A transient parameter cannot be modulated or mapped to MIDI, because
+    /// it carries a live gesture, not a setting (transient-params.md).
+    #[error("parameter `{param}` of module {module} is a live control and cannot be modulated or mapped")]
+    TransientParam {
+        /// The module.
+        module: ModuleId,
+        /// The parameter name.
+        param: String,
+    },
+    /// A MIDI input id is 0 or not below [`MAX_MIDI_INPUTS`](crate::MAX_MIDI_INPUTS).
+    #[error("invalid MIDI input {0} (inputs are 1 to {max})", max = crate::MAX_MIDI_INPUTS - 1)]
+    InvalidMidiInput(u16),
     /// A MIDI channel or controller number is out of range.
     #[error("invalid MIDI control: channel {} and controller {} (channels are 0 to 15, controllers 0 to 127)", .0.channel, .0.controller)]
     InvalidMidiControl(MidiControl),

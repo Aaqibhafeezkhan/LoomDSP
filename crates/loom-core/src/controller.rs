@@ -1,7 +1,7 @@
 //! The control-thread side of the engine.
 
 use crate::compile::{CompileReport, compile};
-use crate::descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole, Polarity};
+use crate::descriptor::{ModuleConfig, ModuleDescriptor, ModuleRole, ParamRange, Polarity};
 use crate::display::{DisplayReader, DisplaySource, DisplayTable};
 use crate::engine::{Command, Engine, EngineConfig, EngineStats, Garbage};
 use crate::error::LoomError;
@@ -175,6 +175,8 @@ impl Controller {
     }
 
     /// Adds a module by kind (`"id@version"` or `"id"`). Returns its new ID.
+    /// Fails with [`LoomError::ModuleIdOutOfRange`] once the next free ID
+    /// would pass [`ModuleId::MAX`].
     pub fn add_module(&mut self, kind: &str) -> Result<ModuleId, LoomError> {
         let descriptor = self.registry.resolve(kind)?;
         let id = ModuleId(self.next_id);
@@ -183,6 +185,9 @@ impl Controller {
     }
 
     /// Adds a module with a specific ID, for example when loading a patch.
+    /// Fails with [`LoomError::ModuleIdOutOfRange`] for an ID above
+    /// [`ModuleId::MAX`], and with [`LoomError::DuplicateModuleId`] for one
+    /// already in use.
     pub fn add_module_with_id(&mut self, id: ModuleId, kind: &str) -> Result<(), LoomError> {
         let descriptor = self.registry.resolve(kind)?;
         self.add_descriptor(id, descriptor)
@@ -191,6 +196,9 @@ impl Controller {
     fn add_descriptor(&mut self, id: ModuleId, descriptor: &'static ModuleDescriptor) -> Result<(), LoomError> {
         if self.graph.nodes.contains_key(&id) {
             return Err(LoomError::DuplicateModuleId(id));
+        }
+        if id > ModuleId::MAX {
+            return Err(LoomError::ModuleIdOutOfRange(id));
         }
         self.collect_garbage();
         let slot = match descriptor.role {
@@ -213,6 +221,12 @@ impl Controller {
                     module,
                     id: id.0,
                     displays: descriptor.displays.len() as u8,
+                    triggers: descriptor
+                        .displays
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.kind == crate::descriptor::DisplayKind::Trigger)
+                        .fold(0, |mask, (i, _)| mask | (1 << i)),
                 };
                 if let Err(rtrb::PushError::Full(_)) = self.commands.push(insert) {
                     self.free_slots.push(slot);
@@ -222,14 +236,7 @@ impl Controller {
             }
             ModuleRole::UnitDelay | ModuleRole::AudioOutput => None,
         };
-        self.graph.nodes.insert(
-            id,
-            Node {
-                descriptor,
-                params: descriptor.default_params(),
-                slot,
-            },
-        );
+        self.graph.nodes.insert(id, Node::new(descriptor, slot));
         self.next_id = self.next_id.max(id.0 + 1);
         self.dirty = true;
         Ok(())
@@ -291,7 +298,7 @@ impl Controller {
         depth: f32,
     ) -> Result<AssignmentId, LoomError> {
         self.check_output(source)?;
-        self.check_param(target, param)?;
+        self.check_target(target, param)?;
         let id = AssignmentId(self.next_assignment);
         self.next_assignment += 1;
         self.graph.assignments.insert(
@@ -318,7 +325,7 @@ impl Controller {
             return Err(LoomError::DuplicateAssignmentId(id));
         }
         self.check_output(assignment.source)?;
-        self.check_param(assignment.target, assignment.param)?;
+        self.check_target(assignment.target, assignment.param)?;
         self.next_assignment = self.next_assignment.max(id.0 + 1);
         self.graph.assignments.insert(
             id,
@@ -419,7 +426,7 @@ impl Controller {
         if !control.is_valid() {
             return Err(LoomError::InvalidMidiControl(control));
         }
-        self.check_param(target, param)?;
+        self.check_target(target, param)?;
         let replaced: Vec<MidiMappingId> = self
             .graph
             .midi_mappings()
@@ -464,8 +471,12 @@ impl Controller {
         param: usize,
     ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
         let result = self.map_midi(seen.control, target, param)?;
-        let spec = &self.node(target)?.descriptor.params[param];
-        self.set_param(target, param, control_value(spec, seen.value))?;
+        // The control spans the selected range (control-ranges.md, rule 4).
+        let spec = self.node(target)?.spec(param).ok_or_else(|| LoomError::NoSuchParam {
+            module: target,
+            param: param.to_string(),
+        })?;
+        self.set_param(target, param, control_value(&spec, seen.value))?;
         Ok(result)
     }
 
@@ -486,6 +497,13 @@ impl Controller {
     /// MIDI learn. `None` before the first one.
     pub fn last_control_change(&self) -> Option<ControlChangeSeen> {
         self.midi_feedback.last()
+    }
+
+    /// The last note on the engine received, or `None` before the first.
+    /// Its serial is counted with control changes, so learning a panic
+    /// trigger can take whichever came first after it started.
+    pub fn last_note_on(&self) -> Option<crate::midi_map::NoteOnSeen> {
+        self.midi_feedback.last_note()
     }
 
     /// A handle that reads the last control change from any thread.
@@ -522,9 +540,9 @@ impl Controller {
             }
             if apply
                 && let Some(node) = self.graph.nodes.get_mut(&mapping.target)
-                && let Some(spec) = node.descriptor.params.get(mapping.param)
+                && let Some(spec) = node.spec(mapping.param)
             {
-                node.params[mapping.param] = control_value(spec, entry.value);
+                node.params[mapping.param] = control_value(&spec, entry.value);
                 changed.push((mapping.target, mapping.param));
             }
         }
@@ -576,14 +594,11 @@ impl Controller {
         let node = self.graph.nodes.get(&module).ok_or(LoomError::UnknownModule(module))?;
         let mut clamped = Vec::with_capacity(changes.len());
         for &(index, value) in changes {
-            let spec = node
-                .descriptor
-                .params
-                .get(index)
-                .ok_or_else(|| LoomError::NoSuchParam {
-                    module,
-                    param: index.to_string(),
-                })?;
+            // Clamped to the selected range (control-ranges.md, rule 8).
+            let spec = node.spec(index).ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: index.to_string(),
+            })?;
             clamped.push((index, spec.clamp(value)));
         }
         // Mapped parameters carry an edit token, as in `set_param`.
@@ -646,14 +661,11 @@ impl Controller {
             .nodes
             .get_mut(&module)
             .ok_or(LoomError::UnknownModule(module))?;
-        let spec = node
-            .descriptor
-            .params
-            .get(index)
-            .ok_or_else(|| LoomError::NoSuchParam {
-                module,
-                param: index.to_string(),
-            })?;
+        // Clamped to the selected range (control-ranges.md, rule 8).
+        let spec = node.spec(index).ok_or_else(|| LoomError::NoSuchParam {
+            module,
+            param: index.to_string(),
+        })?;
         let value = spec.clamp(value);
         node.params[index] = value;
         let edit = mapping.map(|(_, control)| (control, self.next_edit));
@@ -690,6 +702,54 @@ impl Controller {
         self.set_param(module, index, value)
     }
 
+    /// Selects the control range of parameter `index` (control-ranges.md).
+    ///
+    /// A smaller range clamps the value into it. A wider range keeps the
+    /// value (rule 6). The knob, the inspector, MIDI, and modulation then
+    /// span the range. `range` must be one the parameter offers, or its
+    /// full range. Modulation and MIDI follow it after the next
+    /// [`Controller::commit`], which puts the bounds into the schedule
+    /// (rule 8). An error leaves the range and the value as they were.
+    pub fn set_range(&mut self, module: ModuleId, index: usize, range: ParamRange) -> Result<(), LoomError> {
+        let node = self
+            .graph
+            .nodes
+            .get_mut(&module)
+            .ok_or(LoomError::UnknownModule(module))?;
+        let spec = node
+            .descriptor
+            .params
+            .get(index)
+            .ok_or_else(|| LoomError::NoSuchParam {
+                module,
+                param: index.to_string(),
+            })?;
+        // The full range is allowed too: a loaded value that no listed range
+        // holds keeps it, so the value does not change (rule 7).
+        let full = ParamRange::new(spec.min, spec.max);
+        if spec.options.ranges.is_empty() || !(spec.options.ranges.contains(&range) || range == full) {
+            return Err(LoomError::NoSuchRange {
+                module,
+                param: spec.name.to_string(),
+                range: range.to_string(),
+            });
+        }
+        let previous = node.ranges[index].replace(range);
+        let value = node.params[index];
+        let clamped = value.clamp(range.min, range.max);
+        if clamped != value
+            && let Err(error) = self.set_param(module, index, clamped)
+        {
+            if let Some(node) = self.graph.nodes.get_mut(&module) {
+                node.ranges[index] = previous;
+                node.params[index] = value;
+            }
+            return Err(error);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Clears a module's internal state.
     pub fn reset_module(&mut self, module: ModuleId) -> Result<(), LoomError> {
         if let Some(slot) = self.node(module)?.slot {
@@ -703,7 +763,7 @@ impl Controller {
     /// Display value `index` of a module, as of the last block the engine
     /// ran, for a light on its panel (ADR-0013). `None` if the module does
     /// not exist or has no such value. A module the engine has not run yet
-    /// reads 0.
+    /// reads 0. Reading a trigger value clears it (see [`DisplayReader::read`]).
     pub fn display(&self, module: ModuleId, index: usize) -> Option<f32> {
         self.display_source(module, index)
             .map(|source| self.display_reader().read(source))
@@ -725,7 +785,8 @@ impl Controller {
     pub fn display_source(&self, module: ModuleId, index: usize) -> Option<DisplaySource> {
         let node = self.graph.nodes.get(&module)?;
         let slot = node.slot?;
-        (index < node.descriptor.displays.len()).then(|| DisplaySource::new(slot, module.0, index))
+        let spec = node.descriptor.displays.get(index)?;
+        Some(DisplaySource::new(slot, module.0, index, spec.kind))
     }
 
     /// A handle that reads display values from any thread.
@@ -787,6 +848,45 @@ impl Controller {
     /// There is no way back: build a new engine to play again.
     pub fn fade_out(&mut self) -> Result<(), LoomError> {
         self.send(Command::FadeOut)
+    }
+
+    /// Starts tracking the notes held on MIDI input `input`. Call it before
+    /// events stamped with `input` reach the engine; events from an input
+    /// that is not open are dropped. Opening an input that is open releases
+    /// its notes first. Spec: `docs/design/device-changes.md`, Held notes
+    /// belong to an input.
+    pub fn open_midi_input(&mut self, input: crate::MidiInputId) -> Result<(), LoomError> {
+        let index = check_input_id(input)?;
+        self.send(Command::OpenInput {
+            index,
+            held: Box::default(),
+        })
+    }
+
+    /// Stops tracking MIDI input `input`: the engine sends a note off for
+    /// every note it held, unless another input still holds that note, and
+    /// drops later events stamped with it. Call it when the input is closed
+    /// or gone.
+    pub fn release_midi_input(&mut self, input: crate::MidiInputId) -> Result<(), LoomError> {
+        let index = check_input_id(input)?;
+        self.send(Command::ReleaseInput(index))
+    }
+
+    /// Runs panic (`docs/design/panic.md`): the engine fades its output to
+    /// silence over 10 ms, releases every held note and resets every
+    /// module at the silent frame, and fades back in over 10 ms. It is not
+    /// an edit: the graph, the parameters, and the transport do not change.
+    /// A panic sent while one is running is ignored.
+    pub fn panic(&mut self) -> Result<(), LoomError> {
+        self.send(Command::Panic)
+    }
+
+    /// Sets the MIDI message that runs panic in the engine, or `None` for
+    /// no trigger. The engine looks for it in its own MIDI path, so it
+    /// works with no UI thread. The trigger belongs to the player's rig,
+    /// so it is not part of the graph or the patch.
+    pub fn set_panic_trigger(&mut self, trigger: Option<crate::PanicTrigger>) -> Result<(), LoomError> {
+        self.send(Command::SetPanicTrigger(trigger))
     }
 
     fn send(&mut self, command: Command) -> Result<(), LoomError> {
@@ -918,6 +1018,21 @@ impl Controller {
             })
     }
 
+    /// Checks a parameter that modulation or a MIDI mapping will drive. A
+    /// transient parameter is a live gesture, so it is refused
+    /// (transient-params.md).
+    fn check_target(&self, module: ModuleId, index: usize) -> Result<(), LoomError> {
+        self.check_param(module, index)?;
+        let spec = &self.node(module)?.descriptor.params[index];
+        if spec.is_transient() {
+            return Err(LoomError::TransientParam {
+                module,
+                param: spec.name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn check_param(&self, module: ModuleId, index: usize) -> Result<(), LoomError> {
         let node = self.node(module)?;
         if index >= node.descriptor.params.len() {
@@ -943,6 +1058,14 @@ impl Controller {
 }
 
 /// Clamps a modulation depth to -1..1. NaN becomes 0, which adds nothing.
+/// The table index of a MIDI input id, if it is in range.
+fn check_input_id(input: crate::MidiInputId) -> Result<usize, LoomError> {
+    if input.0 == 0 || input.0 >= crate::MAX_MIDI_INPUTS {
+        return Err(LoomError::InvalidMidiInput(input.0));
+    }
+    Ok(usize::from(input.0))
+}
+
 fn clamp_depth(depth: f32) -> f32 {
     if depth.is_nan() { 0.0 } else { depth.clamp(-1.0, 1.0) }
 }
@@ -952,6 +1075,7 @@ mod tests {
     use super::*;
     use crate::module::{Module, PortIo, ProcessContext};
     use crate::{Panel, ParamOptions, ParamSpec, Widget};
+    use std::sync::atomic::Ordering;
 
     struct Silent;
 
@@ -981,9 +1105,9 @@ mod tests {
         description: "A button for the queue test.",
         inputs: &[],
         outputs: &[],
-        params: &[parameter("mode"), parameter("on")],
+        params: &[parameter("mode"), parameter("on"), parameter("hold").transient()],
         role: ModuleRole::Dsp(|_| Box::new(Silent)),
-        panel: Panel::new(6, 3, &[Widget::button(0, 0, "on", "mode")]),
+        panel: Panel::new(6, 3, &[Widget::button(0, 0, "on", "hold", "mode")]),
         displays: &[],
     };
 
@@ -1004,7 +1128,7 @@ mod tests {
         room.commit().unwrap();
         room.set_param_named(id, "on", 1.0).unwrap();
         room.set_params(id, &[(0, 1.0), (1, 0.0)]).unwrap();
-        assert_eq!(room.graph().node(id).unwrap().params, vec![1.0, 0.0]);
+        assert_eq!(room.graph().node(id).unwrap().params, vec![1.0, 0.0, 0.0]);
 
         // Inserting the module and swapping in its schedule fill a queue of
         // two. Two parameter commands do not fit, so neither value changes.
@@ -1013,6 +1137,73 @@ mod tests {
         full.commit().unwrap();
         let error = full.set_params(id, &[(0, 1.0), (1, 0.0)]).unwrap_err();
         assert!(matches!(error, LoomError::QueueFull), "{error}");
-        assert_eq!(full.graph().node(id).unwrap().params, vec![0.0, 0.0]);
+        assert_eq!(full.graph().node(id).unwrap().params, vec![0.0, 0.0, 0.0]);
+    }
+
+    /// A transient parameter is sent to the engine like any other, but it
+    /// cannot be a modulation target or a MIDI mapping target.
+    #[test]
+    fn a_transient_parameter_cannot_be_modulated_or_mapped() {
+        let mut room = controller(16);
+        let id = room.add_module(GATE.id).unwrap();
+        room.commit().unwrap();
+        assert_eq!(room.set_param_named(id, "hold", 1.0).unwrap(), 1.0);
+        let control = MidiControl {
+            channel: 0,
+            controller: 1,
+        };
+        let error = room.map_midi(control, id, 2).unwrap_err();
+        assert!(matches!(error, LoomError::TransientParam { .. }), "{error}");
+        assert!(room.map_midi(control, id, 1).is_ok());
+    }
+
+    /// The largest module ID is refused with an error, not an overflow
+    /// panic, and an ID just below it still leaves room for the next free
+    /// one (#44).
+    #[test]
+    fn module_ids_past_the_largest_are_refused() {
+        let mut room = controller(8);
+        let error = room.add_module_with_id(ModuleId(u32::MAX), GATE.id).unwrap_err();
+        assert!(matches!(error, LoomError::ModuleIdOutOfRange(_)), "{error}");
+        room.add_module_with_id(ModuleId::MAX, GATE.id).unwrap();
+        let error = room.add_module(GATE.id).unwrap_err();
+        assert!(matches!(error, LoomError::ModuleIdOutOfRange(_)), "{error}");
+    }
+
+    /// An engine that no device plays takes edits for as long as someone
+    /// calls `Engine::apply_pending` (#220). It renders nothing: no buffer
+    /// is counted, and nothing leaks, because replaced schedules come back
+    /// to the controller.
+    #[test]
+    fn apply_pending_drains_the_queue_without_rendering() {
+        let mut registry = Registry::new();
+        registry.register(&GATE).expect("test module is valid");
+        let config = EngineConfig {
+            command_capacity: 4,
+            ..EngineConfig::default()
+        };
+        let parts = create_engine(Arc::new(registry), config);
+        let (mut room, mut engine) = (parts.controller, parts.engine);
+        let id = room.add_module(GATE.id).unwrap();
+        room.commit().unwrap();
+        engine.apply_pending();
+        let setup_swaps = room.stats().schedule_swaps.load(Ordering::Relaxed);
+        let mut extra = None;
+        for i in 0..1000 {
+            room.set_param_named(id, "on", (i % 2) as f32).unwrap();
+            // Adding or removing a module makes the commit swap in a new
+            // schedule, so the old one comes back as garbage.
+            match extra.take() {
+                None => extra = Some(room.add_module(GATE.id).unwrap()),
+                Some(module) => room.remove_module(module).unwrap(),
+            }
+            room.commit().unwrap();
+            engine.apply_pending();
+            room.collect_garbage();
+        }
+        let stats = room.stats();
+        assert_eq!(stats.buffers.load(Ordering::Relaxed), 0, "nothing rendered");
+        assert_eq!(stats.schedule_swaps.load(Ordering::Relaxed), setup_swaps + 1000);
+        assert_eq!(stats.leaked.load(Ordering::Relaxed), 0, "nothing leaked");
     }
 }

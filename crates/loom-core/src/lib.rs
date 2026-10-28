@@ -27,6 +27,7 @@ mod live;
 mod midi;
 mod midi_map;
 mod module;
+mod panic;
 mod registry;
 pub mod safety;
 pub mod signal;
@@ -37,17 +38,18 @@ mod width;
 pub use compile::{CompileReport, FeedbackLoop};
 pub use controller::{Controller, EngineParts, MidiSender, create_engine};
 pub use descriptor::{
-    ButtonMode, Channels, MAX_DISPLAYS, MissingText, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamMapping,
-    ParamOptions, ParamSpec, Polarity, PortDefault, PortSpec, SpecKind, Undocumented, Widget, WidgetKind,
-    assert_documented,
+    ButtonMode, Channels, DisplayKind, DisplaySpec, MAX_DISPLAYS, MissingText, ModuleConfig, ModuleDescriptor,
+    ModuleRole, Panel, ParamMapping, ParamOptions, ParamRange, ParamSpec, Polarity, PortDefault, PortSpec, SpecKind,
+    Undocumented, Widget, WidgetKind, assert_documented,
 };
-pub use display::{DisplayReader, DisplaySource};
+pub use display::{DisplayReader, DisplaySource, TriggerFlag};
 pub use engine::{Engine, EngineConfig, EngineStats};
 pub use error::LoomError;
 pub use graph::{Assignment, AssignmentId, Graph, InputRef, ModuleId, Node, OutputRef};
-pub use midi::{MidiEvent, MidiMessage};
-pub use midi_map::{ControlChangeSeen, MidiControl, MidiMapping, MidiMappingId, MidiReader, control_value};
+pub use midi::{MAX_MIDI_INPUTS, MidiEvent, MidiInputId, MidiMessage};
+pub use midi_map::{ControlChangeSeen, MidiControl, MidiMapping, MidiMappingId, MidiReader, NoteOnSeen, control_value};
 pub use module::{Module, Param, PortIo, ProcessContext, testing};
+pub use panic::PanicTrigger;
 pub use registry::{ModuleKind, Registry, RegistryNote};
 pub use safety::OutputSafety;
 pub use signal::SignalType;

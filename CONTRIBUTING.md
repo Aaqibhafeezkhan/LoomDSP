@@ -7,7 +7,7 @@ Thank you for helping. This guide explains how to build, test, and send changes.
 - Look for an issue first. If none exists, open one and describe what you want to change.
 - Issues reference requirement IDs from [docs/product/requirements.md](docs/product/requirements.md), for example `FR-MIDI-02`. Mention the ID in your pull request too. This links code to the reason it exists.
 - New features start with a [specification](docs/design/README.md#spec-first): what the user sees, the rules, acceptance criteria, and what is out of scope. Agree on the spec, then build to it, and update it in the same pull request when the code teaches you something.
-- Big design changes need an [ADR](docs/adr/README.md) first. The ADR records the decision only. Details that will change (ports, parameters, examples) go in a [design specification](docs/design/README.md), which you update with the code. See [kinds of documents](docs/README.md#kinds-of-documents).
+- Big design changes need an [ADR](docs/adr/README.md) first. The ADR records the decision only, and it merges only once it is decided (Accepted, Deferred, Rejected, or Superseded), not while it is Proposed. Details that will change (ports, parameters, examples) go in a [design specification](docs/design/README.md), which you update with the code. See [kinds of documents](docs/README.md#kinds-of-documents).
 - AI-assisted contributions are welcome. Read the [AI contribution policy](AI_POLICY.md).
 
 Good starting points: issues labelled [`good first issue`](https://github.com/brylie/LoomDSP/labels/good%20first%20issue) or [`help wanted`](https://github.com/brylie/LoomDSP/labels/help%20wanted). New modules are often a good first contribution: they are small, self-contained, and easy to test. Pick an issue without `needs spec agreed`: the others still have open questions ([ready to build](docs/design/README.md#ready-to-build)). The current phase's work is in the [P1 milestone](https://github.com/brylie/LoomDSP/milestone/1), roughly in priority order.
@@ -93,10 +93,18 @@ Every pull request runs these jobs. All must pass before merging: the main branc
 | Docs | API docs build without warnings | `mise run docs` |
 | MSRV | Still builds with Rust 1.99 | `mise run msrv` |
 | WebAssembly | Engine crates build for `wasm32-unknown-unknown` | `mise run wasm` |
-| Licences | Only permissive licences, no known vulnerabilities | `mise run deny` |
+| Licences | Only permissive licences, no banned crates, only crates.io as a source | `mise run deny-policy` |
+| Security advisories | No dependency has a RustSec advisory. On a pull request, only when it changes `Cargo.toml`, `Cargo.lock`, or `deny.toml`; always on `main` and in the weekly run | `mise run deny-advisories` |
 | Spelling | Typos in code and docs | `mise run typos` |
 
 To change a check, change its task in `mise.toml`. The hooks and CI both pick it up.
+
+`mise run deny` runs both cargo-deny checks at once, as the pre-push hook does when a dependency file changed.
+
+**When the advisories check fails.** A new advisory is published against the RustSec database, not against your change, so CI checks advisories only where fixing one is part of the work: on `main`, in the weekly run, and in a pull request that changes the dependencies. Why: otherwise one new advisory fails every open pull request, docs-only ones too (#143). To fix a failure:
+
+1. Upgrade the crate to a version without the advisory (`cargo update -p <crate>`), or remove it, or replace it with a maintained one.
+2. If none of these is possible yet, add the advisory to `[advisories] ignore` in `deny.toml` as `{ id = "RUSTSEC-...", reason = "..." }`. The reason says why it does not affect LoomDSP, or what we wait for. Open an issue to remove the entry later.
 
 Why warnings fail CI but not your local build: a warning while you are still editing is noise, but a warning on `main` is a problem someone else inherits. `mise run clippy`, `docs`, and `wasm` treat warnings as errors, as CI does, so the checks catch them before you push.
 
@@ -116,6 +124,20 @@ Besides "CI success", the main branch ruleset has two gates from [GitHub Code Qu
 **Code quality findings.** A pull request is blocked by any Code Quality finding of severity "error". Code Quality's rule-based analysis uses CodeQL, which covers C#, Go, Java, JavaScript, Python, Ruby, and TypeScript, but not Rust. So for LoomDSP's Rust code, the quality gate is Clippy: CI runs it with warnings as errors, and the hooks run the same task. The CodeQL checks run only on GitHub, so there is no local command for them. If one blocks your pull request, its finding is shown inline on the pull request.
 
 Dependabot opens weekly pull requests for dependency updates.
+
+### Fuzzing
+
+`fuzz/` holds a [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target for the patch loader (#44). It reads random input as a patch, loads it into an engine with every built-in module, and plays a few buffers. Any input must give an error or a working engine, never a panic or a hang. cargo-fuzz needs a nightly compiler, so `fuzz/` is its own workspace, CI does not run it, and the engine crates still build on stable and for WebAssembly.
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo install cargo-fuzz
+cd fuzz
+mkdir -p corpus/patch_loader && cp ../examples/patches/*.ron corpus/patch_loader/
+cargo +nightly fuzz run patch_loader -- -max_total_time=300 -dict=patch.dict
+```
+
+Run it after a change to the patch format, the loader, or the controller. When it finds an input that breaks the loader, fix the cause, then copy the input from `fuzz/artifacts/` into `crates/loom-patch/tests/malformed/` with a comment that says what it found. `crates/loom-patch/tests/malformed.rs` loads every file there, plus edge cases and seeded random changes of the example patches, on stable in every CI job.
 
 ## Rules for audio code
 
@@ -171,7 +193,7 @@ Start from the module's entry in the [module catalogue](docs/product/module-cata
 7. Give it a panel: a `Panel` in its descriptor with a knob for each parameter a performer would turn, and lights for display values. The registry refuses a panel that does not fit (see [module panels on tiles](docs/design/panels.md#module-panels-on-tiles-p1)).
 8. Add a reference test to `crates/loom-modules/tests/reference.rs` with the [module test harness](docs/design/module-test-harness.md) (`loom-test`). It checks that block size does not change the output and compares with a short reference render. Create the file with `LOOM_UPDATE_REFERENCES=1 cargo test -p loom-modules --test reference`, listen to it, and commit it. Reviewers can listen to it too. For smaller checks, write unit tests with `loom_core::testing::run`. Once the module is in `loom_modules::ALL`, `tests/non_finite.rs` checks that a NaN or infinite input does not stay in its state: replace a non-finite input with a safe value, or clear the state, rather than keep it.
 9. Generate its help page with `mise run help-pages` (or `cargo run -p loom-cli -- modules --markdown docs/modules`), and commit the new page in [`docs/modules/`](docs/modules/README.md). Write longer notes and an example patch below the marker line at the end of the page; regenerating keeps them. A test fails while a page is out of date, so run it again whenever you change a descriptor ([help pages](docs/design/help-pages.md)).
-10. Run the full test suite, then try the module in the app: `cargo run --release -p loom-app`, pick it in the toolbar, and click **Add**.
+10. Run the full test suite, then try the module in the app: `cargo run --release -p loom-app`, press **A** with the pointer over the canvas (or click **Add module** in the toolbar), type part of its name, and press Enter ([module browser](docs/design/module-browser.md)).
 
 ## Working on the canvas and app
 

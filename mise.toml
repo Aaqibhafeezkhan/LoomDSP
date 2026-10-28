@@ -91,9 +91,26 @@ run = "mise exec rust@1.99 -- cargo check --workspace"
 description = "Check licences and advisories (ADR-0006)"
 run = "cargo deny check"
 
+# CI runs the two halves of `deny` as separate jobs (#143). Licences, bans,
+# and sources change only when our files change, so they block every pull
+# request. Advisories change when the RustSec database changes, so CI runs
+# them only where a new one is ours to fix: on main, weekly, and on pull
+# requests that change the dependencies.
+[tasks.deny-policy]
+description = "Check licences, banned crates, and sources (ADR-0006)"
+run = "cargo deny check bans licenses sources"
+
+[tasks.deny-advisories]
+description = "Check the dependencies against the RustSec advisories"
+run = "cargo deny check advisories"
+
 [tasks.typos]
 description = "Check spelling"
 run = "typos"
+
+[tasks.adr-status]
+description = "Check that every ADR has one allowed status, matching the index (no Proposed ADRs on main)"
+run = "sh scripts/check-adr-status.sh"
 
 [tasks.help-pages]
 description = "Regenerate the module help pages in docs/modules from the descriptors"
@@ -105,4 +122,4 @@ run = "cargo run -p loom-cli -- modules --markdown docs/modules"
 description = "Run the checks CI runs (all but msrv and the three-OS test matrix)"
 # coverage runs every test except doc tests, so `test` is not listed again;
 # `doctest` covers the rest.
-depends = ["fmt", "clippy", "typos", "deny", "docs", "wasm", "coverage", "doctest"]
+depends = ["fmt", "clippy", "typos", "adr-status", "deny", "docs", "wasm", "coverage", "doctest"]

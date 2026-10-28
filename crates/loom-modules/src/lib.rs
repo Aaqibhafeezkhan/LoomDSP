@@ -117,10 +117,18 @@ mod tests {
                     assert!(
                         matches!(
                             widget.map(|w| w.kind),
-                            Some(loom_core::WidgetKind::Button { mode: "mode" })
+                            Some(loom_core::WidgetKind::Button {
+                                mode: "mode",
+                                hold: "hold"
+                            })
                         ),
                         "button.on"
                     );
+                    continue;
+                }
+                // A transient parameter is reached through its widget only
+                // (transient-params.md): Button's `hold` is the button.
+                if param.is_transient() {
                     continue;
                 }
                 // The scope's `auto` is a toggle (panels.md, Scope module).
@@ -135,7 +143,7 @@ mod tests {
                 // The amplifier's response is a radio, not a knob.
                 if descriptor.id == "loom.level.amp" && param.name == "response" {
                     assert!(
-                        matches!(widget.map(|w| w.kind), Some(loom_core::WidgetKind::Radio { .. })),
+                        matches!(widget.map(|w| w.kind), Some(loom_core::WidgetKind::Radio)),
                         "amp.response"
                     );
                     continue;
@@ -143,7 +151,7 @@ mod tests {
                 // Convert's mode is a radio, not a knob.
                 if descriptor.id == "loom.math.convert" && param.name == "mode" {
                     assert!(
-                        matches!(widget.map(|w| w.kind), Some(loom_core::WidgetKind::Radio { .. })),
+                        matches!(widget.map(|w| w.kind), Some(loom_core::WidgetKind::Radio)),
                         "convert.mode"
                     );
                     continue;
@@ -169,7 +177,7 @@ mod tests {
                     assert!(
                         matches!(
                             widget.map(|w| w.kind),
-                            Some(loom_core::WidgetKind::Radio { .. } | loom_core::WidgetKind::Toggle)
+                            Some(loom_core::WidgetKind::Radio | loom_core::WidgetKind::Toggle)
                         ),
                         "{}.{}",
                         descriptor.id,
@@ -191,6 +199,8 @@ mod tests {
                 "loom.midi.note" => &["gate"],
                 "loom.env.adsr" => &["level"],
                 "loom.logic.memory" => &["state"],
+                // Trigger lights (panels.md, Lights for one-sample triggers).
+                "loom.logic.divide" | "loom.phase.trigger" => &["fired"],
                 _ => &[],
             };
             assert_eq!(lights, expected, "{}", descriptor.id);

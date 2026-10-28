@@ -123,7 +123,7 @@ fn notes_of(page: &str) -> Option<String> {
     let mut start = 0;
     for line in page.split_inclusive('\n') {
         start += line.len();
-        if line.trim_end_matches('\n') == MARKER {
+        if line.trim_end_matches(['\r', '\n']) == MARKER {
             return Some(page[start..].to_string());
         }
     }
@@ -315,6 +315,17 @@ fn range(p: &ParamSpec) -> String {
     if p.options.mapping == ParamMapping::Logarithmic {
         text.push_str(", logarithmic");
     }
+    if let Some(default) = p.default_range() {
+        let names: Vec<String> = p.options.ranges.iter().map(ToString::to_string).collect();
+        text.push_str(&format!(", control ranges {} (default {default})", names.join(", ")));
+    }
+    if !p.options.choices.is_empty() {
+        text.push_str(", choices ");
+        text.push_str(&cell(&p.options.choices.join(", ")));
+    }
+    if p.is_transient() {
+        text.push_str(", not saved");
+    }
     text
 }
 
@@ -349,9 +360,27 @@ fn widget(d: &ModuleDescriptor, w: &Widget) -> String {
     match w.kind {
         WidgetKind::Knob => format!("Knob: {}", param(w.bind)),
         WidgetKind::Toggle => format!("Toggle: {}", param(w.bind)),
-        WidgetKind::Radio { options } => format!("Radio buttons: {} ({})", param(w.bind), cell(&options.join(", "))),
-        WidgetKind::Button { .. } => format!("Button: {}", param(w.bind)),
-        WidgetKind::Light => format!("Light: `{}`", w.bind),
+        WidgetKind::Radio => {
+            let choices = d
+                .params
+                .iter()
+                .find(|p| p.name == w.bind)
+                .map_or(&[][..], |p| p.options.choices);
+            format!("Radio buttons: {} ({})", param(w.bind), cell(&choices.join(", ")))
+        }
+        WidgetKind::Button { mode, hold } => format!(
+            "Button: {} (toggle), {} (momentary), chosen by {}",
+            param(w.bind),
+            param(hold),
+            param(mode)
+        ),
+        WidgetKind::Light => {
+            let light = d.displays.iter().find(|v| v.name == w.bind).map_or_else(
+                || format!("`{}`", w.bind),
+                |v| format!("{}: {}", name(v.label, v.name), cell(v.description)),
+            );
+            format!("Light: {light}")
+        }
         WidgetKind::Meter => {
             let output = d
                 .outputs
@@ -405,6 +434,10 @@ mod tests {
     #[test]
     fn the_marker_counts_only_as_a_whole_line() {
         assert_eq!(notes_of(&format!("# A\n{MARKER}\nnotes\n")).as_deref(), Some("notes\n"));
+        assert_eq!(
+            notes_of(&format!("# A\r\n{MARKER}\r\nnotes\r\n")).as_deref(),
+            Some("notes\r\n")
+        );
         assert_eq!(notes_of(&format!("# A\n{MARKER}")).as_deref(), Some(""));
         assert_eq!(
             notes_of(&format!("Keep the line `{MARKER}` when you edit.\nmine\n")),
@@ -507,5 +540,65 @@ mod tests {
         assert_eq!(name("", "x"), "`x`");
         assert_eq!(notes_of("no marker"), None);
         assert_eq!(notes_of(&format!("a\n{MARKER}\nb\n")).as_deref(), Some("b\n"));
+        assert_eq!(
+            extract_ron_snippet("```ron\nPatch()\n```\n").as_deref(),
+            Some("Patch()\n")
+        );
+        assert_eq!(
+            extract_ron_snippet("```ron\nPatch()\n// ```not a close\n```\n").as_deref(),
+            Some("Patch()\n// ```not a close\n")
+        );
+        assert_eq!(extract_ron_snippet("no fence"), None);
+    }
+
+    /// Extracts a RON snippet enclosed in ```ron ... ``` from markdown notes.
+    fn extract_ron_snippet(notes: &str) -> Option<String> {
+        let normalized = notes.replace("\r\n", "\n");
+        let start_tag = "```ron\n";
+        let start = normalized.find(start_tag)?;
+        let rest = &normalized[start + start_tag.len()..];
+        let mut len = 0;
+        for line in rest.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches('\n').trim_end();
+            if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '`') {
+                return Some(rest[..len].to_string());
+            }
+            len += line.len();
+        }
+        None
+    }
+
+    /// Every built-in module has an example patch in its help page (FR-LIB-11).
+    /// The patch must parse, contain the module, and compile cleanly into a schedule.
+    #[test]
+    fn example_patches_in_pages_are_valid() {
+        let registry = loom_modules::registry();
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/modules"));
+        for d in registry.iter() {
+            let path = dir.join(file_name(d));
+            let text = read_normalized(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+                .unwrap_or_else(|| panic!("{} is missing", path.display()));
+            let notes = notes_of(&text).unwrap_or_else(|| panic!("{} has no marker line", path.display()));
+            let ron_snippet = extract_ron_snippet(&notes)
+                .unwrap_or_else(|| panic!("{} has no ```ron example patch in its notes", path.display()));
+            let patch = loom_patch::Patch::from_ron(&ron_snippet)
+                .unwrap_or_else(|e| panic!("{} example patch failed to parse: {e}", path.display()));
+            let expected_prefix = format!("{}@", d.id);
+            let has_module = patch
+                .modules
+                .iter()
+                .any(|m| m.kind.starts_with(&expected_prefix) || m.kind == d.id);
+            assert!(
+                has_module,
+                "{} example patch does not contain module {}",
+                path.display(),
+                d.id
+            );
+            let mut parts = loom_core::create_engine(registry.clone(), loom_core::EngineConfig::default());
+            patch
+                .load_into(&mut parts.controller)
+                .unwrap_or_else(|e| panic!("{} example patch failed to load into controller: {e}", path.display()));
+        }
     }
 }

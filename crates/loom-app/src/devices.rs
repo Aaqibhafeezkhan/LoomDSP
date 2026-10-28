@@ -7,7 +7,10 @@
 //! the saved choice and the command-line flags, and what the window offers.
 
 use crate::preferences::{AudioPrefs, BufferChoice, DeviceChoice, RateChoice};
-use loom_host_desktop::{AudioOptions, AudioOutput, MidiConnection, OutputInfo, Outputs, RunningAudio, SharedMidi};
+use loom_core::MidiInputId;
+use loom_host_desktop::{
+    AudioOptions, AudioOutput, MidiConnection, MidiInputInfo, OutputInfo, Outputs, RunningAudio, SharedMidi,
+};
 use std::path::PathBuf;
 
 /// The flags that set devices for one run. They are never saved.
@@ -40,19 +43,39 @@ pub struct Options {
 
 /// An open MIDI input.
 pub trait MidiPort {
-    /// The input's full name.
+    /// The input's full name, unique in the list (`Pad (2)` for a second
+    /// `Pad`).
     fn name(&self) -> &str;
+    /// The system's identity for the port when it was opened. A port
+    /// listed again under another identity is a new connection.
+    fn port_id(&self) -> &str;
+    /// The id its events carry, which the engine tracks held notes by.
+    fn input(&self) -> MidiInputId;
     /// Closes the input and releases the notes held on it.
     fn close(self: Box<Self>);
 }
 
-impl MidiPort for MidiConnection {
+/// A real MIDI input and the id it was opened with.
+pub struct SystemPort {
+    connection: MidiConnection,
+    input: MidiInputId,
+}
+
+impl MidiPort for SystemPort {
     fn name(&self) -> &str {
-        self.port_name()
+        self.connection.port_name()
+    }
+
+    fn port_id(&self) -> &str {
+        self.connection.port_id()
+    }
+
+    fn input(&self) -> MidiInputId {
+        self.input
     }
 
     fn close(self: Box<Self>) {
-        MidiConnection::close(*self);
+        self.connection.close();
     }
 }
 
@@ -63,14 +86,29 @@ pub trait Host {
     /// Chooses an output, without starting it.
     fn open(&self, options: &AudioOptions) -> Result<AudioOutput, String>;
     /// Starts an output with an engine. A device can still refuse here,
-    /// after it opened.
-    fn start(&self, output: AudioOutput, engine: loom_core::Engine) -> Result<RunningAudio, String> {
-        output.start(engine).map_err(|e| e.to_string())
+    /// after it opened. On refusal, returns the [`loom_core::Engine`] so it
+    /// can be kept idle and retried, along with the error reason.
+    #[allow(clippy::result_large_err)]
+    fn start(
+        &self,
+        output: AudioOutput,
+        engine: loom_core::Engine,
+    ) -> Result<RunningAudio, (loom_core::Engine, String)> {
+        match output.start(engine) {
+            Ok(running) => Ok(running),
+            Err(e) => Err((e.engine, e.error.to_string())),
+        }
     }
-    /// The names of the MIDI inputs.
-    fn midi_inputs(&self) -> Result<Vec<String>, String>;
-    /// Opens the MIDI input with this exact name.
-    fn open_midi(&self, name: &str, midi: SharedMidi) -> Result<Box<dyn MidiPort>, String>;
+    /// The MIDI inputs now: names made unique by order, and port
+    /// identities (`docs/design/device-changes.md`).
+    fn midi_list(&self) -> Result<Vec<MidiInputInfo>, String>;
+    /// The names of the MIDI inputs, unique by order.
+    fn midi_inputs(&self) -> Result<Vec<String>, String> {
+        Ok(self.midi_list()?.into_iter().map(|input| input.name).collect())
+    }
+    /// Opens the MIDI input with this name from [`Host::midi_list`]. Its
+    /// events carry `input`.
+    fn open_midi(&self, name: &str, midi: SharedMidi, input: MidiInputId) -> Result<Box<dyn MidiPort>, String>;
 }
 
 /// The real devices, through `cpal` and `midir`.
@@ -85,13 +123,13 @@ impl Host for System {
         AudioOutput::open(options).map_err(|e| e.to_string())
     }
 
-    fn midi_inputs(&self) -> Result<Vec<String>, String> {
-        loom_host_desktop::midi_input_names().map_err(|e| e.to_string())
+    fn midi_list(&self) -> Result<Vec<MidiInputInfo>, String> {
+        loom_host_desktop::midi_inputs().map_err(|e| e.to_string())
     }
 
-    fn open_midi(&self, name: &str, midi: SharedMidi) -> Result<Box<dyn MidiPort>, String> {
-        loom_host_desktop::connect_midi_named(name, midi)
-            .map(|c| Box::new(c) as Box<dyn MidiPort>)
+    fn open_midi(&self, name: &str, midi: SharedMidi, input: MidiInputId) -> Result<Box<dyn MidiPort>, String> {
+        loom_host_desktop::connect_midi_input(name, midi, input)
+            .map(|connection| Box::new(SystemPort { connection, input }) as Box<dyn MidiPort>)
             .map_err(|e| e.to_string())
     }
 }
@@ -412,6 +450,7 @@ pub mod fake {
     use loom_host_desktop::MidiInputState;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// What happened, in order.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,12 +462,23 @@ pub mod fake {
 
     #[derive(Default)]
     pub struct Fake {
-        pub outputs: Outputs,
+        pub outputs: RefCell<Outputs>,
         /// Devices that fail to open.
-        pub broken: Vec<String>,
+        pub broken: RefCell<Vec<String>>,
         /// Devices that open, then fail to start.
-        pub wont_start: Vec<String>,
-        pub midi: Vec<String>,
+        pub wont_start: RefCell<Vec<String>>,
+        /// The active running streams' callback stats, so tests can emit lost errors.
+        pub active_stats: RefCell<Vec<(String, Arc<loom_host_desktop::CallbackStats>)>>,
+        /// The MIDI inputs plugged in now, as (name, port identity). A
+        /// test plugs and unplugs them with [`Fake::plug`] and
+        /// [`Fake::unplug`].
+        pub midi: RefCell<Vec<(String, String)>>,
+        /// Counts identities, so a port plugged in again gets a new one.
+        pub next_id: std::cell::Cell<u32>,
+        /// MIDI inputs, by listed name, that fail to open.
+        pub broken_midi: RefCell<Vec<String>>,
+        /// True while listing the MIDI inputs fails.
+        pub midi_list_fails: std::cell::Cell<bool>,
         pub log: RefCell<Vec<Event>>,
         /// The open MIDI inputs, so a test can play notes on them.
         pub ports: RefCell<Vec<(String, Rc<RefCell<MidiInputState>>)>>,
@@ -467,13 +517,64 @@ pub mod fake {
         /// Devices by name, the first the system default, and MIDI inputs.
         pub fn new(devices: &[OutputInfo], midi: &[&str]) -> Self {
             Self {
-                outputs: Outputs {
+                outputs: RefCell::new(Outputs {
                     default: devices.first().map(|d| d.name.clone()),
                     devices: devices.to_vec(),
-                },
-                midi: midi.iter().map(|s| s.to_string()).collect(),
+                }),
+                midi: RefCell::new(midi.iter().map(|s| (s.to_string(), format!("id-{s}"))).collect()),
                 ..Self::default()
             }
+        }
+
+        /// Dynamically removes a device from the output list.
+        pub fn remove_device(&self, name: &str) {
+            let mut outputs = self.outputs.borrow_mut();
+            outputs.devices.retain(|d| d.name != name);
+            if outputs.default.as_deref() == Some(name) {
+                outputs.default = outputs.devices.first().map(|d| d.name.clone());
+            }
+        }
+
+        /// Dynamically adds a device to the output list.
+        pub fn add_device(&self, info: OutputInfo) {
+            let mut outputs = self.outputs.borrow_mut();
+            if !outputs.devices.iter().any(|d| d.name == info.name) {
+                outputs.devices.push(info);
+            }
+            if outputs.default.is_none() {
+                outputs.default = outputs.devices.first().map(|d| d.name.clone());
+            }
+        }
+
+        /// Emits a device loss error for the running output on `name`.
+        pub fn emit_lost(&self, name: &str) {
+            for (dev_name, stats) in self.active_stats.borrow().iter() {
+                if dev_name == name {
+                    stats.mark_dead();
+                }
+            }
+        }
+
+        /// Plugs in an input with a new port identity, at the end of the
+        /// list.
+        pub fn plug(&self, name: &str) {
+            let id = self.next_id.get() + 1;
+            self.next_id.set(id);
+            self.midi.borrow_mut().push((name.to_string(), format!("{name}#{id}")));
+        }
+
+        /// Unplugs the last input listed with this name. Its connection, if
+        /// open, stays until the app closes it, as a real one does.
+        pub fn unplug(&self, name: &str) {
+            let mut midi = self.midi.borrow_mut();
+            if let Some(index) = midi.iter().rposition(|(n, _)| n == name) {
+                midi.remove(index);
+            }
+        }
+
+        /// How many inputs are open, for leak checks.
+        pub fn open_count(&self) -> usize {
+            self.ports.borrow().len()
         }
 
         pub fn opened(&self) -> Vec<String> {
@@ -501,6 +602,8 @@ pub mod fake {
 
     struct Port {
         name: String,
+        id: String,
+        input: MidiInputId,
         state: Rc<RefCell<MidiInputState>>,
         host: Rc<Fake>,
     }
@@ -508,6 +611,14 @@ pub mod fake {
     impl MidiPort for Port {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        fn port_id(&self) -> &str {
+            &self.id
+        }
+
+        fn input(&self) -> MidiInputId {
+            self.input
         }
 
         fn close(self: Box<Self>) {
@@ -531,15 +642,21 @@ pub mod fake {
             System.open(options)
         }
 
-        fn start(&self, output: AudioOutput, engine: loom_core::Engine) -> Result<RunningAudio, String> {
+        #[allow(clippy::result_large_err)]
+        #[allow(clippy::result_large_err)]
+        fn start(
+            &self,
+            output: AudioOutput,
+            engine: loom_core::Engine,
+        ) -> Result<RunningAudio, (loom_core::Engine, String)> {
             System.start(output, engine)
         }
 
-        fn midi_inputs(&self) -> Result<Vec<String>, String> {
+        fn midi_list(&self) -> Result<Vec<MidiInputInfo>, String> {
             Ok(Vec::new())
         }
 
-        fn open_midi(&self, name: &str, _midi: SharedMidi) -> Result<Box<dyn MidiPort>, String> {
+        fn open_midi(&self, name: &str, _midi: SharedMidi, _input: MidiInputId) -> Result<Box<dyn MidiPort>, String> {
             panic!("a test opened the MIDI port `{name}`; use fake::Shared with its own ports");
         }
     }
@@ -549,23 +666,23 @@ pub mod fake {
 
     impl Host for Shared {
         fn outputs(&self) -> Result<Outputs, String> {
-            Ok(self.0.outputs.clone())
+            Ok(self.0.outputs.borrow().clone())
         }
 
         fn open(&self, options: &AudioOptions) -> Result<AudioOutput, String> {
             let fake = &self.0;
+            let outputs = fake.outputs.borrow();
             let name = options
                 .device
                 .clone()
-                .or(fake.outputs.default.clone())
+                .or_else(|| outputs.default.clone())
                 .ok_or("no device")?;
-            let info = fake
-                .outputs
+            let info = outputs
                 .devices
                 .iter()
                 .find(|d| d.name == name)
                 .ok_or_else(|| format!("no audio output device found matching `{name}`"))?;
-            if fake.broken.contains(&name) {
+            if fake.broken.borrow().contains(&name) {
                 return Err("the device is busy".to_string());
             }
             let rate = options.sample_rate.unwrap_or(info.default_rate);
@@ -582,39 +699,62 @@ pub mod fake {
             .named(name))
         }
 
-        fn start(&self, output: AudioOutput, engine: loom_core::Engine) -> Result<RunningAudio, String> {
-            if self.0.wont_start.iter().any(|name| name == output.name()) {
-                return Err("the stream did not start".to_string());
+        #[allow(clippy::result_large_err)]
+        fn start(
+            &self,
+            output: AudioOutput,
+            engine: loom_core::Engine,
+        ) -> Result<RunningAudio, (loom_core::Engine, String)> {
+            if self.0.wont_start.borrow().iter().any(|name| name == output.name()) {
+                return Err((engine, "the stream did not start".to_string()));
             }
             let stalls = self.0.stalls.iter().any(|name| name == output.name());
             let block = output.buffer_size().unwrap_or(256) as usize;
-            let running = output.start(engine).map_err(|e| e.to_string())?;
+            let name = output.name().to_string();
+            let running = match output.start(engine) {
+                Ok(r) => r,
+                Err(e) => return Err((e.engine, e.error.to_string())),
+            };
+            self.0.active_stats.borrow_mut().push((name, running.stats().clone()));
             if stalls {
                 self.0.stall_tape.step(block * STALL_AFTER);
             }
             Ok(running)
         }
 
-        fn midi_inputs(&self) -> Result<Vec<String>, String> {
+        fn midi_list(&self) -> Result<Vec<MidiInputInfo>, String> {
             match &self.0.real_midi {
-                Some(only) => Ok(System.midi_inputs()?.into_iter().filter(|n| n.contains(only)).collect()),
-                None => Ok(self.0.midi.clone()),
+                Some(only) => Ok(System
+                    .midi_list()?
+                    .into_iter()
+                    .filter(|i| i.name.contains(only))
+                    .collect()),
+                None if self.0.midi_list_fails.get() => Err("the MIDI service is not running".to_string()),
+                None => {
+                    let (names, ids) = self.0.midi.borrow().iter().cloned().unzip();
+                    Ok(loom_host_desktop::input_infos(names, ids))
+                }
             }
         }
 
-        fn open_midi(&self, name: &str, midi: SharedMidi) -> Result<Box<dyn MidiPort>, String> {
+        fn open_midi(&self, name: &str, midi: SharedMidi, input: MidiInputId) -> Result<Box<dyn MidiPort>, String> {
             if let Some(only) = &self.0.real_midi {
                 assert!(name.contains(only), "a test opens only its own MIDI ports");
-                return System.open_midi(name, midi);
+                return System.open_midi(name, midi, input);
             }
-            if !self.0.midi.iter().any(|n| n == name) {
+            if self.0.broken_midi.borrow().iter().any(|broken| broken == name) {
+                return Err(format!("{name}: the port is busy"));
+            }
+            let Some(info) = self.midi_list()?.into_iter().find(|i| i.name == name) else {
                 return Err(format!("no MIDI input port found matching `{name}`"));
-            }
-            let state = Rc::new(RefCell::new(MidiInputState::new(midi)));
+            };
+            let state = Rc::new(RefCell::new(MidiInputState::for_input(midi, input)));
             self.0.ports.borrow_mut().push((name.to_string(), state.clone()));
             self.0.log.borrow_mut().push(Event::MidiOpened(name.to_string()));
             Ok(Box::new(Port {
                 name: name.to_string(),
+                id: info.id,
+                input,
                 state,
                 host: self.0.clone(),
             }))
@@ -624,7 +764,7 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::device;
+    use super::fake::{NoMidi, device};
     use super::*;
 
     fn outputs(names: &[&str]) -> Outputs {
@@ -782,5 +922,53 @@ mod tests {
             "Playing on \"MOTU M4\" at 96000 Hz, 512 frames (5.3 ms)."
         );
         assert_eq!(chosen_by_device.describe(None), "Playing on \"MOTU M4\" at 96000 Hz.");
+    }
+
+    /// Verifies that NoMidi host implements start by delegating to output.start.
+    #[test]
+    fn no_midi_host_start() {
+        let host = NoMidi;
+        let output = AudioOutput::clock(48_000, 256);
+        let parts = loom_core::create_engine(loom_modules::registry(), loom_core::EngineConfig::default());
+        let started = host.start(output, parts.engine);
+        assert!(started.is_ok());
+    }
+
+    /// Verifies that the default Host::start implementation handles outputs.
+    #[test]
+    fn host_start_default_implementation() {
+        let output = AudioOutput::clock(48_000, 256);
+        let parts = loom_core::create_engine(loom_modules::registry(), loom_core::EngineConfig::default());
+        let started = System.start(output, parts.engine);
+        assert!(started.is_ok());
+    }
+
+    /// When outputs.default is None, add_device promotes the first device to default.
+    #[test]
+    fn fake_add_device_sets_default_when_none() {
+        let fake = fake::Fake {
+            outputs: std::cell::RefCell::new(Outputs {
+                default: None,
+                devices: Vec::new(),
+            }),
+            ..fake::Fake::new(&[], &[])
+        };
+        assert!(fake.outputs.borrow().default.is_none());
+        fake.add_device(fake::device("USB Audio"));
+        assert_eq!(fake.outputs.borrow().default.as_deref(), Some("USB Audio"));
+    }
+
+    /// NoMidi delegates outputs and open to System.
+    #[test]
+    fn no_midi_delegates_to_system() {
+        let host = NoMidi;
+        let _ = host.outputs();
+        let options = AudioOptions {
+            device: Some("nonexistent device that will fail to open".into()),
+            exact: true,
+            sample_rate: None,
+            buffer_size: None,
+        };
+        let _ = host.open(&options);
     }
 }

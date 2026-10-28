@@ -12,6 +12,7 @@ mod browser;
 mod clipboard;
 mod control;
 mod devices;
+mod edits;
 mod files;
 mod inspector;
 mod layout;
@@ -20,6 +21,7 @@ mod lights;
 mod live;
 mod modulation;
 mod monitor;
+mod panic;
 mod param;
 mod pointer;
 mod preferences;
@@ -232,6 +234,12 @@ enum Message {
         world: Point,
     },
     HoldNote,
+    /// Silence everything and clear stuck notes (`docs/design/panic.md`).
+    Panic,
+    /// Look for MIDI inputs plugged in or out (`docs/design/device-changes.md`).
+    MidiPoll,
+    /// Look for audio device loss, silent stalls, and reconnects (`docs/design/device-changes.md`).
+    AudioPoll,
     /// File commands (`docs/design/files.md`).
     New,
     Open,
@@ -293,6 +301,20 @@ enum Message {
         index: usize,
         value: f32,
     },
+    /// A choice name was picked in the inspector: value `min + choice` of
+    /// the parameter, as one undo step (panels.md, Choice names).
+    Choice {
+        module: u32,
+        index: usize,
+        choice: usize,
+    },
+    /// A range was picked in a parameter's **Range** selector: index
+    /// `range` of the ranges it offers (`docs/design/control-ranges.md`).
+    Range {
+        module: u32,
+        index: usize,
+        range: usize,
+    },
     /// An inspector slider was let go.
     SliderReleased,
     /// Open or close the **Add modulation** list under a parameter.
@@ -338,6 +360,16 @@ enum Message {
     },
 }
 
+/// `opened <path>`, followed by the load notes when there are any, so a note
+/// about what loaded differently stays in view.
+fn opened_status(path: &std::path::Path, notes: &[String]) -> String {
+    if notes.is_empty() {
+        format!("opened {}", path.display())
+    } else {
+        format!("opened {}: {}", path.display(), notes.join("; "))
+    }
+}
+
 struct App {
     controller: Controller,
     positions: BTreeMap<u32, Point>,
@@ -347,6 +379,9 @@ struct App {
     values: PanelValues,
     /// Last brightness of each light, by module and widget.
     lights: BTreeMap<lights::Light, f32>,
+    /// What the last loaded patch loaded differently from its file, such
+    /// as a saved control range that was not kept (control-ranges.md).
+    load_notes: Vec<String>,
     /// Latest level of each meter probe.
     meter_levels: std::collections::HashMap<ProbeId, live::Level>,
     /// Modules whose lights or meters are on screen, as the canvas reports.
@@ -383,11 +418,12 @@ struct App {
     quit: bool,
     theme: Theme,
     _audio: Option<RunningAudio>,
-    /// The engine, when no audio device plays it. Nothing in the app runs
-    /// it; tests run it by hand with `App::process`, so they can check what
-    /// depends on a running engine (live values, lights, meters). Keeping
-    /// it costs the real audio path nothing: there is none.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The engine, when no audio device plays it. The app never renders
+    /// with it: each update only applies the queued edits
+    /// (`App::drain_idle_engine`), so the queue never fills. Tests run it by
+    /// hand with `App::process`, so they can check what depends on a
+    /// running engine (live values, lights, meters). Keeping it costs the
+    /// real audio path nothing: there is none.
     idle_engine: Option<loom_core::Engine>,
     /// Meter and scope data from the engine, drained on the telemetry
     /// thread so the queues never fill.
@@ -398,6 +434,8 @@ struct App {
     /// What belongs to the machine: preferences, devices, MIDI inputs.
     rig: settings::Rig,
     audio_stats: Option<Arc<CallbackStats>>,
+    audio_callbacks_seen: u64,
+    audio_callbacks_advanced: Instant,
     audio_name: String,
     /// Note input shared by every MIDI port and the "Hold note" button.
     midi: Option<SharedMidi>,
@@ -438,23 +476,9 @@ struct App {
     armed: Option<learn::Armed>,
     /// What learn mode shows on the canvas.
     learn_view: LearnView,
-    /// Undo and redo (`docs/design/undo.md`).
-    history: undo::History,
-    /// The patch before the edit in progress, if there is one.
-    pending: Option<undo::Snapshot>,
-    /// True between a gesture's start and end. Undo waits for it.
-    gesture: bool,
-    /// True when the open gesture began on an inspector slider. A slider
-    /// sends no start, and arrow keys on it send no end, so the next edit
-    /// or an undo closes it too.
-    slider_gesture: bool,
-    /// True after a commit failed, until the graph is sent. The graph holds a
-    /// change the engine does not, so no step is recorded: undo would send
-    /// that change along with a later one.
-    history_off: bool,
-    /// Parameters this app set during the edit in progress. A change on a
-    /// mapped parameter is part of the step only if it is listed here.
-    touched: BTreeSet<(u32, usize)>,
+    /// Undo and redo (`docs/design/undo.md`): the history, and the edit
+    /// or gesture being recorded.
+    edits: edits::Edits,
     /// The parameter whose **Add modulation** list is open.
     adding: Option<(u32, usize)>,
     /// During an arc drag: the assignment it changes, once picked, or
@@ -487,6 +511,9 @@ struct Session {
     name: String,
     file: Option<PathBuf>,
     stamp: Option<recovery::Stamp>,
+    /// What loaded differently from the file, such as a saved control
+    /// range that was not kept (control-ranges.md, rule 7).
+    notes: Vec<String>,
 }
 
 impl App {
@@ -629,7 +656,7 @@ impl App {
             recovery::FileState::NeverSaved => {}
         }
         // Nothing on disk holds this patch.
-        self.history.clear();
+        self.edits.history.clear();
         self.saved_content = None;
         let when = recovery::local_time(orphan.written());
         self.status = match args.source() {
@@ -684,8 +711,9 @@ impl App {
             telemetry,
         } = create_engine(registry(test_modules), config);
         let mut positions = BTreeMap::new();
+        let mut notes = Vec::new();
         let mut load = |patch: &Patch, controller: &mut Controller| -> Result<String, String> {
-            patch.load_into(controller).map_err(|e| e.to_string())?;
+            notes = patch.load_into(controller).map_err(|e| e.to_string())?;
             for m in &patch.modules {
                 if let Some((x, y)) = m.position {
                     positions.insert(m.id, Point::new(x, y));
@@ -710,6 +738,9 @@ impl App {
             Source::Empty => ("Untitled".to_string(), None, None),
         };
         layout::auto_layout(&controller, &mut positions);
+        for note in &notes {
+            eprintln!("loom-app: {note}");
+        }
         Ok(Session {
             controller,
             engine,
@@ -719,6 +750,7 @@ impl App {
             name,
             file,
             stamp,
+            notes,
         })
     }
 
@@ -744,14 +776,15 @@ impl App {
             name,
             file,
             stamp,
+            notes,
         } = session;
-        let mut status = String::new();
+        let mut status = notes.join("; ");
+        let load_notes = notes;
 
         // Every MIDI input plays the patch, and the "Hold note" button works
         // alongside them, so a keyboard is never hidden behind another port.
-        if let Some(error) = rig.attach(sender, connect_midi) {
-            status = error;
-        }
+        // The inputs are opened once the app is built, on its controller.
+        let first_midi = rig.attach(sender);
         let midi = rig.midi_in.clone().expect("attached");
 
         let (audio, midi, audio_name, idle_engine) = match output {
@@ -768,7 +801,7 @@ impl App {
                     }
                     Err(e) => {
                         rig.playing = None;
-                        (None, None, format!("no audio ({e})"), None)
+                        (None, None, format!("no audio ({})", e.error), Some(e.engine))
                     }
                 }
             }
@@ -784,6 +817,7 @@ impl App {
             scene,
             values,
             lights: BTreeMap::new(),
+            load_notes,
             meter_levels: std::collections::HashMap::new(),
             visible_displays: Vec::new(),
             selection: BTreeSet::new(),
@@ -813,6 +847,8 @@ impl App {
                 },
             ),
             audio_stats: audio.as_ref().map(|a| a.stats().clone()),
+            audio_callbacks_seen: 0,
+            audio_callbacks_advanced: Instant::now(),
             _audio: audio,
             idle_engine,
             monitor: monitor::Monitor::new(telemetry, generation),
@@ -845,19 +881,20 @@ impl App {
             learning: false,
             armed: None,
             learn_view: LearnView::default(),
-            history: undo::History::default(),
-            pending: None,
-            gesture: false,
-            slider_gesture: false,
-            history_off: false,
-            touched: BTreeSet::new(),
+            edits: edits::Edits::default(),
             adding: None,
             depth_drag: None,
             still: None,
             step_name: None,
         };
+        // A stream that failed to start took the engine with it.
+        app.keep_engine_idle();
+        app.send_panic_trigger();
+        if let Some(error) = app.connect_midi(first_midi, connect_midi) {
+            app.status = error;
+        }
         // A patch just loaded is the one on disk.
-        app.history.mark_saved();
+        app.edits.history.mark_saved();
         app.saved_content = Some(app.current_patch());
         if app.status.is_empty() {
             app.report();
@@ -867,7 +904,7 @@ impl App {
 
     /// True when the patch differs from the file (`docs/design/files.md`).
     fn unsaved(&self) -> bool {
-        !self.history.is_saved()
+        !self.edits.history.is_saved()
     }
 
     /// Writes the patch to `path`. On success the path becomes the current
@@ -881,7 +918,7 @@ impl App {
                 self.file = Some(path);
                 self.shown_name = None;
                 self.save_hint = None;
-                self.history.mark_saved();
+                self.edits.history.mark_saved();
                 self.saved_content = Some(patch);
                 // The file holds the work now: the copy goes.
                 self.autosave(Instant::now());
@@ -922,7 +959,7 @@ impl App {
     /// when it ends.
     fn finish_edits(&mut self) {
         self.close_slider_gesture();
-        if self.gesture {
+        if self.edits.gesture_open() {
             self.record();
         }
     }
@@ -1052,8 +1089,14 @@ impl App {
         let Some(path) = files::pick_open(self.file.as_deref()) else {
             return;
         };
-        if self.replace(Source::File(&path)) {
-            self.status = format!("opened {}", path.display());
+        self.open_path(&path);
+    }
+
+    /// Opens the patch at `path` in place of this one, and says so in the
+    /// status bar, with any notes about what loaded differently.
+    fn open_path(&mut self, path: &std::path::Path) {
+        if self.replace(Source::File(path)) {
+            self.status = opened_status(path, &self.load_notes);
         }
     }
 
@@ -1104,6 +1147,20 @@ impl App {
             Some(_) => iced::time::every(recovery::TICK).map(|_| Message::Autosave),
             None => Subscription::none(),
         };
+        // MIDI inputs plugged in and out are found by polling four times a
+        // second: the systems offer no portable callback (device-changes.md).
+        let midi_poll = if self.rig.midi_in.is_some() && !self.rig.flags.no_midi {
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::MidiPoll)
+        } else {
+            Subscription::none()
+        };
+        // Audio device loss, silent stalls, and device reconnection are watched
+        // by polling four times a second (device-changes.md, Audio device loss).
+        let audio_poll = if !self.no_audio && !self.fake_audio {
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::AudioPoll)
+        } else {
+            Subscription::none()
+        };
         let report = match &self.reporter {
             Some(reporter) => Subscription::run_with(reporter.clone(), bench::stream).map(|()| Message::BenchDone),
             None => Subscription::none(),
@@ -1118,6 +1175,8 @@ impl App {
                 close,
                 report,
                 autosave,
+                midi_poll,
+                audio_poll,
             ]
             .into_iter()
             .chain(control),
@@ -1129,7 +1188,7 @@ impl App {
     /// In learn mode, it also listens for Escape.
     fn midi_watch(&self) -> Subscription<Message> {
         let mapped = self.controller.graph().midi_mappings().next().is_some();
-        let watch = (mapped || self.learning).then(|| {
+        let watch = (mapped || self.learning || self.rig.panic_learn.is_some()).then(|| {
             let watch = learn::Watch {
                 reader: self.controller.midi_reader(),
                 generation: self.generation,
@@ -1140,7 +1199,9 @@ impl App {
         // The search field takes Escape for itself, so the browser listens
         // to keys whether or not a widget used them.
         let browser = self.browser.is_some().then(|| iced::event::listen_with(browser_key));
-        Subscription::batch(watch.into_iter().chain(keys).chain(browser))
+        // The panic key works whatever has focus (panic.md).
+        let panic = Some(iced::event::listen_with(panic::key));
+        Subscription::batch(watch.into_iter().chain(keys).chain(browser).chain(panic))
     }
 
     /// Watches the lights on screen, and sends a message only when one
@@ -1176,6 +1237,17 @@ impl App {
             lights: watched,
             generation: self.generation,
         })
+    }
+
+    /// Applies the edits queued for the idle engine, and frees what it
+    /// hands back, after every update. Without it, nothing would drain the
+    /// command queue when no device plays, and edits would fail once it is
+    /// full (#220). It renders no audio, so lights and meters stay still.
+    fn drain_idle_engine(&mut self) {
+        if let Some(engine) = self.idle_engine.as_mut() {
+            engine.apply_pending();
+            self.controller.collect_garbage();
+        }
     }
 
     /// Runs the engine for `frames` frames on silent buffers, as an audio
@@ -1215,6 +1287,21 @@ impl App {
 
     /// Arms a parameter in learn mode, or disarms it if it is armed.
     fn arm(&mut self, param: learn::Param) {
+        let (module, index) = param;
+        let transient = self
+            .controller
+            .graph()
+            .node(ModuleId(module))
+            .and_then(|node| node.descriptor.params.get(index))
+            .is_some_and(|spec| spec.is_transient());
+        if transient {
+            // A live gesture cannot be mapped (transient-params.md).
+            self.status = format!(
+                "MIDI learn: {} is a live control and cannot be mapped",
+                learn::param_name(&self.controller, param)
+            );
+            return;
+        }
         if self.armed.is_some_and(|armed| armed.param == param) {
             self.armed = None;
             self.status = "MIDI learn: click a control to map it".to_string();
@@ -1237,6 +1324,9 @@ impl App {
         if !self.controller.sync_midi().is_empty() {
             self.refresh_values();
         }
+        if self.panic_midi_arrived() {
+            return;
+        }
         let Some(armed) = self.armed else { return };
         let Some(seen) = self.controller.last_control_change() else {
             return;
@@ -1246,7 +1336,7 @@ impl App {
         }
         let (module, index) = armed.param;
         self.begin_edit();
-        self.touched.insert((module, index));
+        self.edits.touch(module, index);
         let learned = self.controller.learn_midi(seen, ModuleId(module), index);
         match learned {
             Ok((id, removed)) => {
@@ -1268,7 +1358,7 @@ impl App {
                 self.refresh_learn();
             }
         }
-        if !self.gesture {
+        if !self.edits.gesture_open() {
             self.record();
         }
     }
@@ -1343,51 +1433,84 @@ impl App {
     /// Sets a parameter as a knob turn does. A slider sends no start, so its
     /// first change opens the gesture and letting go closes it.
     fn turn_param(&mut self, module: u32, index: usize, value: f32) {
-        if !self.gesture {
-            self.gesture = true;
-            self.slider_gesture = true;
-        }
+        self.edits.start_slider_gesture();
         self.begin_edit();
         self.set_param(module, index, value);
     }
 
-    /// Sets a parameter from a control on a tile or in the inspector.
-    ///
-    /// A switch to momentary also clears that button's gate. Both writes go
-    /// in one step, so a full command queue leaves the mode and the gate as
-    /// they were.
-    fn set_param(&mut self, module: u32, index: usize, value: f32) {
-        let changes = self
+    /// Selects a parameter's control range, as one undo step. A smaller
+    /// range clamps the value into it, a wider one keeps it (control-ranges.md,
+    /// rule 6). The commit puts the bounds into the schedule for modulation
+    /// and MIDI (rule 8).
+    fn set_range(&mut self, module: u32, index: usize, range: usize) {
+        let Some(range) = self
             .controller
             .graph()
             .node(ModuleId(module))
-            .map(|node| scene::param_edits(node, index, value))
-            .unwrap_or_else(|| vec![(index, value)]);
-        if let Err(e) = self.controller.set_params(ModuleId(module), &changes) {
+            .and_then(|n| n.descriptor.params.get(index))
+            .and_then(|spec| spec.options.ranges.get(range))
+            .copied()
+        else {
+            return;
+        };
+        self.close_slider_gesture();
+        self.edit(|app| {
+            if let Err(e) = app.controller.set_range(ModuleId(module), index, range) {
+                app.status = format!("error: {e}");
+                return;
+            }
+            app.edits.touch(module, index);
+            app.commit();
+        });
+        self.refresh_values();
+    }
+
+    /// Sets a parameter from a control on a tile or in the inspector.
+    fn set_param(&mut self, module: u32, index: usize, value: f32) {
+        if let Err(e) = self.controller.set_param(ModuleId(module), index, value) {
             self.status = format!("error: {e}");
         }
-        self.touched.extend(changes.iter().map(|&(i, _)| (module, i)));
+        self.edits.touch(module, index);
         self.refresh_values();
     }
 
     /// Applies a button gesture. The canvas names the gesture. [`loom_core::ButtonMode`]
-    /// names the value, from the mode parameter stored on the module.
+    /// names the value, from the mode parameter stored on the module. Toggle
+    /// writes the latch and Momentary the transient hold.
     fn apply_button(&mut self, module: u32, widget: usize, change: impl Fn(loom_core::ButtonMode, f32) -> Option<f32>) {
         let edit = self.controller.graph().node(ModuleId(module)).and_then(|node| {
             let panel_widget = node.descriptor.panel.widgets.get(widget)?;
-            let loom_core::WidgetKind::Button { mode } = panel_widget.kind else {
+            let loom_core::WidgetKind::Button { mode, .. } = panel_widget.kind else {
                 return None;
             };
             let mode_index = node.descriptor.param_index(mode)?;
-            let on_index = node.descriptor.param_index(panel_widget.bind)?;
+            let target = node.descriptor.control_param(panel_widget, &node.params)?;
             let next = change(
                 loom_core::ButtonMode::from_value(node.params[mode_index]),
-                node.params[on_index],
+                node.params[target],
             )?;
-            Some((on_index, next))
+            Some((target, next))
         });
         if let Some((index, value)) = edit {
             self.set_param(module, index, value);
+        }
+    }
+
+    /// Lets go of a button's transient hold, whatever the mode is now. The
+    /// mode can change during a momentary press (inspector, undo, or a MIDI
+    /// mapping), and the release then resolves to the latch. Without this
+    /// the hold would stay high and come back with Momentary mode.
+    fn release_hold(&mut self, module: u32, widget: usize) {
+        let held = self.controller.graph().node(ModuleId(module)).and_then(|node| {
+            let loom_core::WidgetKind::Button { hold, .. } = node.descriptor.panel.widgets.get(widget)?.kind else {
+                return None;
+            };
+            let index = node.descriptor.param_index(hold)?;
+            let default = node.descriptor.params[index].default;
+            (node.params[index] != default).then_some((index, default))
+        });
+        if let Some((index, default)) = held {
+            self.set_param(module, index, default);
         }
     }
 
@@ -1398,7 +1521,7 @@ impl App {
     /// assignment).
     fn assign(&mut self, source: OutputRef, target: ModuleId, index: usize) {
         let graph = self.controller.graph();
-        let Some(spec) = graph.node(target).and_then(|n| n.descriptor.params.get(index)).copied() else {
+        let Some(spec) = graph.node(target).and_then(|n| n.spec(index)) else {
             return;
         };
         let (from, to) = (
@@ -1461,6 +1584,10 @@ impl App {
     }
 
     fn report(&mut self) {
+        if let Some(lost) = &self.rig.lost_audio {
+            self.status = lost.message.clone();
+            return;
+        }
         let report = self.controller.last_report();
         let inserted = report.inserted_delays().count();
         self.status = match report.loops.len() {
@@ -1489,31 +1616,29 @@ impl App {
     /// if one is already open, so a gesture's first call is the one that
     /// counts.
     fn begin_edit(&mut self) {
-        // Another path (probe sync) may have sent the graph since the failure.
-        if !self.gesture {
-            self.history_back_on();
-        }
-        if self.pending.is_none() && !self.history_off {
-            self.pending = Some(undo::Snapshot::take(&self.controller, &self.positions));
-            self.touched.clear();
-        }
+        let (controller, positions) = (&self.controller, &self.positions);
+        self.edits.begin(controller.has_uncommitted_changes(), || {
+            undo::Snapshot::take(controller, positions)
+        });
     }
 
     /// Ends the recording and adds a step if the patch changed.
     fn record(&mut self) {
         // A command's name is for this step only, also when no step is made.
         let step_name = self.step_name.take();
-        let Some(before) = self.pending.take() else {
-            return;
-        };
-        let after = undo::Snapshot::take(&self.controller, &self.positions);
-        if let Some(mut step) = undo::diff(&before, &after, &self.touched) {
-            if let Some(name) = step_name {
-                step.rename(name);
-            }
-            self.history.push(step);
-        }
-        self.touched.clear();
+        let (controller, positions) = (&self.controller, &self.positions);
+        self.edits
+            .record(step_name, || undo::Snapshot::take(controller, positions));
+    }
+
+    /// Closes the open gesture, of either kind, and records it.
+    fn end_gesture(&mut self) {
+        let step_name = self.step_name.take();
+        let (controller, positions) = (&self.controller, &self.positions);
+        self.edits
+            .end_gesture(controller.has_uncommitted_changes(), step_name, || {
+                undo::Snapshot::take(controller, positions)
+            });
     }
 
     /// Runs one edit as one undo step, unless a gesture is open: then the
@@ -1521,38 +1646,28 @@ impl App {
     fn edit(&mut self, change: impl FnOnce(&mut Self)) {
         self.begin_edit();
         change(self);
-        if !self.gesture {
+        if !self.edits.gesture_open() {
             self.record();
         }
     }
 
     /// Closes a gesture that began on an inspector slider.
     fn close_slider_gesture(&mut self) {
-        if self.slider_gesture {
-            self.slider_gesture = false;
-            self.gesture = false;
-            self.record();
-            self.history_back_on();
-        }
-    }
-
-    /// Records steps again once the engine has the whole graph.
-    fn history_back_on(&mut self) {
-        if !self.controller.has_uncommitted_changes() {
-            self.history_off = false;
+        if self.edits.slider_gesture_open() {
+            self.end_gesture();
         }
     }
 
     fn undo(&mut self) {
         self.close_slider_gesture();
-        if !self.gesture {
+        if !self.edits.gesture_open() {
             self.step(false);
         }
     }
 
     fn redo(&mut self) {
         self.close_slider_gesture();
-        if !self.gesture {
+        if !self.edits.gesture_open() {
             self.step(true);
         }
     }
@@ -1560,9 +1675,9 @@ impl App {
     /// Undoes (`forward` false) or redoes the next step.
     fn step(&mut self, forward: bool) {
         let step = if forward {
-            self.history.redo_step()
+            self.edits.history.redo_step()
         } else {
-            self.history.undo_step()
+            self.edits.history.undo_step()
         };
         let Some(step) = step.cloned() else { return };
         let verb = if forward { "Redo" } else { "Undo" };
@@ -1576,9 +1691,9 @@ impl App {
         match applied {
             Ok(()) => {
                 if forward {
-                    self.history.redone();
+                    self.edits.history.redone();
                 } else {
-                    self.history.undone();
+                    self.edits.history.undone();
                 }
                 // What the step touched, if it still exists, is selected.
                 let touched: BTreeSet<u32> = step
@@ -1602,7 +1717,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.history.clear();
+                self.edits.history.clear();
                 self.commit();
                 self.status = format!("{verb} failed ({e}); undo history cleared");
             }
@@ -1618,24 +1733,14 @@ impl App {
         let sent = match self.controller.commit() {
             Ok(_) => {
                 self.report();
-                // Inside a gesture, wait for its end: the rest of it was not
-                // recorded, so it stays out of the history as a whole.
-                if !self.gesture {
-                    self.history_off = false;
-                }
+                self.edits.committed(true);
                 true
             }
             Err(e) => {
                 self.status = format!("error: {e}");
-                // The graph holds a change the engine does not. Recording it
-                // would put a step in the history for something that does not
-                // play. The controller stays dirty, so the next commit
-                // retries the change; until then the history cannot be
-                // trusted.
-                self.pending = None;
-                self.touched.clear();
-                self.history.clear();
-                self.history_off = true;
+                // The controller stays dirty, so the next commit retries the
+                // change; until then the history cannot be trusted.
+                self.edits.committed(false);
                 false
             }
         };
@@ -1671,6 +1776,7 @@ impl App {
                 Task::none()
             }
         };
+        self.drain_idle_engine();
         if self.quit {
             // Stop audio now, with a fade so it does not click, so a
             // recording is closed before the process ends, and leave no
@@ -1810,7 +1916,7 @@ impl App {
                     .controller
                     .graph()
                     .node(ModuleId(module))
-                    .and_then(|n| n.descriptor.params.get(index))
+                    .and_then(|n| n.spec(index))
                     .map(|spec| spec.denormalize(position));
                 if let Some(value) = value {
                     self.turn_param(module, index, value);
@@ -1821,12 +1927,25 @@ impl App {
                     .controller
                     .graph()
                     .node(ModuleId(module))
-                    .and_then(|n| n.descriptor.params.get(index))
+                    .and_then(|n| n.spec(index))
                     .map(|spec| spec.clamp(value));
                 if let Some(value) = value {
                     self.turn_param(module, index, value);
                 }
             }
+            Message::Choice { module, index, choice } => {
+                let value = self
+                    .controller
+                    .graph()
+                    .node(ModuleId(module))
+                    .and_then(|n| n.spec(index))
+                    .map(|spec| spec.clamp(spec.min + choice as f32));
+                if let Some(value) = value {
+                    self.turn_param(module, index, value);
+                    self.close_slider_gesture();
+                }
+            }
+            Message::Range { module, index, range } => self.set_range(module, index, range),
             Message::SliderReleased => self.close_slider_gesture(),
             Message::AddModulation { module, index } => {
                 self.adding = if self.adding == Some((module, index)) {
@@ -1843,10 +1962,7 @@ impl App {
             Message::Depth { id, depth } => {
                 // Like a parameter slider: the first change opens the
                 // gesture, and letting go closes it, so one drag is one step.
-                if !self.gesture {
-                    self.gesture = true;
-                    self.slider_gesture = true;
-                }
+                self.edits.start_slider_gesture();
                 self.begin_edit();
                 if let Err(e) = self.controller.set_assignment_depth(id, depth) {
                     self.status = format!("error: {e}");
@@ -1894,6 +2010,8 @@ impl App {
             Message::Undo => self.undo(),
             Message::Redo => self.redo(),
             Message::OpenBrowser => self.browser_key += 1,
+            Message::Panic => self.panic(),
+            Message::MidiPoll => self.poll_midi(),
             Message::HoldNote => {
                 if let Some(midi) = &self.midi {
                     self.holding = !self.holding;
@@ -1947,6 +2065,7 @@ impl App {
                 self.controller.collect_garbage();
                 self.update_dropouts(Instant::now());
             }
+            Message::AudioPoll => self.poll_audio(),
             Message::Meters(levels) => {
                 // A reading may arrive after its probe was removed.
                 let live: std::collections::HashSet<ProbeId> = self.live.probes().collect();
@@ -2043,16 +2162,14 @@ impl App {
         match event {
             CanvasEvent::GestureStart => {
                 self.close_slider_gesture();
-                self.gesture = true;
+                self.edits.start_gesture();
                 self.begin_edit();
             }
             CanvasEvent::GestureEnd => {
                 if self.depth_drag.take().is_some() {
                     self.refresh_values();
                 }
-                self.gesture = false;
-                self.record();
-                self.history_back_on();
+                self.end_gesture();
             }
             CanvasEvent::Select(ids) => self.selection = ids.into_iter().collect(),
             CanvasEvent::Move { ids, delta } => {
@@ -2118,6 +2235,7 @@ impl App {
             }
             CanvasEvent::ButtonReleased { module, widget } => {
                 self.apply_button(module, widget, |mode, _current| mode.release());
+                self.release_hold(module, widget);
             }
             CanvasEvent::ButtonArrow { module, widget, high } => {
                 self.apply_button(module, widget, |mode, current| mode.arrow(current, high));
@@ -2232,7 +2350,7 @@ impl App {
     fn cut(&mut self) -> Option<String> {
         // Like undo, these commands wait for a drag to finish.
         self.close_slider_gesture();
-        if self.gesture {
+        if self.edits.gesture_open() {
             return None;
         }
         let group = self.selected_group("cut", false)?;
@@ -2249,7 +2367,7 @@ impl App {
     /// Pastes clipboard text with its top-left corner at a world point.
     fn paste(&mut self, world: Point, text: Option<String>) {
         self.close_slider_gesture();
-        if self.gesture {
+        if self.edits.gesture_open() {
             return;
         }
         let Some(text) = text else {
@@ -2266,7 +2384,7 @@ impl App {
     /// assignments.
     fn duplicate(&mut self) {
         self.close_slider_gesture();
-        if self.gesture {
+        if self.edits.gesture_open() {
             return;
         }
         let Some(group) = self.selected_group("duplicate", true) else {
@@ -2361,6 +2479,9 @@ impl App {
             if status == iced::event::Status::Ignored {
                 messages.push(Message::Key(key.clone()));
             }
+            if let Some(message) = panic::key(iced::Event::Keyboard(key.clone()), status, iced::window::Id::unique()) {
+                messages.push(message);
+            }
             if browser_open
                 && let Some(message) = browser_key(iced::Event::Keyboard(key), status, iced::window::Id::unique())
             {
@@ -2394,8 +2515,22 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             hold,
-            self.history_button("Undo", "Undo", self.history.undo_step(), Message::Undo),
-            self.history_button("Redo", "Redo", self.history.redo_step(), Message::Redo),
+            tooltip(
+                button(text("Panic").size(13)).on_press(Message::Panic),
+                container(
+                    text(if cfg!(target_os = "macos") {
+                        "Silence everything: Cmd+."
+                    } else {
+                        "Silence everything: Ctrl+."
+                    })
+                    .size(12)
+                )
+                .padding(6)
+                .style(container::rounded_box),
+                tooltip::Position::Bottom,
+            ),
+            self.history_button("Undo", "Undo", self.edits.history.undo_step(), Message::Undo),
+            self.history_button("Redo", "Redo", self.edits.history.redo_step(), Message::Redo),
             button(text("MIDI learn").size(13))
                 .on_press(Message::ToggleLearn)
                 .style(if self.learning {
@@ -2539,15 +2674,23 @@ fn severity_colour(severity: alerts::Severity) -> Color {
     }
 }
 
+/// Inspector help text, shown with nothing selected. It lists every canvas
+/// gesture and shortcut (#16), so keep it in step with `PatchCanvas::handle`
+/// and the key handling in `loom-canvas/src/widget.rs`.
 const HELP: &str = "A or a double-click on empty canvas opens the module browser at the pointer; type, then Enter adds.\n\
 Drag from a port to patch a cable. Drag a connected input to move or remove its cable.\n\
-Drag tiles to move them. Shift-click or drag a box to select several. Cmd/Ctrl+A selects all modules.\n\
+Drag tiles to move them. Shift-click or drag a box to select several. Cmd/Ctrl+A selects all.\n\
+Delete or Backspace removes the selection.\n\
 Drag a knob up or down; Shift for fine steps; double-click resets it.\n\
-With a module selected, Tab moves between its controls and the arrow keys change them.\n\
-Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom. Cmd/Ctrl+0 resets zoom to 100%.\n\
+With a module selected, Tab and Shift-Tab move between its controls, the arrow keys change them, \
+and Space or Enter presses, toggles, or steps the focused control. Escape clears the focus.\n\
+Space toggles Run when no control has focus.\n\
+Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom. Cmd/Ctrl+0 zooms to 100%.\n\
+F or Home frames the patch.\n\
 Right-click an output or a cable to add a scope or a meter fed by it.\n\
-F or Home frames the patch. Delete removes the selection.\n\
+Click a modulation badge to pin its lines; click again or press Escape to hide them.\n\
 Cmd/Ctrl+C copies, X cuts, V pastes at the pointer, and D duplicates the selection.\n\
+Cmd/Ctrl+Z undoes, and Cmd/Ctrl+Shift+Z redoes.\n\
 MIDI learn: click a control, then move a knob on your controller. Escape ends it.";
 
 /// The keys the open browser handles, whether or not a widget used them.
@@ -2574,6 +2717,32 @@ mod tests {
 
     fn app() -> App {
         App::new(app_args())
+    }
+
+    /// #16: the inspector help text names every canvas shortcut, the new
+    /// Cmd/Ctrl+0 zoom reset and the ones that were there before it.
+    #[test]
+    fn help_text_lists_every_canvas_shortcut() {
+        for shortcut in [
+            "A or a double-click",
+            "Cmd/Ctrl+A",
+            "Delete or Backspace",
+            "Tab and Shift-Tab",
+            "arrow keys",
+            "Space or Enter",
+            "Escape clears the focus",
+            "Space toggles Run",
+            "Cmd/Ctrl+0",
+            "F or Home",
+            "press Escape",
+            "Cmd/Ctrl+C",
+            "V pastes",
+            "D duplicates",
+            "Cmd/Ctrl+Z",
+            "Cmd/Ctrl+Shift+Z",
+        ] {
+            assert!(HELP.contains(shortcut), "help text lacks {shortcut:?}");
+        }
     }
 
     /// Text in the window chrome meets WCAG 1.4.3 (4.5:1) on the theme
@@ -2678,6 +2847,31 @@ mod tests {
         }
     }
 
+    /// Without an audio device the app keeps taking edits (#220). Each
+    /// update applies the idle engine's queued commands, so 5,000 knob
+    /// moves, far more than the queue holds, never fill it. The engine
+    /// renders nothing in the meantime.
+    #[test]
+    fn no_audio_keeps_taking_edits() {
+        let mut app = app();
+        assert!(app._audio.is_none() && app.idle_engine.is_some());
+        let filter = app.controller.add_module("loom.filter.svf").unwrap();
+        app.commit();
+        let capacity = loom_core::EngineConfig::default().command_capacity;
+        for i in 0..5_000 {
+            let _ = app.update(Message::Param {
+                module: filter.0,
+                index: 0,
+                position: (i % 100) as f32 / 100.0,
+            });
+            assert!(!app.status.contains("queue is full"), "move {i}: {}", app.status);
+        }
+        assert!(5_000 > capacity);
+        let stats = app.controller.stats();
+        assert_eq!(stats.buffers.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(stats.leaked.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     fn open_at(app: &mut App, world: Point) {
         let _ = app.update(Message::Canvas(CanvasEvent::OpenBrowser {
             world,
@@ -2694,14 +2888,14 @@ mod tests {
     fn adding_from_the_browser_is_one_undo_step_at_the_snapped_point() {
         let mut app = app();
         let before = app.controller.graph().nodes().count();
-        let undo = app.history.undo_step().map(|s| s.name().to_string());
+        let undo = app.edits.history.undo_step().map(|s| s.name().to_string());
 
         // Opening, typing, and closing are not edits.
         open_at(&mut app, Point::new(250.0, 130.0));
         type_query(&mut app, "svf");
         let _ = app.update(Message::Browser(browser::Message::Key(browser::Nav::Escape)));
         assert!(app.browser.is_none());
-        assert_eq!(app.history.undo_step().map(|s| s.name().to_string()), undo);
+        assert_eq!(app.edits.history.undo_step().map(|s| s.name().to_string()), undo);
 
         open_at(&mut app, Point::new(250.0, 130.0));
         type_query(&mut app, "svf");
@@ -2714,7 +2908,7 @@ mod tests {
 
         app.undo();
         assert_eq!(app.controller.graph().nodes().count(), before);
-        assert_eq!(app.history.undo_step().map(|s| s.name().to_string()), undo);
+        assert_eq!(app.edits.history.undo_step().map(|s| s.name().to_string()), undo);
     }
 
     #[test]
@@ -2748,7 +2942,7 @@ mod tests {
         let d = app.controller.graph().node(filter).unwrap().descriptor;
         let cutoff = d.param_index("cutoff").unwrap();
         let widget = d.panel.widgets.iter().position(|w| w.bind == "cutoff").unwrap();
-        app.history.clear();
+        app.edits.history.clear();
         (env, filter, cutoff, widget)
     }
 
@@ -2784,7 +2978,10 @@ mod tests {
         assert_eq!(made[0].depth, 0.25);
         assert_eq!(made[0].polarity, None);
         assert!(made[0].enabled);
-        assert_eq!(app.history.undo_step().map(undo::Step::name), Some("add modulation"));
+        assert_eq!(
+            app.edits.history.undo_step().map(undo::Step::name),
+            Some("add modulation")
+        );
 
         drop_env(&mut app, env, filter, widget);
         assert_eq!(assignments(&app).len(), 1);
@@ -2907,14 +3104,14 @@ mod tests {
         drop_env(&mut app, env, filter, widget);
         let id = app.controller.graph().assignments().next().unwrap().0;
         let generation = app.scene.generation();
-        let steps = app.history.len();
+        let steps = app.edits.history.len();
 
         for depth in [0.3, 0.4, 0.5] {
             let _ = app.update(Message::Depth { id, depth });
         }
         let _ = app.update(Message::SliderReleased);
         assert_eq!(assignments(&app)[0].depth, 0.5);
-        assert_eq!(app.history.len(), steps + 1, "one drag, one step");
+        assert_eq!(app.edits.history.len(), steps + 1, "one drag, one step");
 
         let _ = app.update(Message::Polarity {
             id,
@@ -3084,7 +3281,7 @@ mod tests {
     fn an_arc_drag_is_one_step_and_shows_only_its_assignment() {
         let mut app = app();
         let (_, sine, filter, _, widget) = two_sources(&mut app);
-        let steps = app.history.len();
+        let steps = app.edits.history.len();
         let pinned = Some(loom_canvas::PortRef {
             module: sine.0,
             output: true,
@@ -3118,7 +3315,7 @@ mod tests {
         };
         assert!((depth(&app) - 0.45).abs() < 1e-6, "{}", depth(&app));
         assert!(app.status.contains("+45%"), "{}", app.status);
-        assert_eq!(app.history.len(), steps + 1);
+        assert_eq!(app.edits.history.len(), steps + 1);
         app.undo();
         assert_eq!(depth(&app), 0.25);
     }
@@ -3159,7 +3356,7 @@ mod tests {
         let (_, _, filter, _, widget) = two_sources(&mut app);
         app.selection.clear();
         let before = assignments(&app);
-        let steps = app.history.len();
+        let steps = app.edits.history.len();
         let _ = app.update(Message::Canvas(CanvasEvent::GestureStart));
         let _ = app.update(Message::Canvas(CanvasEvent::DragDepth {
             module: filter.0,
@@ -3169,7 +3366,7 @@ mod tests {
         }));
         let _ = app.update(Message::Canvas(CanvasEvent::GestureEnd));
         assert_eq!(assignments(&app), before);
-        assert_eq!(app.history.len(), steps);
+        assert_eq!(app.edits.history.len(), steps);
         assert!(app.status.contains("Several sources"), "{}", app.status);
     }
 
@@ -3215,13 +3412,13 @@ mod tests {
         app.positions.insert(sine.0, Point::new(0.0, 0.0));
         app.positions.insert(vca.0, Point::new(240.0, 0.0));
         app.commit();
-        app.history.clear();
+        app.edits.history.clear();
         app.selection = BTreeSet::from([sine.0, vca.0]);
         (sine, vca)
     }
 
     fn step_name(app: &App) -> Option<String> {
-        app.history.undo_step().map(|s| s.name().to_string())
+        app.edits.history.undo_step().map(|s| s.name().to_string())
     }
 
     #[test]
@@ -3230,7 +3427,7 @@ mod tests {
         app.selection.clear();
         assert!(app.copy().is_none());
         assert_eq!(app.status, "Nothing selected to copy");
-        assert!(app.history.undo_step().is_none(), "copy is not an edit");
+        assert!(app.edits.history.undo_step().is_none(), "copy is not an edit");
     }
 
     #[test]
@@ -3239,7 +3436,7 @@ mod tests {
         let (sine, vca) = two_selected(&mut app);
         let text = app.copy().unwrap();
         assert_eq!(app.status, "Copied 2 modules");
-        assert!(app.history.undo_step().is_none(), "copy is not an edit");
+        assert!(app.edits.history.undo_step().is_none(), "copy is not an edit");
 
         let before = app.controller.graph().nodes().count();
         app.paste(Point::new(605.0, 299.0), Some(text));
@@ -3290,7 +3487,7 @@ mod tests {
         assert!(text.contains("loom.osc.sine"));
         assert_eq!(app.controller.graph().nodes().count(), before - 2);
         assert_eq!(step_name(&app).as_deref(), Some("cut 2 modules"));
-        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.edits.history.len(), 1);
         app.undo();
         assert!(app.controller.graph().node(sine).is_some() && app.controller.graph().node(vca).is_some());
         assert_eq!(app.controller.graph().cables().count(), 1);
@@ -3310,7 +3507,7 @@ mod tests {
         );
         assert_eq!(app.status, "Cannot paste: unknown module `loom.none.such`");
         assert_eq!(app.controller.graph().nodes().count(), before);
-        assert!(app.history.undo_step().is_none());
+        assert!(app.edits.history.undo_step().is_none());
     }
 
     #[test]
@@ -3330,11 +3527,11 @@ mod tests {
     fn a_step_name_does_not_outlive_its_edit() {
         let mut app = app();
         let (_, vca) = two_selected(&mut app);
-        app.history_off = true;
+        app.edits.set_history_off(true);
         app.step_name = Some("cut 2 modules".to_string());
         app.edit(|_| {});
         assert!(app.step_name.is_none());
-        app.history_off = false;
+        app.edits.set_history_off(false);
         app.edit(|app| {
             app.controller.set_param_named(vca, "gain", 0.9).unwrap();
             app.commit();
@@ -3361,6 +3558,130 @@ mod tests {
             generation: app.generation,
         });
         assert_eq!(app.controller.graph().nodes().count(), before + 2);
+    }
+
+    /// Panic is not an edit: the value, the cables, and the unsaved mark
+    /// stay, and there is no new undo step (panic.md, Acceptance criteria).
+    #[test]
+    fn panic_is_not_an_edit() {
+        let mut app = app();
+        let (_, vca) = two_selected(&mut app);
+        app.edit(|app| {
+            app.controller.set_param_named(vca, "gain", 0.9).unwrap();
+            app.commit();
+        });
+        assert!(app.unsaved());
+        let steps = app.edits.history.len();
+        let cables = app.controller.graph().cables().count();
+        app.holding = true;
+        let _ = app.update(Message::Panic);
+        // The MIDI poll runs while the app has an engine, and finds nothing.
+        let _ = app.subscription();
+        let _ = app.update(Message::MidiPoll);
+        assert!(app.status.starts_with("Panic"), "{}", app.status);
+        assert!(!app.holding, "Hold note lets go");
+        let gain = app
+            .controller
+            .graph()
+            .node(vca)
+            .unwrap()
+            .descriptor
+            .param_index("gain")
+            .unwrap();
+        assert_eq!(app.controller.graph().node(vca).unwrap().params[gain], 0.9);
+        assert_eq!(app.controller.graph().cables().count(), cables);
+        assert!(app.unsaved(), "the unsaved mark stays");
+        assert_eq!(app.edits.history.len(), steps, "no undo step");
+    }
+
+    /// The panic key works with a text field focused, the toolbar button
+    /// runs it, and so do the control channel's `panic` and `press`.
+    #[test]
+    fn the_panic_key_button_and_command_run_panic() {
+        let mut ui = crate::ui_test::Ui::open("subtractive.ron");
+        let _ = ui.app.update(Message::OpenBrowser);
+        ui.redraw();
+        ui.typewrite("sin");
+        let messages = ui.tap(
+            iced::keyboard::Key::Character(".".into()),
+            iced::keyboard::Modifiers::COMMAND,
+        );
+        assert!(messages.iter().any(|m| matches!(m, Message::Panic)), "{messages:?}");
+        assert!(ui.app.status.starts_with("Panic"), "{}", ui.app.status);
+
+        ui.app.status.clear();
+        let _ = ui.app.update(Message::Browser(browser::Message::Close));
+        ui.redraw();
+        let button = ui.text("Panic").expect("a Panic button on the toolbar");
+        ui.move_to(button.center());
+        let mut messages = ui.press();
+        messages.extend(ui.release());
+        assert!(messages.iter().any(|m| matches!(m, Message::Panic)), "{messages:?}");
+    }
+
+    /// A momentary press sets the transient hold: the tile shows it, but
+    /// the patch is unchanged, the saved file has no `hold`, the inspector
+    /// has no row for it, and a copy pastes a released button
+    /// (transient-params.md, Acceptance criteria).
+    #[test]
+    fn a_momentary_hold_is_not_part_of_the_patch() {
+        let mut app = app();
+        let id = app.controller.add_module("loom.ui.button").unwrap();
+        app.controller.set_param_named(id, "mode", 1.0).unwrap();
+        app.positions.insert(id.0, Point::new(0.0, 0.0));
+        app.commit();
+        app.edits.history.clear();
+        app.edits.history.mark_saved();
+        let hold = app
+            .controller
+            .graph()
+            .node(id)
+            .unwrap()
+            .descriptor
+            .param_index("hold")
+            .unwrap();
+        let held = |app: &App| app.controller.graph().node(id).unwrap().params[hold];
+
+        let _ = app.update(Message::Canvas(CanvasEvent::ButtonPressed {
+            module: id.0,
+            widget: 0,
+        }));
+        assert_eq!(held(&app), 1.0);
+        assert_eq!(tile_widget(&app, id, 0).position, 1.0, "a held button looks held");
+        assert!(!app.unsaved(), "a hold does not mark the patch changed");
+        assert_eq!(app.edits.history.len(), 0, "a hold is no undo step");
+        let text = app.current_patch().to_ron().unwrap();
+        assert!(!text.contains("hold"), "{text}");
+        app.arm((id.0, hold));
+        assert!(app.armed.is_none(), "a hold cannot be a MIDI learn target");
+
+        app.selection = BTreeSet::from([id.0]);
+        let snapshot = app.ui_snapshot();
+        let rows = serde_json::to_string(&snapshot.inspector).unwrap();
+        assert!(!rows.contains("\"Hold\""), "{rows}");
+        let copied = app.copy().unwrap();
+        let before: BTreeSet<u32> = app.controller.graph().nodes().map(|(m, _)| m.0).collect();
+        let _ = app.update(Message::Pasted {
+            world: Point::new(400.0, 0.0),
+            text: Some(copied),
+            generation: app.generation,
+        });
+        let (pasted, node) = app
+            .controller
+            .graph()
+            .nodes()
+            .find(|(m, _)| !before.contains(&m.0))
+            .expect("a pasted button");
+        assert_ne!(pasted, id);
+        assert_eq!(node.params[hold], 0.0, "a pasted button is released");
+        assert_eq!(held(&app), 1.0, "the original is still held");
+
+        let _ = app.update(Message::Canvas(CanvasEvent::ButtonReleased {
+            module: id.0,
+            widget: 0,
+        }));
+        assert_eq!(held(&app), 0.0);
+        assert_eq!(tile_widget(&app, id, 0).position, 0.0);
     }
     /// The widget on module `id`'s tile at `widget`, as the snapshot shows it.
     fn tile_widget(app: &App, id: ModuleId, widget: usize) -> snapshot::Widget {
@@ -3417,9 +3738,236 @@ mod tests {
         app.controller.connect_named(gate, "out", env, "gate").unwrap();
         app.commit();
         app.process(4_800);
-        let _ = app.update(Message::Lights(watch.read()));
+        // A level light draws its value as it is, with no fade.
+        let mut fades = vec![lights::Fade::default(); watch.lights.len()];
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, Instant::now())));
         let level = tile_widget(&app, env, light).position;
         assert!(level > 0.5, "the gate is held: {level}");
+    }
+
+    /// Button's mode shows its choice names, "Toggle" and "Momentary", as
+    /// radio buttons, and a parameter without names keeps its slider. No
+    /// module is special-cased: the names come from the descriptor
+    /// (panels.md, Choice names). A pick is one undo step.
+    #[test]
+    fn the_inspector_names_the_choices_of_a_whole_number_parameter() {
+        let mut app = app();
+        let button = app.controller.add_module("loom.ui.button").unwrap();
+        let lfo = app.controller.add_module("loom.mod.lfo").unwrap();
+        app.commit();
+        let rows = |app: &App, module: ModuleId| {
+            let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+                panic!("one module is selected");
+            };
+            assert_eq!(rows.id, module.0);
+            rows.params
+        };
+        let control = |row: &inspector::ParamRow| match &row.mode {
+            inspector::ParamMode::Edit { control, .. } => control.clone(),
+            inspector::ParamMode::Learn { .. } => panic!("not in learn mode"),
+        };
+        let _ = app.update(Message::SelectModule(button.0));
+        let params = rows(&app, button);
+        let mode = params.iter().find(|p| p.label == "Mode").unwrap();
+        assert_eq!(
+            control(mode),
+            inspector::ParamControl::Radio {
+                choices: vec!["Toggle", "Momentary"],
+                selected: 0
+            }
+        );
+        assert_eq!(mode.value, "Toggle", "the value is the name, never the bare number");
+        let on = params.iter().find(|p| p.label != "Mode").unwrap();
+        assert_eq!(control(on), inspector::ParamControl::Slider);
+
+        let undo = app.edits.history.undo_step().map(|s| s.name().to_string());
+        let _ = app.update(Message::Choice {
+            module: button.0,
+            index: mode.index,
+            choice: 1,
+        });
+        assert_eq!(app.controller.graph().node(button).unwrap().params[mode.index], 1.0);
+        let mode = rows(&app, button).into_iter().find(|p| p.label == "Mode").unwrap();
+        assert_eq!(mode.value, "Momentary");
+        assert_ne!(
+            app.edits.history.undo_step().map(|s| s.name().to_string()),
+            undo,
+            "one step"
+        );
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.controller.graph().node(button).unwrap().params[mode.index], 0.0);
+
+        // More than four names: a pick list.
+        let _ = app.update(Message::SelectModule(lfo.0));
+        let shape = rows(&app, lfo).into_iter().find(|p| p.label == "Shape").unwrap();
+        let inspector::ParamControl::PickList { choices, selected } = control(&shape) else {
+            panic!("five shapes are a pick list: {shape:?}");
+        };
+        assert_eq!(choices.len(), 5);
+        assert_eq!(selected, 0);
+    }
+
+    /// A saved range that does not hold its value loads with the smallest
+    /// range that does, the value unchanged, and a note in the status bar
+    /// (control-ranges.md, rule 7).
+    #[test]
+    fn a_range_note_shows_in_the_status_bar() {
+        let dir = std::env::temp_dir().join(format!("loom-app-range-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("range.ron");
+        std::fs::write(
+            &path,
+            r#"Patch(version: 1, modules: [(id: 1, kind: "loom.math.mul@1", params: {"gain": 5.0}, ranges: {"gain": (-0.1, 0.1)})])"#,
+        )
+        .unwrap();
+        let app = App::new(Args {
+            patch: Some(path),
+            ..app_args()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = app.controller.graph().node(ModuleId(1)).unwrap();
+        assert_eq!(
+            (node.params[0], node.range(0)),
+            (5.0, Some(loom_core::ParamRange::new(-5.0, 5.0)))
+        );
+        assert!(app.status.contains("-0.1 to 0.1"), "{}", app.status);
+    }
+
+    /// Opening a patch that loads as saved says only "opened <path>". One
+    /// with a load note says the note after it.
+    #[test]
+    fn opening_a_patch_names_only_its_load_notes() {
+        let mut app = app();
+        let clean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches/subtractive.ron");
+        app.open_path(&clean);
+        assert_eq!(app.status, format!("opened {}", clean.display()));
+
+        let dir = std::env::temp_dir().join(format!("loom-app-open-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let noted = dir.join("noted.ron");
+        std::fs::write(
+            &noted,
+            r#"Patch(version: 1, modules: [(id: 1, kind: "loom.math.mul@1", params: {"gain": 5.0}, ranges: {"gain": (-0.1, 0.1)})])"#,
+        )
+        .unwrap();
+        app.open_path(&noted);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            app.status.starts_with(&format!("opened {}: module 1", noted.display())),
+            "{}",
+            app.status
+        );
+
+        app.open_path(&clean);
+        assert_eq!(
+            app.status,
+            format!("opened {}", clean.display()),
+            "the old note is gone"
+        );
+    }
+
+    /// control-ranges.md: Multiply's gain shows a **Range** selector. A
+    /// smaller range clamps the value, as one undo step, and the tile knob
+    /// then spans the selected range. Undo brings back range and value.
+    #[test]
+    fn the_inspector_selects_a_control_range() {
+        let mut app = app();
+        let mul = app.controller.add_module("loom.math.mul").unwrap();
+        app.controller.set_param(mul, 0, 0.5).unwrap();
+        app.commit();
+        let _ = app.update(Message::SelectModule(mul.0));
+        let gain_row = |app: &App| {
+            let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+                panic!("one module is selected");
+            };
+            rows.params.into_iter().find(|p| p.label == "Gain").unwrap()
+        };
+        let range = gain_row(&app).range.expect("a Range selector");
+        assert_eq!(range.choices.len(), 7);
+        assert_eq!(range.choices[0], "-0.1 to 0.1");
+        assert_eq!(range.choices[range.selected.unwrap()], "-1 to 1");
+
+        let _ = app.update(Message::Range {
+            module: mul.0,
+            index: 0,
+            range: 0,
+        });
+        let row = gain_row(&app);
+        assert_eq!(row.range.unwrap().selected, Some(0));
+        assert_eq!(app.controller.graph().node(mul).unwrap().params[0], 0.1, "clamped");
+        assert_eq!(
+            app.edits.history.undo_step().map(|s| s.name().to_string()).as_deref(),
+            Some("change Multiply Gain range")
+        );
+        // The tile knob and its keyboard steps span -0.1 to 0.1.
+        let widget = app
+            .controller
+            .graph()
+            .node(mul)
+            .unwrap()
+            .descriptor
+            .panel
+            .widgets
+            .iter()
+            .position(|w| w.bind == "gain")
+            .unwrap();
+        let (_, _, spec) = scene::control_param(&app.controller, mul.0, widget).unwrap();
+        assert_eq!((spec.min, spec.max), (-0.1, 0.1));
+        assert!(
+            (spec.denormalize(0.51) - spec.denormalize(0.5) - 0.002).abs() < 1e-6,
+            "1% of the range"
+        );
+
+        let _ = app.update(Message::Undo);
+        let node = app.controller.graph().node(mul).unwrap();
+        assert_eq!(
+            (node.params[0], node.range(0)),
+            (0.5, Some(loom_core::ParamRange::new(-1.0, 1.0)))
+        );
+        // A parameter without ranges has no selector.
+        let lfo = app.controller.add_module("loom.mod.lfo").unwrap();
+        app.commit();
+        let _ = app.update(Message::SelectModule(lfo.0));
+        let inspector::Inspector::Module(rows) = app.ui_snapshot().inspector else {
+            panic!("one module is selected");
+        };
+        assert!(rows.params.iter().all(|p| p.range.is_none()));
+    }
+
+    /// A one-sample trigger lights Clock Divide's trigger light, though the
+    /// output went low again long before the light is read. The light fades
+    /// out in 120 ms, and a second read without a trigger is dark
+    /// (panels.md, Lights for one-sample triggers).
+    #[test]
+    fn a_one_sample_trigger_lights_the_divide_light() {
+        let mut app = app();
+        let gate = app.controller.add_module("loom.math.constant").unwrap();
+        app.controller.set_param_named(gate, "value", 1.0).unwrap();
+        let divide = app.controller.add_module("loom.logic.divide").unwrap();
+        app.controller.set_param_named(divide, "n", 1.0).unwrap();
+        app.controller.connect_named(gate, "out", divide, "trigger").unwrap();
+        app.commit();
+        let d = app.controller.graph().node(divide).unwrap().descriptor;
+        let light = d.panel.widgets.iter().position(|w| w.bind == "fired").unwrap();
+        let _ = app.update(Message::Canvas(CanvasEvent::VisibleDisplays(vec![divide.0])));
+        let watch = app.watched_lights().expect("the trigger light is on screen");
+
+        // The constant's rise is one trigger in the first frame, then 4 799
+        // frames of 0.
+        app.process(4_800);
+        let start = Instant::now();
+        let mut fades = vec![lights::Fade::default(); watch.lights.len()];
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, start)));
+        assert_eq!(tile_widget(&app, divide, light).position, 1.0, "the trigger lit it");
+
+        app.process(4_800);
+        let later = start + lights::FADE;
+        let _ = app.update(Message::Lights(watch.shown(&mut fades, later)));
+        assert_eq!(
+            tile_widget(&app, divide, light).position,
+            0.0,
+            "faded, and no new trigger"
+        );
     }
 
     /// A meter on screen follows the engine through the app's `Meters`
@@ -3641,7 +4189,7 @@ mod tests {
 
         let output = &tile(env).outputs[0];
         let badge = output.badge_bounds.expect("the envelope drives one assignment");
-        let drawn = view.badge_bounds(0).unwrap();
+        let drawn = app.scene.badge_bounds(env.0, 0).unwrap();
         assert_eq!(badge, drawn.into());
         let port = PortRef {
             module: env.0,
@@ -3669,5 +4217,134 @@ mod tests {
         assert_eq!((cable.from.module, cable.from.index), (sine.0, 0));
         assert_eq!(cable.from.point, tile(sine).outputs[0].centre);
         assert_eq!(cable.to.point, tile(filter).inputs[cable.to.index].centre);
+    }
+
+    /// An app with one filter, its ID, and the index of its Cutoff.
+    fn app_with_filter() -> (App, u32, usize) {
+        let mut app = app();
+        let id = app.controller.add_module("loom.filter.svf").unwrap();
+        app.commit();
+        let cutoff = app
+            .controller
+            .graph()
+            .node(id)
+            .unwrap()
+            .descriptor
+            .param_index("cutoff")
+            .unwrap();
+        (app, id.0, cutoff)
+    }
+
+    /// Turns the filter's Cutoff with the inspector slider.
+    fn slide(app: &mut App, module: u32, index: usize, values: &[f32]) {
+        for &value in values {
+            let _ = app.update(Message::ParamValue { module, index, value });
+        }
+    }
+
+    /// An inspector slider gesture is one step, and it closes at release,
+    /// at the next edit, and at undo: a slider sends no start, and arrow
+    /// keys on it send no release (undo.md, Gestures). Issue #170.
+    #[test]
+    fn an_inspector_slider_gesture_closes_at_release_at_the_next_edit_and_at_undo() {
+        let (mut app, filter, cutoff) = app_with_filter();
+        let steps = app.edits.history.len();
+
+        // Release.
+        slide(&mut app, filter, cutoff, &[500.0, 600.0, 700.0]);
+        assert!(app.edits.slider_gesture_open());
+        let _ = app.update(Message::SliderReleased);
+        assert!(!app.edits.gesture_open());
+        assert_eq!(app.edits.history.len(), steps + 1, "one drag, one step");
+
+        // The next edit, here a canvas gesture start.
+        slide(&mut app, filter, cutoff, &[800.0, 900.0]);
+        let _ = app.update(Message::Canvas(CanvasEvent::GestureStart));
+        assert!(!app.edits.slider_gesture_open());
+        assert_eq!(app.edits.history.len(), steps + 2, "the start closed the slider's step");
+        let _ = app.update(Message::Canvas(CanvasEvent::GestureEnd));
+        assert_eq!(
+            app.edits.history.len(),
+            steps + 2,
+            "a gesture with no change is no step"
+        );
+
+        // Undo, which takes back the slider's step it closes.
+        slide(&mut app, filter, cutoff, &[1000.0]);
+        let _ = app.update(Message::Undo);
+        assert!(!app.edits.gesture_open());
+        let value = app.controller.graph().node(ModuleId(filter)).unwrap().params[cutoff];
+        assert_eq!(value, 900.0, "undo took back the slider's last step");
+        assert_eq!(app.edits.history.len(), steps + 3);
+        assert_eq!(
+            app.edits.history.redo_step().map(undo::Step::name),
+            Some("change SVF Cutoff")
+        );
+    }
+
+    /// A mode change during a momentary press does not leave the hold
+    /// stuck high: the release lets go of it in any mode (review of #402).
+    #[test]
+    fn a_release_clears_the_hold_after_a_mode_change() {
+        let mut app = app();
+        let id = app.controller.add_module("loom.ui.button").unwrap();
+        app.commit();
+        let node = app.controller.graph().node(id).unwrap();
+        let mode = node.descriptor.param_index("mode").unwrap();
+        let hold = node.descriptor.param_index("hold").unwrap();
+        let (module, widget) = (id.0, 0);
+        let held = |app: &App| app.controller.graph().node(id).unwrap().params[hold];
+
+        app.controller.set_param(id, mode, 1.0).unwrap();
+        let _ = app.update(Message::Canvas(CanvasEvent::ButtonPressed { module, widget }));
+        assert_eq!(held(&app), 1.0, "the hold is down");
+        app.controller.set_param(id, mode, 0.0).unwrap();
+        let _ = app.update(Message::Canvas(CanvasEvent::ButtonReleased { module, widget }));
+        assert_eq!(held(&app), 0.0, "the release let go of the hold");
+        app.controller.set_param(id, mode, 1.0).unwrap();
+        assert_eq!(held(&app), 0.0, "Momentary mode comes back released");
+    }
+
+    /// A momentary button hold makes no step, and a toggle press does
+    /// (undo.md, What is not undoable). A button sends a press and a
+    /// release, with no gesture around them.
+    #[test]
+    fn a_momentary_hold_makes_no_step_and_a_toggle_press_does() {
+        let mut app = app();
+        let id = app.controller.add_module("loom.ui.button").unwrap();
+        app.commit();
+        let node = app.controller.graph().node(id).unwrap();
+        let mode = node.descriptor.param_index("mode").unwrap();
+        let on = node
+            .descriptor
+            .param_index(node.descriptor.panel.widgets[0].bind)
+            .unwrap();
+        // Momentary mode writes the transient hold, not the latch (#161).
+        let hold = node.descriptor.param_index("hold").unwrap();
+        let (module, widget) = (id.0, 0);
+        let press = |app: &mut App, param: usize, release: bool| {
+            let _ = app.update(Message::Canvas(CanvasEvent::ButtonPressed { module, widget }));
+            let held = app.controller.graph().node(id).unwrap().params[param];
+            if release {
+                let _ = app.update(Message::Canvas(CanvasEvent::ButtonReleased { module, widget }));
+            }
+            held
+        };
+
+        app.controller.set_param(id, mode, 1.0).unwrap();
+        app.commit();
+        let steps = app.edits.history.len();
+        assert_eq!(press(&mut app, hold, false), 1.0, "the hold is down");
+        assert_eq!(app.edits.history.len(), steps, "a momentary press is no step");
+        let _ = app.update(Message::Canvas(CanvasEvent::ButtonReleased { module, widget }));
+        assert_eq!(app.controller.graph().node(id).unwrap().params[hold], 0.0);
+        assert_eq!(app.edits.history.len(), steps, "nor is its release");
+
+        app.controller.set_param(id, mode, 0.0).unwrap();
+        app.commit();
+        let steps = app.edits.history.len();
+        assert_eq!(press(&mut app, on, true), 1.0, "the toggle is on");
+        assert_eq!(app.edits.history.len(), steps + 1, "a toggle press is a step");
+        assert_eq!(app.controller.graph().node(id).unwrap().params[on], 1.0, "and stays on");
     }
 }

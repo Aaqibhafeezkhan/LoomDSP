@@ -86,6 +86,14 @@ impl Registry {
             return Err(invalid("an input default must be a finite number"));
         }
         for param in descriptor.params {
+            // Transient parameters (transient-params.md, rules 1 and 2): a
+            // hold or a press, which starts in the safe "nothing" state.
+            if param.is_transient() && !param.options.integer {
+                return Err(invalid("a transient parameter must be a whole number"));
+            }
+            if param.is_transient() && param.default != 0.0 {
+                return Err(invalid("a transient parameter must default to 0"));
+            }
             if param.options.mapping == ParamMapping::Logarithmic {
                 if param.options.integer {
                     return Err(invalid("a whole-number parameter cannot be logarithmic"));
@@ -238,6 +246,16 @@ mod tests {
         }
     }
 
+    /// A level display value for test descriptors.
+    const fn display(name: &'static str) -> crate::DisplaySpec {
+        crate::DisplaySpec {
+            name,
+            label: name,
+            description: "A test display value.",
+            kind: crate::DisplayKind::Level,
+        }
+    }
+
     #[test]
     fn parses_kinds() {
         assert_eq!(
@@ -363,6 +381,168 @@ mod tests {
         assert_eq!(notes, ["test.quiet: input `in` has no description"]);
     }
 
+    /// A display value with no label or description loads, with a note,
+    /// as a port or parameter does.
+    #[test]
+    fn notes_undocumented_display_values() {
+        static DARK: ModuleDescriptor = ModuleDescriptor {
+            id: "test.dark",
+            version: 1,
+            name: "Dark",
+            category: "Test",
+            description: "",
+            inputs: &[],
+            outputs: &[],
+            params: &[],
+            role: ModuleRole::Dsp(|_| unreachable!("never created")),
+            panel: crate::Panel::EMPTY,
+            displays: &[crate::DisplaySpec {
+                name: "busy",
+                label: " ",
+                description: "",
+                kind: crate::DisplayKind::Trigger,
+            }],
+        };
+        let mut registry = Registry::new();
+        registry.register(&DARK).unwrap();
+        let notes: Vec<String> = registry.notes().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            notes,
+            [
+                "test.dark: display value `busy` has no label",
+                "test.dark: display value `busy` has no description"
+            ]
+        );
+    }
+
+    /// control-ranges.md: the registry refuses a range outside the
+    /// parameter, a range with `min >= max`, a default range not in the
+    /// list, a default value outside the default range, and ranges on a
+    /// logarithmic or whole-number parameter.
+    #[test]
+    fn refuses_bad_ranges() {
+        use crate::ParamRange as R;
+        macro_rules! with_param {
+            ($param:expr) => {{
+                static DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
+                    id: "test.ranges",
+                    version: 1,
+                    name: "Ranges",
+                    category: "Test",
+                    description: "",
+                    inputs: &[],
+                    outputs: &[],
+                    params: &[$param],
+                    role: ModuleRole::Dsp(|_| unreachable!("never created")),
+                    panel: crate::Panel::EMPTY,
+                    displays: &[],
+                };
+                Registry::new()
+                    .register(&DESCRIPTOR)
+                    .map_err(|error| error.to_string())
+            }};
+        }
+        const LIST: &[R] = &[R::new(-1.0, 1.0), R::new(-10.0, 10.0)];
+        assert_eq!(
+            with_param!(param("gain", -10.0, 10.0, 1.0, "").ranges(LIST, R::new(-1.0, 1.0))),
+            Ok(())
+        );
+        let refused = [
+            (
+                with_param!(param("gain", -5.0, 5.0, 1.0, "").ranges(LIST, R::new(-1.0, 1.0))),
+                "range -10 to 10 is outside",
+            ),
+            (
+                with_param!(param("gain", -10.0, 10.0, 1.0, "").ranges(&[R::new(1.0, 1.0)], R::new(1.0, 1.0))),
+                "not below its maximum",
+            ),
+            (
+                with_param!(param("gain", -10.0, 10.0, 1.0, "").ranges(LIST, R::new(0.0, 1.0))),
+                "the default range is not in the list",
+            ),
+            (
+                with_param!(param("gain", -10.0, 10.0, 5.0, "").ranges(LIST, R::new(-1.0, 1.0))),
+                "the default value 5 is outside the default range -1 to 1",
+            ),
+            (
+                with_param!(
+                    param("cutoff", 1.0, 10.0, 1.0, "")
+                        .logarithmic()
+                        .ranges(&[R::new(1.0, 10.0)], R::new(1.0, 10.0))
+                ),
+                "only linear parameters",
+            ),
+            (
+                with_param!(
+                    param("steps", -10.0, 10.0, 1.0, "")
+                        .integer()
+                        .ranges(LIST, R::new(-1.0, 1.0))
+                ),
+                "only linear parameters",
+            ),
+        ];
+        for (result, expected) in refused {
+            let error = result.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    /// Choice names go on whole-number parameters only, one per value, and
+    /// none empty. The error names the parameter.
+    #[test]
+    fn refuses_bad_choice_names() {
+        macro_rules! with_param {
+            ($param:expr) => {{
+                static DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
+                    id: "test.choices",
+                    version: 1,
+                    name: "Choices",
+                    category: "Test",
+                    description: "",
+                    inputs: &[],
+                    outputs: &[],
+                    params: &[$param],
+                    role: ModuleRole::Dsp(|_| unreachable!("never created")),
+                    panel: crate::Panel::EMPTY,
+                    displays: &[],
+                };
+                Registry::new()
+                    .register(&DESCRIPTOR)
+                    .map_err(|error| error.to_string())
+            }};
+        }
+        assert_eq!(
+            with_param!(
+                param("mode", 0.0, 1.0, 0.0, "")
+                    .integer()
+                    .choices(&["Toggle", "Momentary"])
+            ),
+            Ok(())
+        );
+        let refused = [
+            (
+                with_param!(
+                    param("mode", 0.0, 2.0, 0.0, "")
+                        .integer()
+                        .choices(&["Toggle", "Momentary"])
+                ),
+                "parameter `mode`: 2 choice names for 3 values",
+            ),
+            (
+                with_param!(param("mode", 0.0, 1.0, 0.0, "").integer().choices(&["Toggle", " "])),
+                "parameter `mode`: a choice name is empty",
+            ),
+            (
+                with_param!(param("mix", 0.0, 1.0, 0.0, "").choices(&["Dry", "Wet"])),
+                "parameter `mix`: choice names need a whole-number parameter",
+            ),
+        ];
+        for (result, expected) in refused {
+            let error = result.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
     /// A DSP module with the given parameters, for registry checks.
     macro_rules! with_params {
         ($($param:expr),*) => {{
@@ -395,6 +575,20 @@ mod tests {
         assert!(Registry::new().register(fine).is_ok());
     }
 
+    /// A transient parameter must be a whole number with a default of 0
+    /// (transient-params.md, rules 1 and 2).
+    #[test]
+    fn refuses_impossible_transient_parameters() {
+        let continuous = with_params!(param("hold", 0.0, 1.0, 0.0, "").transient());
+        let error = Registry::new().register(continuous).unwrap_err();
+        assert!(error.to_string().contains("whole number"), "{error}");
+        let held = with_params!(param("hold", 0.0, 1.0, 1.0, "").integer().transient());
+        let error = Registry::new().register(held).unwrap_err();
+        assert!(error.to_string().contains("default to 0"), "{error}");
+        let fine = with_params!(param("hold", 0.0, 1.0, 0.0, "").integer().transient());
+        assert!(Registry::new().register(fine).is_ok());
+    }
+
     /// A DSP module with two parameters, one display value, and a panel.
     macro_rules! with_panel {
         ($width:expr, $height:expr, [$($widget:expr),*]) => {{
@@ -410,12 +604,13 @@ mod tests {
                 params: &[
                     param("level", 0.0, 1.0, 0.5, ""),
                     param("on", 0.0, 1.0, 0.0, "").integer(),
-                    param("slope", 0.0, 3.0, 0.0, "").integer(),
+                    param("slope", 0.0, 3.0, 0.0, "").integer().choices(&["6", "12", "18", "24"]),
                     param("mode", 0.0, 1.0, 0.0, "").integer(),
+                    param("hold", 0.0, 1.0, 0.0, "").integer().transient(),
                 ],
                 role: ModuleRole::Dsp(|_| unreachable!("never created")),
                 panel: crate::Panel::new($width, $height, &[$($widget),*]),
-                displays: &["busy"],
+                displays: &[display("busy")],
             };
             Registry::new().register(&DESCRIPTOR).map_err(|error| error.to_string())
         }};
@@ -424,14 +619,14 @@ mod tests {
     #[test]
     fn accepts_a_panel_that_fits() {
         let result = with_panel!(
-            12,
+            15,
             6,
             [
                 Widget::knob(0, 0, "level"),
                 Widget::toggle(3, 0, "on"),
-                Widget::radio(6, 0, "slope", &["6", "12", "18", "24"]),
+                Widget::radio(6, 0, "slope"),
                 Widget::light(0, 3, "busy"),
-                Widget::meter(9, 0, "out")
+                Widget::meter(12, 0, "out")
             ]
         );
         assert_eq!(result, Ok(()));
@@ -446,8 +641,12 @@ mod tests {
             ),
             (with_panel!(3, 2, [Widget::toggle(0, 0, "level")]), "a toggle needs"),
             (
-                with_panel!(3, 4, [Widget::radio(0, 0, "slope", &["6", "12", "24"])]),
-                "radio buttons need",
+                with_panel!(3, 4, [Widget::radio(0, 0, "on")]),
+                "radio buttons need a whole-number parameter with choice names",
+            ),
+            (
+                with_panel!(3, 4, [Widget::radio(0, 0, "slope")]),
+                "`slope` (Radio): outside the panel",
             ),
             (
                 with_panel!(3, 2, [Widget::light(0, 0, "idle")]),
@@ -458,24 +657,40 @@ mod tests {
                 "`wet` (Meter): no such output",
             ),
             (
-                with_panel!(6, 3, [Widget::button(0, 0, "level", "mode")]),
+                with_panel!(6, 3, [Widget::button(0, 0, "level", "hold", "mode")]),
                 "a button needs",
             ),
             (
-                with_panel!(6, 3, [Widget::button(0, 0, "on", "missing")]),
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "hold", "missing")]),
                 "no such mode parameter",
             ),
             (
-                with_panel!(6, 3, [Widget::button(0, 0, "on", "level")]),
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "hold", "level")]),
                 "mode must be a whole-number parameter from 0 to 1",
             ),
             (
-                with_panel!(6, 3, [Widget::button(0, 0, "on", "slope")]),
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "hold", "slope")]),
                 "mode must be a whole-number parameter from 0 to 1",
             ),
             (
-                with_panel!(6, 3, [Widget::button(0, 0, "on", "on")]),
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "hold", "on")]),
                 "mode must be a different parameter",
+            ),
+            (
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "mode", "mode")]),
+                "mode must be a different parameter",
+            ),
+            (
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "on", "mode")]),
+                "hold must be a different parameter",
+            ),
+            (
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "missing", "mode")]),
+                "no such hold parameter",
+            ),
+            (
+                with_panel!(6, 3, [Widget::button(0, 0, "on", "slope", "mode")]),
+                "hold must be a whole-number parameter from 0 to 1",
             ),
             (with_panel!(3, 2, [Widget::knob(0, 0, "level")]), "outside the panel"),
             (
@@ -502,7 +717,7 @@ mod tests {
             params: &[],
             role: ModuleRole::Dsp(|_| unreachable!("never created")),
             panel: crate::Panel::EMPTY,
-            displays: &["a", "b", "c", "d", "e"],
+            displays: &[display("a"), display("b"), display("c"), display("d"), display("e")],
         };
         let error = Registry::new().register(&DESCRIPTOR).unwrap_err();
         assert!(error.to_string().contains("more than 4 display values"), "{error}");
@@ -607,7 +822,7 @@ mod tests {
             params: &[],
             role: ModuleRole::UnitDelay,
             panel: crate::Panel::EMPTY,
-            displays: &["level"],
+            displays: &[display("level")],
         };
         let error = Registry::new().register(&DELAY_WITH_DISPLAYS).unwrap_err();
         assert!(
