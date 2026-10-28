@@ -14,10 +14,12 @@ A useful test: if a detail could change without changing the decision, it belong
 
 ## Editing rules
 
-- **Proposed:** edit freely while it is discussed.
+- **Proposed:** edit freely while it is discussed, on its own branch. A Proposed ADR does not merge into `main`. Decide it first: it merges with a decided status (Accepted, Deferred, or Rejected), or as Superseded by an ADR that merges with it. A Rejected ADR still merges, so the choice and its reasons stay on record. CI enforces this: `mise run adr-status` (`scripts/check-adr-status.sh`) fails while any ADR is Proposed, or its status line holds anything but one allowed value, or the index row disagrees with it.
 - **Accepted:** frozen. Only fix typos and broken links, or update the status line. To change the decision, write a new ADR and mark the old one "Superseded by ADR-NNNN".
 
-Why: an ADR is a record of why things are the way they are. If it is rewritten after the fact, it can no longer explain the history it was written to explain.
+Why merge only decided ADRs: a Proposed ADR on `main` looks like a decision but is not one, so work that depends on it waits with no clear owner. Several features were blocked this way. Keeping it on its branch, with its pull request open, keeps the open question visible until someone decides it.
+
+Why freeze accepted ADRs: an ADR is a record of why things are the way they are. If it is rewritten after the fact, it can no longer explain the history it was written to explain.
 
 ## Status values
 
@@ -56,8 +58,8 @@ The status line holds one of these values and nothing else. The date line is the
 | [0020](0020-inferred-channel-count.md) | Channel count inferred per cable, with per-channel copies | Accepted |
 | [0021](0021-plain-data-view-models-and-keyed-identity.md) | Plain-data view models and keyed widget identity | Accepted |
 | [0022](0022-copies-take-state-from-the-running-instance.md) | A new channel copy takes its state from the running instance | Accepted |
-| [0023](0023-patch-licences-spdx-and-creative-commons.md) | Patch licences as SPDX expressions, chosen through Creative Commons questions | Proposed |
-| [0024](0024-widgets-follow-the-kind-of-value.md) | Widgets follow the kind of value, and structured data has shared kinds | Proposed |
+| [0023](0023-patch-licences-spdx-and-creative-commons.md) | Patch licences as SPDX expressions, chosen through Creative Commons questions | Accepted |
+| [0024](0024-widgets-follow-the-kind-of-value.md) | Widgets follow the kind of value, and structured data has shared kinds | Accepted |
 | [0025](0025-one-design-language-and-derived-panels.md) | One design language, and panels derived from the declaration | Accepted |
 | [0026](0026-browser-demo-feasibility.md) | A browser demo waits for a spike; pre-rendered audio examples come first | Accepted |
 | [0027](0027-prebuilt-release-downloads.md) | Prebuilt release downloads from a tagged GitHub Actions build | Accepted |
