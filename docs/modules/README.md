@@ -30,15 +30,18 @@ One page for each built-in module, made from its descriptor. After you change a 
 |---|---|---|
 | [Envelope](loom.env.envelope.md) | `loom.env.envelope` | A level from 0 to 1 that rises and falls when a gate starts it. ADSR holds while the gate is high; AD runs once, so a trigger also starts it. |
 | [LFO](loom.mod.lfo.md) | `loom.mod.lfo` | A slow wave. Free mode runs at a rate in Hz; synced mode follows a phase, by default the bar phase. |
+| [Random](loom.rand.random.md) | `loom.rand.random` | A new random value on each trigger, within a range, or a random walk. The seed makes it repeatable. |
 | [Sample and Hold](loom.rand.sample-hold.md) | `loom.rand.sample-hold` | Takes the input's value on a trigger and holds it. With noise on the input, it makes stepped random values. |
 
 ## Time and rhythm
 
 | Module | ID | Description |
 |---|---|---|
+| [Chance](loom.rand.chance.md) | `loom.rand.chance` | Four lanes that pass each trigger or gate to output A with a set chance, and to output B otherwise. |
 | [Clock](loom.clock.clock.md) | `loom.clock.clock` | A phase, trigger, and gate at a musical rate, locked to the transport's bar 1. |
 | [Clock Divide](loom.logic.divide.md) | `loom.logic.divide` | Fires on every Nth trigger, so a fast clock makes slower rhythms. Offset fires earlier in the count, and Reset starts the count again. |
 | [Phase](loom.phase.generator.md) | `loom.phase.generator` | Ramp from 0 to 1 at the pitch frequency. Drives oscillators and LFOs. |
+| [Phase Reset](loom.phase.reset.md) | `loom.phase.reset` | Restarts a phase at zero on a trigger. After that, the phase moves at the input's speed. |
 | [Phase Scale](loom.phase.scale.md) | `loom.phase.scale` | Runs a phase at multiply / divide times its speed, locked to the input. Divide counts the input's wraps from the first cycle or the last reset. |
 | [Phase Trigger](loom.phase.trigger.md) | `loom.phase.trigger` | Fires a trigger each time the phase wraps, forward or backward. |
 | [Phase Wrap and Fold](loom.phase.wrap.md) | `loom.phase.wrap` | Brings any signal into the phase range, 0 to 1. Wrap goes round the edge; fold turns back at the edges. |
