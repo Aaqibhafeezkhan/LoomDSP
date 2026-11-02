@@ -9,7 +9,7 @@ An Audio In module that brings sound from an interface into the patch, so LoomDS
 - **Background:** [Output safety](../learn/output-safety.md) (why a loud loop must be stopped at the output).
 - **Prior art:** none needed.
 - **Issues:** [#29](https://github.com/brylie/LoomDSP/issues/29).
-- **Code:** `loom.io.audio-in` in `crates/loom-modules/src/io.rs`; the input stream in `crates/loom-host-desktop`; the `Host` trait in `crates/loom-app/src/devices.rs`.
+- **Code:** `loom.io.audio-in` in `crates/loom-modules/src/io.rs`; the input stream in `crates/loom-host-desktop`; the `Host` trait in `crates/loom-app/src/devices.rs`; the stream's lifecycle and messages in `InputSession`, `crates/loom-app/src/input_session.rs`.
 
 ## Goal
 
@@ -78,7 +78,7 @@ A new **Audio input** row in the Audio section of Preferences:
 
 - **macOS asks for microphone permission** the first time an input stream opens. The app bundle ([`scripts/bundle-macos.sh`](../../scripts/bundle-macos.sh)) must carry `NSMicrophoneUsageDescription` ("LoomDSP uses audio input so patches can process live sound."). Without it, macOS stops the app.
 - **If the player denies access, or the OS blocks it,** the module is silent and the status bar says `Audio input: access to the microphone was denied. Allow LoomDSP in System Settings, Privacy and Security, Microphone.` (The text names the right place for each OS.) The message shows once per run, and again if the player changes the input device.
-- **Windows and Linux** may have no prompt; the same message shows if the stream cannot open.
+- **Windows and Linux** may have no prompt. The message shows when the audio backend reports a refused permission as such: ALSA and PulseAudio do. WASAPI on Windows reports only its own text, so a refusal there shows `Audio input: audio error: <text>.` instead. *Why:* the app does not search error text for words, because a backend's wording is no evidence of a refusal.
 
 ## Feedback
 
