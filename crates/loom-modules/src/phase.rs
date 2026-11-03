@@ -9,6 +9,7 @@ use loom_core::{
     Channels, DisplayKind, DisplaySpec, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions,
     ParamSpec, PortDefault, PortIo, PortSpec, ProcessContext, SignalType, TriggerFlag, Widget,
 };
+use loom_dsp::phase::Phasor;
 
 /// `loom.phase.generator`: a ramp from 0 to 1 at the frequency set by pitch.
 pub static PHASE: ModuleDescriptor = ModuleDescriptor {
@@ -76,8 +77,8 @@ pub static PHASE: ModuleDescriptor = ModuleDescriptor {
 
 #[derive(Clone)]
 struct Phase {
-    phase: f64,
-    sample_rate: f64,
+    phasor: Phasor,
+    sample_rate: f32,
     tune: f32,
     octave: f32,
     reset_in: EdgeDetector,
@@ -89,33 +90,13 @@ impl Phase {
 
     fn new(config: &ModuleConfig) -> Self {
         Self {
-            phase: 0.0,
-            sample_rate: f64::from(config.sample_rate),
+            phasor: Phasor::new(),
+            sample_rate: config.sample_rate,
             tune: 0.0,
             octave: 0.0,
             reset_in: EdgeDetector::new(),
         }
     }
-}
-
-/// Largest phase step per sample: just under half a cycle (Nyquist).
-///
-/// Not exactly 0.5: then the phase would read 0, 0.5, 0, 0.5, and no step
-/// would be more than half a cycle, so `WrapDetector` would see no wraps
-/// and a Phase Trigger would stop firing. At 0.49 every wrap is a jump of
-/// 0.51, clear of `f32` rounding.
-const MAX_STEP: f64 = 0.49;
-
-/// Phase step per sample for a frequency, at most [`MAX_STEP`].
-///
-/// A high pitch overflows `to_hz` to infinity, and `inf - floor(inf)` is
-/// NaN. Without this limit the phase would stay NaN for good, so a patch
-/// stays silent even after the pitch comes back (#121). Frequencies near
-/// Nyquist and above cannot be heard as themselves anyway. NaN pitch stops
-/// the phase.
-fn increment(hz: f32, sample_rate: f64) -> f64 {
-    let step = f64::from(hz) / sample_rate;
-    if step.is_nan() { 0.0 } else { step.min(MAX_STEP) }
 }
 
 impl Module for Phase {
@@ -132,12 +113,14 @@ impl Module for Phase {
             let offset =
                 tune.at_or(i, self.tune) * pitch::PER_SEMITONE + octave.at_or(i, self.octave) * pitch::PER_OCTAVE;
             if self.reset_in.rising(r) {
-                self.phase = 0.0;
+                self.phasor.reset();
             }
 
-            *out = self.phase as f32;
-            self.phase += increment(pitch::to_hz(p + offset), self.sample_rate);
-            self.phase -= self.phase.floor();
+            // A high pitch overflows `to_hz` to infinity, and `step_for` limits
+            // that, so a patch recovers when the pitch comes back (#121).
+            *out = self
+                .phasor
+                .tick(Phasor::step_for(pitch::to_hz(p + offset), self.sample_rate));
         }
     }
 
@@ -150,7 +133,7 @@ impl Module for Phase {
     }
 
     fn reset(&mut self) {
-        self.phase = 0.0;
+        self.phasor.reset();
         self.reset_in.reset();
     }
 }

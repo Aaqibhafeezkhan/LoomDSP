@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/loom-rt",
+    "crates/loom-dsp",
     "crates/loom-core",
     "crates/loom-modules",
     "crates/loom-patch",
@@ -26,6 +27,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 loom-rt = { path = "crates/loom-rt", version = "0.1.0" }
+loom-dsp = { path = "crates/loom-dsp", version = "0.1.0" }
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
 loom-modules = { path = "crates/loom-modules", version = "0.1.0" }
 loom-patch = { path = "crates/loom-patch", version = "0.1.0" }
@@ -110,6 +112,9 @@ debug = 1
 # dev and test builds; `debug_assertions` stay on, so the no-allocation
 # tests still run.
 [profile.dev.package.loom-core]
+opt-level = 3
+
+[profile.dev.package.loom-dsp]
 opt-level = 3
 
 [profile.dev.package.loom-modules]

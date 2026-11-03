@@ -34,12 +34,12 @@ fn make_allpass(sample_rate: f32, time: f32, gain: f32) -> Box<dyn Module> {
 /// Checks that an integer delay shifts an impulse by the exact number of samples.
 #[test]
 fn integer_delay_shifts_an_impulse_by_exact_samples() {
-    let mut buf = DelayBuffer::new(0.1, 1_000.0);
+    let mut buf = delay::DelayLine::new(0.1, 1_000.0);
     for i in 0..32 {
         let x = if i == 0 { 1.0 } else { 0.0 };
-        let y = buf.step_delay(x, 10.0);
+        let y = buf.tick(x, 10.0);
         let expected = if i == 10 { 1.0 } else { 0.0 };
-        assert_eq!(y, expected, "step_delay frame {i}");
+        assert_eq!(y, expected, "delay frame {i}");
     }
 
     // Through Module::process: use dyadic floats so (base_time + time_in) * sample_rate
@@ -68,9 +68,9 @@ fn integer_delay_shifts_an_impulse_by_exact_samples() {
 fn fractional_catmull_rom_matches_the_cubic_formula_and_sweeps_smoothly_at_long_delays() {
     // On a linear ramp x[n] = n, Catmull-Rom reproduces the line exactly
     // once all four stencil points (k - 1 ..= k + 2) lie on the ramp.
-    let mut buf = DelayBuffer::new(0.1, 1_000.0);
+    let mut buf = delay::DelayLine::new(0.1, 1_000.0);
     for n in 0..30 {
-        let y = buf.step_delay(n as f32, 5.375);
+        let y = buf.tick(n as f32, 5.375);
         if n >= 8 {
             let expected = n as f32 - 5.375;
             assert!((y - expected).abs() < 1e-5, "frame {n}: got {y}, expected {expected}");
@@ -82,16 +82,16 @@ fn fractional_catmull_rom_matches_the_cubic_formula_and_sweeps_smoothly_at_long_
     // changes the output on every frame rather than quantising into
     // 32-frame plateaus.
     let sample_rate = 192_000.0;
-    let mut long_buf = DelayBuffer::new(2.0, sample_rate);
+    let mut long_buf = delay::DelayLine::new(2.0, sample_rate);
     let base_delay = 380_000usize;
     for n in 0..base_delay + 10 {
-        let _ = long_buf.step_delay((n as f32 * 0.1).sin(), base_delay as f64);
+        let _ = long_buf.tick((n as f32 * 0.1).sin(), base_delay as f64);
     }
-    let mut prev = long_buf.step_delay(0.5, base_delay as f64);
+    let mut prev = long_buf.tick(0.5, base_delay as f64);
     let mut changed = 0;
     for step in 1..=16 {
         let d = base_delay as f64 + step as f64 * 0.001;
-        let next = long_buf.step_delay(0.5, d);
+        let next = long_buf.tick(0.5, d);
         if next != prev {
             changed += 1;
         }
@@ -181,8 +181,8 @@ fn clamps_limits_and_sanitizes_nan_and_infinity_on_time_input() {
 fn allpass_with_zero_gain_equals_delay_line_for_same_delay_in_samples() {
     // 1. Step level: identical `delay_samples >= 2.0`, including fractional
     // sweeps, -0.0, and quiet 1e-25 inputs below the 1e-20 feedback flush.
-    let mut delay_buf = DelayBuffer::new(0.2, 48_000.0);
-    let mut ap_buf = DelayBuffer::new(0.2, 48_000.0);
+    let mut delay_buf = delay::DelayLine::new(0.2, 48_000.0);
+    let mut ap_buf = delay::Allpass::new(0.2, 48_000.0);
     for i in 0..500 {
         let x = match i {
             0 => -0.0,
@@ -190,8 +190,8 @@ fn allpass_with_zero_gain_equals_delay_line_for_same_delay_in_samples() {
             _ => (i as f32 * 0.13).sin(),
         };
         let d = 2.0 + 50.0 * (1.0 + (i as f64 * 0.03).sin());
-        let y_delay = delay_buf.step_delay(x, d);
-        let y_ap = ap_buf.step_allpass(x, d, 0.0);
+        let y_delay = delay_buf.tick(x, d);
+        let y_ap = ap_buf.tick(x, d, 0.0);
         assert_eq!(y_ap, y_delay, "frame {i} at d = {d}");
     }
 

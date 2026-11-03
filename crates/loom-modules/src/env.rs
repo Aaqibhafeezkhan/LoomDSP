@@ -7,6 +7,7 @@ use loom_core::{
     Channels, DisplayKind, DisplaySpec, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions,
     ParamSpec, PortDefault, PortIo, PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_dsp::envelope::{self, Settings, fall, power};
 
 /// `loom.env.envelope`: an envelope with an ADSR mode that follows a gate
 /// and an AD mode that runs once from a gate or a trigger.
@@ -176,37 +177,10 @@ fn envelope_preview(params: &[f32], x: f32) -> f32 {
 #[cfg(test)]
 mod preview_tests;
 
-/// Where the envelope is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Stage {
-    /// At 0, waiting for a rising gate.
-    Idle,
-    /// Rising from the level it started at to 1.
-    Attack,
-    /// Falling from 1 to the sustain level (ADSR) or to 0 (AD).
-    Decay,
-    /// Holding the sustain level while the gate is high (ADSR only).
-    Sustain,
-    /// Falling from the level it started at to 0 (ADSR only).
-    Release,
-}
-
 /// State for `loom.env.envelope`.
 #[derive(Clone)]
 struct Envelope {
-    sample_rate: f64,
-    stage: Stage,
-    /// The output level.
-    level: f32,
-    /// The level when the current stage started.
-    start: f32,
-    /// Progress through the current stage, from 0 to 1. Kept in `f64`, so
-    /// a 10 s stage at a high sample rate still ends on time.
-    progress: f64,
-    gate_was_high: bool,
-    /// Whether the current decay falls to 0 (AD) rather than to the
-    /// sustain level, so a mode change mid-decay can restart it.
-    decay_ad: bool,
+    envelope: envelope::Envelope,
     /// The knob values. Modulated values live only for one frame, so these
     /// keep the base and removing an assignment returns to it.
     attack: f32,
@@ -228,13 +202,7 @@ impl Envelope {
     /// An idle envelope with the default parameters.
     fn new(config: &ModuleConfig) -> Self {
         Self {
-            sample_rate: f64::from(config.sample_rate),
-            stage: Stage::Idle,
-            level: 0.0,
-            start: 0.0,
-            progress: 0.0,
-            gate_was_high: false,
-            decay_ad: false,
+            envelope: envelope::Envelope::new(config.sample_rate),
             attack: 0.01,
             decay: 0.2,
             sustain: 0.7,
@@ -243,35 +211,6 @@ impl Envelope {
             curve: 0.0,
         }
     }
-
-    /// Starts `stage` from the current level.
-    fn enter(&mut self, stage: Stage) {
-        self.stage = stage;
-        self.start = self.level;
-        self.progress = 0.0;
-    }
-
-    /// Moves the progress on by one frame of a stage that lasts `seconds`,
-    /// and returns the new progress, at most 1.
-    fn advance(&mut self, seconds: f32) -> f32 {
-        let frames = (f64::from(seconds) * self.sample_rate).max(1.0);
-        self.progress = (self.progress + 1.0 / frames).min(1.0);
-        self.progress as f32
-    }
-}
-
-/// The shaping power for `curve` from -1 to 1: `2^(3 × curve)`, from 1/8
-/// to 8.
-fn power(curve: f32) -> f32 {
-    (3.0 * curve.clamp(-1.0, 1.0)).exp2()
-}
-
-/// How far a falling stage has gone: `(1 - x)^k`, from 1 at `x` = 0 to 0
-/// at `x` = 1. A rising stage uses `1 - fall(x, k)`.
-fn fall(x: f32, k: f32) -> f32 {
-    let rest = (1.0 - x).max(0.0);
-    // Skip the `powf` for the straight line, the default.
-    if k == 1.0 { rest } else { rest.powf(k) }
 }
 
 impl Module for Envelope {
@@ -296,67 +235,17 @@ impl Module for Envelope {
             let ad = mode.map_or(i, self.ad, |v| v >= 0.5);
             let k = power(curve.at_or(i, self.curve));
 
-            let high = gate_is_high(g);
-            if high && !self.gate_was_high {
-                // Retrigger from the current level: no click. The attack
-                // still takes the full attack time.
-                self.enter(Stage::Attack);
-            } else if !high && self.gate_was_high && !ad && self.stage != Stage::Idle {
-                self.enter(Stage::Release);
-            }
-            self.gate_was_high = high;
-            // AD has no sustain. A switch to AD while holding falls to 0.
-            if ad && self.stage == Stage::Sustain {
-                self.enter(Stage::Decay);
-                self.decay_ad = true;
-            }
-            // A mode change mid-decay moves the decay's end. Restart the
-            // stage from the current level, so the output does not jump.
-            // With the gate already low, ADSR goes on to the release.
-            if self.stage == Stage::Decay && self.decay_ad != ad {
-                self.enter(if ad || high { Stage::Decay } else { Stage::Release });
-                self.decay_ad = ad;
-            }
-
-            match self.stage {
-                Stage::Idle => self.level = 0.0,
-                Stage::Attack => {
-                    let x = self.advance(attack);
-                    self.level = self.start + (1.0 - self.start) * (1.0 - fall(x, k));
-                    if x >= 1.0 {
-                        self.level = 1.0;
-                        self.enter(Stage::Decay);
-                        self.decay_ad = ad;
-                    }
-                }
-                Stage::Decay => {
-                    let x = self.advance(decay);
-                    let end = if ad { 0.0 } else { sustain };
-                    self.level = end + (self.start - end) * fall(x, k);
-                    if x >= 1.0 {
-                        self.level = end;
-                        if ad {
-                            self.stage = Stage::Idle;
-                        } else if high {
-                            self.stage = Stage::Sustain;
-                        } else {
-                            // The gate fell while the mode was AD, so no
-                            // falling edge will come: release from here.
-                            self.enter(Stage::Release);
-                        }
-                    }
-                }
-                Stage::Sustain => self.level = sustain,
-                Stage::Release => {
-                    let x = self.advance(release);
-                    self.level = self.start * fall(x, k);
-                    if x >= 1.0 {
-                        self.level = 0.0;
-                        self.stage = Stage::Idle;
-                    }
-                }
-            }
-            *out = self.level;
+            *out = self.envelope.tick(
+                gate_is_high(g),
+                Settings {
+                    attack,
+                    decay,
+                    sustain,
+                    release,
+                    ad,
+                    power: k,
+                },
+            );
         }
     }
 
@@ -373,15 +262,11 @@ impl Module for Envelope {
     }
 
     fn reset(&mut self) {
-        self.stage = Stage::Idle;
-        self.level = 0.0;
-        self.start = 0.0;
-        self.progress = 0.0;
-        self.gate_was_high = false;
+        self.envelope.reset();
     }
 
     fn displays(&self, values: &mut [f32]) {
-        values[0] = self.level;
+        values[0] = self.envelope.level();
     }
 }
 

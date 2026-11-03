@@ -5,8 +5,8 @@ use loom_core::{
     Channels, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, PortDefault, PortIo,
     PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_dsp::filter::{ladder, one_pole, svf};
 use loom_rt::Smoothed;
-use std::f32::consts::PI;
 
 /// `loom.filter.svf`: state variable filter with lowpass, bandpass,
 /// highpass, and notch outputs.
@@ -112,8 +112,7 @@ struct Svf {
     sample_rate: f32,
     cutoff: Smoothed,
     resonance: Smoothed,
-    ic1: f32,
-    ic2: f32,
+    filter: svf::Svf,
 }
 
 impl Svf {
@@ -135,8 +134,7 @@ impl Svf {
                 config.sample_rate,
                 SVF.params[Self::RESONANCE].options.smooth_seconds,
             ),
-            ic1: 0.0,
-            ic2: 0.0,
+            filter: svf::Svf::new(),
         }
     }
 }
@@ -164,26 +162,15 @@ impl Module for Svf {
             let cutoff_hz = if cutoff_hz.is_nan() { 1_000.0 } else { cutoff_hz }.clamp(5.0, nyquist_limit);
             let resonance = resonance_param.at_or(i, self.resonance.tick());
             // Resonance 0..1 maps to damping k = 2..0.02 (Q from 0.5 to 50).
-            let k = 2.0 - 1.98 * resonance;
-            let g = (PI * cutoff_hz / self.sample_rate).tan();
-            let a1 = 1.0 / (1.0 + g * (g + k));
-            let a2 = g * a1;
-            let a3 = g * a2;
+            let coefficients = svf::Coefficients::new(cutoff_hz, 2.0 - 1.98 * resonance, self.sample_rate);
 
             let x = input[i];
             let x = if x.is_finite() { x } else { 0.0 };
-            let v3 = x - self.ic2;
-            let v1 = a1 * self.ic1 + a2 * v3;
-            let v2 = self.ic2 + a2 * self.ic1 + a3 * v3;
-            self.ic1 = 2.0 * v1 - self.ic1;
-            self.ic2 = 2.0 * v2 - self.ic2;
-
-            lp[i] = v2;
-            bp[i] = v1;
-            hp[i] = x - k * v1 - v2;
-            // The notch is the lowpass plus the highpass: the bandpass terms
-            // cancel and `x - k * v1` is left. One addition, always in step.
-            notch[i] = lp[i] + hp[i];
+            let outputs = self.filter.tick(x, coefficients);
+            lp[i] = outputs.low;
+            bp[i] = outputs.band;
+            hp[i] = outputs.high;
+            notch[i] = outputs.notch;
         }
     }
 
@@ -208,8 +195,7 @@ impl Module for Svf {
     /// Clears the filter memory and snaps the smoothing to its targets
     /// (live patching spec, rule 7).
     fn reset(&mut self) {
-        self.ic1 = 0.0;
-        self.ic2 = 0.0;
+        self.filter.reset();
         let (cutoff, resonance) = (self.cutoff.target(), self.resonance.target());
         self.cutoff.reset(cutoff);
         self.resonance.reset(resonance);
@@ -282,14 +268,13 @@ pub static ONEPOLE: ModuleDescriptor = ModuleDescriptor {
     displays: &[],
 };
 
-/// State for `loom.filter.onepole`: the smoothed cutoff and the integrator.
+/// State for `loom.filter.onepole`: the smoothed cutoff and the filter.
 #[derive(Clone)]
 struct OnePole {
     sample_rate: f32,
     /// The cutoff in pitch units, smoothed over 10 ms.
     cutoff: Smoothed,
-    /// The trapezoidal integrator state: the lowpass output so far.
-    state: f32,
+    filter: one_pole::OnePole,
 }
 
 impl OnePole {
@@ -304,7 +289,7 @@ impl OnePole {
                 config.sample_rate,
                 ONEPOLE.params[Self::CUTOFF].options.smooth_seconds,
             ),
-            state: 0.0,
+            filter: one_pole::OnePole::new(),
         }
     }
 }
@@ -328,16 +313,12 @@ impl Module for OnePole {
             // and it would reach the state and stay there. Use a safe
             // cutoff for that frame instead. Infinity is clamped as usual.
             let cutoff_hz = if cutoff_hz.is_nan() { 1_000.0 } else { cutoff_hz }.clamp(0.5, nyquist_limit);
-            // Trapezoidal one-pole. Warping the cutoff with `tan` puts the
-            // -3 dB point exactly on the cutoff at any rate.
-            let g = (PI * cutoff_hz / self.sample_rate).tan();
+            let coefficients = one_pole::Coefficients::new(cutoff_hz, self.sample_rate);
             let x = input[i];
             let x = if x.is_finite() { x } else { 0.0 };
-            let v = (x - self.state) * g / (1.0 + g);
-            let low = v + self.state;
-            self.state = low + v;
-            lp[i] = low;
-            hp[i] = x - low;
+            let outputs = self.filter.tick(x, coefficients);
+            lp[i] = outputs.low;
+            hp[i] = outputs.high;
         }
     }
 
@@ -358,7 +339,7 @@ impl Module for OnePole {
     /// Clears the integrator and snaps the cutoff to its target (live
     /// patching spec, rule 7).
     fn reset(&mut self) {
-        self.state = 0.0;
+        self.filter.reset();
         let cutoff = self.cutoff.target();
         self.cutoff.reset(cutoff);
     }
@@ -367,15 +348,7 @@ impl Module for OnePole {
 /// `loom.filter.ladder`: a resonant low-pass made of two, three, or four
 /// one-pole stages in a loop, with saturation in the feedback (MT-FILTER-02).
 ///
-/// Designed from published theory only (ADR-0018):
-///
-/// - T. Stilson and J. Smith, "Analyzing the Moog VCF with Considerations
-///   for Digital Implementation", Proc. ICMC 1996: the loop of identical
-///   one-pole stages with inverting feedback, and the gain where it starts
-///   to oscillate.
-/// - V. Zavalishin, "The Art of VA Filter Design": the trapezoidal (TPT)
-///   one-pole stage, the prewarped cutoff, and solving the feedback loop
-///   with no unit delay in it (zero-delay feedback).
+/// The algorithm and its sources are in [`ladder`].
 ///
 /// Spec: `docs/design/p1-modules.md`, Ladder low-pass. Explainer:
 /// `docs/learn/ladder-filter.md`.
@@ -490,13 +463,13 @@ fn ladder_preview(params: &[f32], x: f32) -> f32 {
     let (cutoff, resonance, slope) = (params[Ladder::CUTOFF], params[Ladder::RESONANCE], params[Ladder::SLOPE]);
     let frequency = 20.0 * 1000.0_f32.powf(x.clamp(0.0, 1.0));
     let ratio = frequency / cutoff.max(20.0);
-    let stage = slope.round().clamp(0.0, 2.0) as usize;
+    let slope = slope_from(slope);
     let mut real = 1.0;
     let mut imaginary = 0.0;
-    for _ in 0..stage + 2 {
+    for _ in 0..slope.stages() {
         (real, imaginary) = (real - imaginary * ratio, imaginary + real * ratio);
     }
-    let feedback = resonance.clamp(0.0, 1.0) * LADDER_K_MAX[stage];
+    let feedback = resonance.clamp(0.0, 1.0) * slope.feedback_limit();
     let magnitude = 1.0 / ((real + feedback).powi(2) + imaginary.powi(2)).sqrt();
     ((20.0 * magnitude.log10() + 60.0) / 72.0).clamp(0.0, 1.0)
 }
@@ -504,23 +477,15 @@ fn ladder_preview(params: &[f32], x: f32) -> f32 {
 #[cfg(test)]
 mod preview_tests;
 
-/// The number of one-pole stages the ladder always runs.
-const LADDER_STAGES: usize = 4;
-
-/// The feedback gain at resonance 1 for each slope (2, 3, and 4 stages).
-///
-/// For N identical stages `1 / (1 + s)` with feedback `-k`, the loop rings
-/// forever when `(1 + s)^N = -k` has a root on the imaginary axis: `k = 8`
-/// for N = 3 (at `√3` times the cutoff) and `k = 4` for N = 4 (at the
-/// cutoff), as Stilson and Smith show. Two stages never reach it. The 18 and
-/// 24 dB values are 5% above the limit: at the limit itself the loop only
-/// keeps an oscillation that is already there, and the tanh in the feedback
-/// pulls it below, so resonance 1 would not sing.
-const LADDER_K_MAX: [f32; 3] = [8.0, 8.4, 4.2];
-
-/// How fast the feedback limit moves during a slope change, per second:
-/// from 8.4 to 4.2 in 10 ms.
-const LADDER_LIMIT_RAMP: f32 = (8.4 - 4.2) / 0.01;
+/// The slope a knob or a modulated value selects. Rounds to the nearest of 0,
+/// 1, and 2, and NaN gives 0.
+fn slope_from(value: f32) -> ladder::Slope {
+    match value.round().clamp(0.0, 2.0) as usize {
+        0 => ladder::Slope::Db12,
+        1 => ladder::Slope::Db18,
+        _ => ladder::Slope::Db24,
+    }
+}
 
 /// The input gain at drive 1: 8 times, +18 dB.
 const LADDER_MAX_DRIVE: f32 = 8.0;
@@ -533,31 +498,9 @@ struct Ladder {
     cutoff: Smoothed,
     resonance: Smoothed,
     drive: Smoothed,
-    /// The knob's slope, 0 to 2. Modulation counts for one frame only.
-    slope: usize,
-    /// The slope the output is at or fading to.
-    target: usize,
-    /// How much each tap (after stage 2, 3, and 4) adds to the output and
-    /// to the feedback. One of them is 1, except during a slope change.
-    weights: [f32; 3],
-    /// The weights when the current slope change began.
-    from: [f32; 3],
-    /// Progress of the slope crossfade, from 0 to 1. 1 means done.
-    fade: f32,
-    /// Progress per frame of the 10 ms crossfade.
-    fade_step: f32,
-    /// The feedback gain at resonance 1 now. During a slope change it
-    /// moves toward the limit of the taps in use at [`LADDER_LIMIT_RAMP`],
-    /// so the gain never jumps.
-    limit: f32,
-    /// How far `limit` may move in one frame.
-    limit_step: f32,
-    /// The trapezoidal integrator state of each stage. All four always
-    /// run, so a change of slope finds the stages already moving.
-    state: [f32; LADDER_STAGES],
-    /// `tanh(y) / y` for the last output `y`: the slope of the line from
-    /// the origin to the point on the tanh curve. See [`Ladder::tick`].
-    saturation: f32,
+    /// The knob's slope. Modulation counts for one frame only.
+    slope: ladder::Slope,
+    filter: ladder::Ladder,
 }
 
 impl Ladder {
@@ -578,109 +521,9 @@ impl Ladder {
             ),
             resonance: Smoothed::new(0.2, config.sample_rate, params[Self::RESONANCE].options.smooth_seconds),
             drive: Smoothed::new(0.0, config.sample_rate, params[Self::DRIVE].options.smooth_seconds),
-            slope: 2,
-            target: 2,
-            weights: [0.0, 0.0, 1.0],
-            from: [0.0, 0.0, 1.0],
-            fade: 1.0,
-            fade_step: 1.0 / (0.01 * config.sample_rate).max(1.0),
-            limit: LADDER_K_MAX[2],
-            limit_step: LADDER_LIMIT_RAMP / config.sample_rate,
-            state: [0.0; LADDER_STAGES],
-            saturation: 1.0,
+            slope: ladder::Slope::Db24,
+            filter: ladder::Ladder::new(config.sample_rate),
         }
-    }
-
-    /// Starts a 10 ms crossfade from the current tap weights to `slope`.
-    /// A change during a crossfade starts from where that one had got to.
-    fn change_slope(&mut self, slope: usize) {
-        self.target = slope;
-        self.from = self.weights;
-        self.fade = 0.0;
-    }
-
-    /// Moves a slope change on by one frame and returns the feedback gain
-    /// at resonance 1 for this frame.
-    ///
-    /// The gain may never pass the limit of any tap that is heard or about
-    /// to be heard. So when the new slope's limit is lower, the gain first
-    /// moves down to it, with only the old taps heard, and the crossfade
-    /// waits. When it is higher, the crossfade runs first, at the old gain,
-    /// and the gain then moves up. The gain never jumps, so the output
-    /// never clicks.
-    fn step_slope(&mut self) -> f32 {
-        let wanted = self
-            .weights
-            .iter()
-            .zip(LADDER_K_MAX)
-            .enumerate()
-            .filter(|&(tap, (&w, _))| tap == self.target || w > 0.0)
-            .map(|(_, (_, k))| k)
-            .fold(f32::INFINITY, f32::min);
-        self.limit = if self.limit > wanted {
-            (self.limit - self.limit_step).max(wanted)
-        } else {
-            (self.limit + self.limit_step).min(wanted)
-        };
-        if self.fade < 1.0 && self.limit <= LADDER_K_MAX[self.target] {
-            self.fade = (self.fade + self.fade_step).min(1.0);
-            for (tap, weight) in self.weights.iter_mut().enumerate() {
-                let to = if tap == self.target { 1.0 } else { 0.0 };
-                *weight = self.from[tap] + (to - self.from[tap]) * self.fade;
-            }
-            if self.fade >= 1.0 {
-                self.weights = [0.0; 3];
-                self.weights[self.target] = 1.0;
-            }
-        }
-        self.limit
-    }
-
-    /// One frame of the filter: input `x`, prewarped gain `g`, feedback
-    /// gain `k`, input gain `gain`. Returns the output.
-    ///
-    /// Each stage is Zavalishin's trapezoidal one-pole: with
-    /// `G = g / (1 + g)`, its output is `y = G·x + s / (1 + g)`, where `s`
-    /// is its state. So every tap is a straight line in the loop input `u`:
-    /// `y = a·u + b`. The loop is `u = gain·x - k·tanh(y)`. The tanh is
-    /// replaced by its secant through the origin at the last output,
-    /// `tanh(y) ≈ y · tanh(y_last) / y_last`, so `u` comes from one
-    /// division, with no unit delay in the loop (zero-delay feedback). The
-    /// secant slope is at most 1, so it only ever lowers the loop gain.
-    fn tick(&mut self, x: f32, g: f32, k: f32, gain: f32) -> f32 {
-        let big_g = g / (1.0 + g);
-        let carry = 1.0 / (1.0 + g);
-        // The taps after stages 2, 3, and 4 as `a·u + b`.
-        let (mut a, mut b) = (1.0, 0.0);
-        let mut taps = [(0.0, 0.0); 3];
-        for (stage, &s) in self.state.iter().enumerate() {
-            a *= big_g;
-            b = big_g * b + carry * s;
-            if stage >= 1 {
-                taps[stage - 1] = (a, b);
-            }
-        }
-        let (mut fa, mut fb) = (0.0, 0.0);
-        for (&(a, b), &w) in taps.iter().zip(&self.weights) {
-            fa += w * a;
-            fb += w * b;
-        }
-        let loop_gain = k * self.saturation;
-        let u = (gain * x - loop_gain * fb) / (1.0 + loop_gain * fa);
-
-        // Run the four stages on `u`.
-        let mut input = u;
-        let mut outs = [0.0; LADDER_STAGES];
-        for (s, out) in self.state.iter_mut().zip(&mut outs) {
-            let v = (input - *s) * big_g;
-            let y = v + *s;
-            *s = y + v;
-            *out = y;
-            input = y;
-        }
-        let y: f32 = outs[1..].iter().zip(&self.weights).map(|(y, w)| y * w).sum();
-        self.saturation = if y.abs() < 1e-4 { 1.0 } else { y.tanh() / y };
-        y
     }
 }
 
@@ -707,24 +550,27 @@ impl Module for Ladder {
             let cutoff_hz = if cutoff_hz.is_nan() { 1_000.0 } else { cutoff_hz }.clamp(5.0, nyquist_limit);
             let resonance = resonance_param.at_or(i, self.resonance.tick()).clamp(0.0, 1.0);
             let drive = drive_param.at_or(i, self.drive.tick()).clamp(0.0, 1.0);
-            let slope = slope_param.map_or(i, self.slope, |v| v.round().clamp(0.0, 2.0) as usize);
-            if slope != self.target {
-                self.change_slope(slope);
+            let slope = slope_param.map_or(i, self.slope, slope_from);
+            if slope != self.filter.target() {
+                self.filter.change_slope(slope);
             }
-            let limit = self.step_slope();
+            let limit = self.filter.step_slope();
 
             let x = input[i];
             if !x.is_finite() {
                 // A bad input clears the loop, so it cannot stay in it.
-                self.state = [0.0; LADDER_STAGES];
-                self.saturation = 1.0;
+                self.filter.clear_loop();
                 out[i] = 0.0;
                 continue;
             }
-            let g = (PI * cutoff_hz / self.sample_rate).tan();
-            // Drive 0 to 1 is a gain of 1 to 8, even in dB.
-            let gain = LADDER_MAX_DRIVE.powf(drive);
-            out[i] = self.tick(x, g, resonance * limit, gain);
+            let coefficients = ladder::Coefficients::new(ladder::Settings {
+                cutoff_hz,
+                feedback: resonance * limit,
+                // Drive 0 to 1 is a gain of 1 to 8, even in dB.
+                input_gain: LADDER_MAX_DRIVE.powf(drive),
+                sample_rate: self.sample_rate,
+            });
+            out[i] = self.filter.tick(x, coefficients);
         }
     }
 
@@ -733,7 +579,7 @@ impl Module for Ladder {
             Self::CUTOFF => self.cutoff.set_target(pitch::from_hz(value)),
             Self::RESONANCE => self.resonance.set_target(value),
             Self::DRIVE => self.drive.set_target(value),
-            Self::SLOPE => self.slope = value.round().clamp(0.0, 2.0) as usize,
+            Self::SLOPE => self.slope = slope_from(value),
             _ => {}
         }
     }
@@ -753,14 +599,7 @@ impl Module for Ladder {
         self.cutoff.reset(self.cutoff.target());
         self.resonance.reset(self.resonance.target());
         self.drive.reset(self.drive.target());
-        self.target = self.slope;
-        self.weights = [0.0; 3];
-        self.weights[self.slope] = 1.0;
-        self.from = self.weights;
-        self.fade = 1.0;
-        self.limit = LADDER_K_MAX[self.slope];
-        self.state = [0.0; LADDER_STAGES];
-        self.saturation = 1.0;
+        self.filter.reset(self.slope);
     }
 }
 

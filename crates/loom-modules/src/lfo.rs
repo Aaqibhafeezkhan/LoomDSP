@@ -6,8 +6,9 @@ use loom_core::{
     Channels, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, PortDefault, PortIo,
     PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_dsp::oscillator::SlowWave;
+use loom_dsp::phase::Phasor;
 use loom_rt::Smoothed;
-use std::f64::consts::TAU;
 
 /// `loom.mod.lfo`: a slow periodic signal, free-running or locked to the
 /// transport.
@@ -139,8 +140,8 @@ struct Lfo {
     cycles: f64,
     shape: u8,
     rate: Smoothed,
-    /// The free-running phase, kept in `f64` so it does not drift.
-    phase: f64,
+    /// The free-running phase.
+    phasor: Phasor,
 }
 
 impl Lfo {
@@ -156,28 +157,21 @@ impl Lfo {
             cycles: 1.0,
             shape: 0,
             rate: Smoothed::new(1.0, config.sample_rate, LFO.params[Self::RATE].options.smooth_seconds),
-            phase: 0.0,
+            phasor: Phasor::new(),
         }
     }
 
-    /// The wave at phase `p` in `[0, 1)`. Every shape crosses 0 going up at
-    /// phase 0, so a sine and a triangle line up.
+    /// The wave at phase `p` in `[0, 1)`.
+    #[inline]
     fn wave(shape: u8, p: f64) -> f32 {
-        let fract = |x: f64| x - x.floor();
-        let value = match shape {
-            0 => (TAU * p).sin(),
-            1 => 1.0 - 4.0 * (fract(p + 0.25) - 0.5).abs(),
-            2 => 2.0 * fract(p + 0.5) - 1.0,
-            3 => -(2.0 * fract(p + 0.5) - 1.0),
-            _ => {
-                if p < 0.5 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
+        let wave = match shape {
+            0 => SlowWave::Sine,
+            1 => SlowWave::Triangle,
+            2 => SlowWave::RampUp,
+            3 => SlowWave::RampDown,
+            _ => SlowWave::Square,
         };
-        value as f32
+        wave.value(p)
     }
 }
 
@@ -209,9 +203,8 @@ impl Module for Lfo {
                 if x.is_finite() { x - x.floor() } else { 0.0 }
             } else {
                 // The wave starts at phase 0, then the phase moves on.
-                let p = self.phase;
-                self.phase += rate / self.sample_rate;
-                self.phase -= self.phase.floor();
+                let p = self.phasor.phase();
+                self.phasor.advance(rate / self.sample_rate);
                 p
             };
             out[i] = Self::wave(shape, p);
@@ -236,7 +229,7 @@ impl Module for Lfo {
     }
 
     fn reset(&mut self) {
-        self.phase = 0.0;
+        self.phasor.reset();
         let target = self.rate.target();
         self.rate.reset(target);
     }

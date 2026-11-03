@@ -9,7 +9,7 @@ Two time-domain building blocks (`MT-DELAY-02` and `MT-DELAY-03`) for echoes, ch
 - **Background:** [Delays and interpolation](../learn/delays-and-interpolation.md): how a circular buffer works, why linear interpolation loses high frequencies, why the all-pass needs at least two samples of delay, and how to tune a delay loop.
 - **Prior art:** hardware and modular delay lines with a voltage-controlled time input, and Manfred Schroeder's 1962 reverberation all-pass diffuser. Described in our own words and names.
 - **Issues:** [#40](https://github.com/brylie/LoomDSP/issues/40)
-- **Code:** `crates/loom-modules/src/time.rs`, `crates/loom-modules/tests/reference.rs`, `crates/loom-modules/tests/no_alloc.rs`, `crates/loom-modules/tests/engine.rs`.
+- **Code:** `crates/loom-dsp/src/delay.rs`, `crates/loom-modules/src/time.rs`, `crates/loom-modules/tests/reference.rs`, `crates/loom-modules/tests/no_alloc.rs`, `crates/loom-modules/tests/engine.rs`.
 
 <!-- Spec first: agree on this before building. Keep it true as the code is
      built. See README.md in this folder. -->

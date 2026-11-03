@@ -2094,9 +2094,17 @@ name = "loom-core"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "loom-dsp",
  "loom-rt",
  "rtrb",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "loom-dsp"
+version = "0.1.0"
+dependencies = [
+ "assert_no_alloc",
 ]
 
 [[package]]
@@ -2125,6 +2133,7 @@ dependencies = [
  "criterion",
  "loom-analysis",
  "loom-core",
+ "loom-dsp",
  "loom-modules",
  "loom-patch",
  "loom-rt",

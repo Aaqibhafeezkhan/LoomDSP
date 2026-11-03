@@ -121,7 +121,9 @@ The event that marks the end of a cycle is a **trigger**. In LoomDSP a trigger o
 
 | Piece | What it does |
 |---|---|
-| `loom.phase.generator` | Makes a phase at a pitch. |
+| `loom_dsp::phase::Phasor` | The running phase and its step limit, usable outside a patch. |
+| `loom.phase.generator` | Makes a phase at a pitch, with a `Phasor`. |
+| `loom_dsp::oscillator` | Shapes from a phase. A function takes the true step, and a struct works it out from the last phase. |
 | `loom.phase.trigger` (Phase Trigger) | A trigger on each wrap of its input phase. |
 | `loom.logic.divide` (Clock Divide) | Passes on every Nth trigger. |
 | `loom_core::signal::WrapDetector` | The wrap rule, shared by every module that marks the end of a cycle. |

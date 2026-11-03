@@ -7,7 +7,8 @@
 //! any block size. All memory is allocated when the stage is built, so
 //! nothing here allocates on the audio thread, not even a mode change.
 
-use std::collections::VecDeque;
+use loom_dsp::filter::dc_blocker::DcBlocker;
+use loom_dsp::limiter::{self, Limiter};
 
 /// What the safety stage does to the final output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,10 +98,11 @@ impl SafetyStage {
             pending: None,
             stopping: false,
             silent: false,
-            dc: [DcBlocker::new(sample_rate), DcBlocker::new(sample_rate)],
-            limiter: Limiter::new(sample_rate),
+            dc: [dc_blocker(sample_rate), dc_blocker(sample_rate)],
+            limiter: limiter(sample_rate),
             fade: Fade::new(sample_rate),
         };
+        stage.limiter.set_mode(limiter_mode(mode));
         stage.fade_in();
         stage
     }
@@ -111,7 +113,7 @@ impl SafetyStage {
     fn fade_in(&mut self) {
         self.fade.rising = true;
         self.fade.hold = if self.mode == OutputSafety::Clean {
-            self.limiter.lookahead
+            self.limiter.lookahead()
         } else {
             0
         };
@@ -169,7 +171,7 @@ impl SafetyStage {
             self.mode = mode;
         }
         self.dc.iter_mut().for_each(DcBlocker::reset);
-        self.limiter.reset();
+        self.limiter.set_mode(limiter_mode(self.mode));
         self.fade.position = 0;
         self.fade_in();
     }
@@ -192,7 +194,7 @@ impl SafetyStage {
             if self.mode != OutputSafety::Off {
                 a = self.dc[0].tick(a);
                 b = self.dc[1].tick(b);
-                (a, b) = self.limiter.tick(a, b, self.mode == OutputSafety::Clean);
+                (a, b) = self.limiter.tick(a, b);
             }
             let gain = self.fade.tick();
             *l = (a * gain).clamp(-1.0, 1.0);
@@ -203,7 +205,7 @@ impl SafetyStage {
             {
                 self.mode = mode;
                 self.dc.iter_mut().for_each(DcBlocker::reset);
-                self.limiter.reset();
+                self.limiter.set_mode(limiter_mode(mode));
                 self.fade_in();
             }
         }
@@ -220,142 +222,27 @@ fn sanitize(sample: f32) -> f32 {
     }
 }
 
-/// A first-order high-pass filter: `y[n] = a * (y[n-1] + x[n] - x[n-1])`.
-struct DcBlocker {
-    coefficient: f32,
-    previous_in: f32,
-    previous_out: f32,
+/// The stage's DC blocker (rule 5).
+fn dc_blocker(sample_rate: f32) -> DcBlocker {
+    DcBlocker::new(DC_CUTOFF_HZ, sample_rate)
 }
 
-impl DcBlocker {
-    fn new(sample_rate: f32) -> Self {
-        Self {
-            coefficient: (-std::f32::consts::TAU * DC_CUTOFF_HZ / sample_rate).exp(),
-            previous_in: 0.0,
-            previous_out: 0.0,
-        }
-    }
-
-    fn tick(&mut self, input: f32) -> f32 {
-        // The difference first: added to a large held input, a small output
-        // would round away and stop decaying.
-        let mut output = self.coefficient * (self.previous_out + (input - self.previous_in));
-        // A held offset decays toward 0 for ever. Stop it before it becomes
-        // a denormal, which is slow on some CPUs.
-        if output.abs() < 1e-20 {
-            output = 0.0;
-        }
-        self.previous_in = input;
-        self.previous_out = output;
-        output
-    }
-
-    fn reset(&mut self) {
-        self.previous_in = 0.0;
-        self.previous_out = 0.0;
-    }
+/// The stage's limiter (rule 4).
+fn limiter(sample_rate: f32) -> Limiter {
+    Limiter::new(limiter::Settings {
+        ceiling: CEILING,
+        lookahead: samples(LOOKAHEAD_SECONDS, sample_rate).max(1),
+        release_seconds: RELEASE_SECONDS,
+        sample_rate,
+    })
 }
 
-/// A stereo-linked peak limiter. One gain for both channels, so the stereo
-/// image does not move while it acts.
-///
-/// Without lookahead the gain falls in the sample that goes over. With
-/// lookahead the audio is delayed by `lookahead` samples, and the gain is
-/// the average, over the last `lookahead + 1` samples, of the lowest gain
-/// needed anywhere in the window ahead. Every value in that average is at or
-/// under the gain the delayed sample needs, so the average is too, and it
-/// changes in straight lines rather than steps.
-struct Limiter {
-    /// Gain applied to the last sample, after release.
-    gain: f32,
-    /// Per-sample factor that moves the gain toward 1.
-    release: f32,
-    lookahead: usize,
-    /// Delayed audio, `lookahead` frames.
-    delay: VecDeque<(f32, f32)>,
-    /// Sliding minimum of the needed gain: (sample number, gain), with gains
-    /// rising from front to back.
-    minimum: VecDeque<(u64, f32)>,
-    /// The last `lookahead + 1` window minimums, and their sum.
-    window: VecDeque<f32>,
-    window_sum: f64,
-    /// Samples seen since the last reset.
-    count: u64,
-}
-
-impl Limiter {
-    fn new(sample_rate: f32) -> Self {
-        let lookahead = samples(LOOKAHEAD_SECONDS, sample_rate).max(1);
-        let mut limiter = Self {
-            gain: 1.0,
-            release: (-1.0 / (RELEASE_SECONDS * sample_rate)).exp(),
-            lookahead,
-            delay: VecDeque::with_capacity(lookahead + 1),
-            minimum: VecDeque::with_capacity(lookahead + 2),
-            window: VecDeque::with_capacity(lookahead + 2),
-            window_sum: 0.0,
-            count: 0,
-        };
-        limiter.reset();
-        limiter
-    }
-
-    /// Back to unity gain and silence in the delay line. Keeps capacity, so
-    /// it never allocates.
-    fn reset(&mut self) {
-        self.gain = 1.0;
-        self.delay.clear();
-        self.delay.extend(std::iter::repeat_n((0.0, 0.0), self.lookahead));
-        self.minimum.clear();
-        self.window.clear();
-        self.window.extend(std::iter::repeat_n(1.0, self.lookahead + 1));
-        self.window_sum = (self.lookahead + 1) as f64;
-        self.count = 0;
-    }
-
-    fn tick(&mut self, left: f32, right: f32, lookahead: bool) -> (f32, f32) {
-        let peak = left.abs().max(right.abs());
-        let needed = if peak > CEILING { CEILING / peak } else { 1.0 };
-        let (target, left, right) = if lookahead {
-            self.look_ahead(needed, left, right)
-        } else {
-            (needed, left, right)
-        };
-        let released = 1.0 - (1.0 - self.gain) * self.release;
-        self.gain = target.min(released);
-        // The clamp only trims rounding: `x * (CEILING / x)` can land one
-        // step above the ceiling.
-        (
-            (left * self.gain).clamp(-CEILING, CEILING),
-            (right * self.gain).clamp(-CEILING, CEILING),
-        )
-    }
-
-    /// Pushes one sample in, and returns the gain for the sample coming out
-    /// of the delay line, with that sample.
-    fn look_ahead(&mut self, needed: f32, left: f32, right: f32) -> (f32, f32, f32) {
-        let n = self.count;
-        self.count += 1;
-        while self.minimum.back().is_some_and(|&(_, gain)| gain >= needed) {
-            self.minimum.pop_back();
-        }
-        self.minimum.push_back((n, needed));
-        let oldest = n.saturating_sub(self.lookahead as u64);
-        while self.minimum.front().is_some_and(|&(i, _)| i < oldest) {
-            self.minimum.pop_front();
-        }
-        let lowest = self.minimum.front().map_or(1.0, |&(_, gain)| gain);
-
-        self.window.push_back(lowest);
-        self.window_sum += f64::from(lowest);
-        if let Some(old) = self.window.pop_front() {
-            self.window_sum -= f64::from(old);
-        }
-        let average = (self.window_sum / (self.lookahead + 1) as f64) as f32;
-
-        self.delay.push_back((left, right));
-        let (left, right) = self.delay.pop_front().unwrap_or((0.0, 0.0));
-        (average.min(1.0), left, right)
+/// The limiter's mode for a safety mode. Off does not run the limiter.
+fn limiter_mode(mode: OutputSafety) -> limiter::Mode {
+    if mode == OutputSafety::Clean {
+        limiter::Mode::Lookahead
+    } else {
+        limiter::Mode::Direct
     }
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 use loom_core::testing::run;
+use std::f32::consts::PI;
 use std::f32::consts::TAU;
 
 const RATE: f32 = 48_000.0;
@@ -292,32 +293,6 @@ fn ladder_stays_finite() {
                 );
             }
         }
-    }
-}
-
-/// During a slope change the feedback gain never passes the limit of a
-/// tap that is heard, never jumps, and ends at the new slope's limit.
-#[test]
-fn ladder_slope_change_keeps_the_gain_under_every_heard_limit() {
-    for (from, to) in [(0, 2), (2, 0), (1, 2), (2, 1), (0, 1), (1, 0)] {
-        let mut ladder = Ladder::new(&ModuleConfig {
-            sample_rate: RATE,
-            max_block: 64,
-        });
-        ladder.set_param(SLOPE, from as f32);
-        ladder.reset();
-        ladder.change_slope(to);
-        let mut last = ladder.limit;
-        for _ in 0..2_000 {
-            let k = ladder.step_slope();
-            for (tap, &w) in ladder.weights.iter().enumerate() {
-                assert!(w == 0.0 || k <= LADDER_K_MAX[tap], "{from} to {to}: k {k} on tap {tap}");
-            }
-            assert!((k - last).abs() <= ladder.limit_step * 1.001, "{from} to {to}: jump");
-            last = k;
-        }
-        assert_eq!(ladder.weights[to], 1.0, "{from} to {to}");
-        assert_eq!(last, LADDER_K_MAX[to], "{from} to {to}");
     }
 }
 

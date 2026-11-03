@@ -1,0 +1,25 @@
+# What the algorithms must never touch (ADR-0035). Clippy reads this file from
+# the crate's own directory, so it applies to this crate only. It has no way to
+# ban a whole module, so each entry names what a mistake would most likely use.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "a tick must not lock" },
+    { path = "std::sync::RwLock", reason = "a tick must not lock" },
+    { path = "std::collections::HashMap", reason = "random hashing breaks determinism" },
+    { path = "std::collections::HashSet", reason = "random hashing breaks determinism" },
+    { path = "std::time::Instant", reason = "output must not depend on the clock" },
+    { path = "std::time::SystemTime", reason = "output must not depend on the clock" },
+    { path = "std::fs::File", reason = "algorithms do no I/O" },
+    { path = "std::net::TcpStream", reason = "algorithms do no I/O" },
+    { path = "std::net::TcpListener", reason = "algorithms do no I/O" },
+    { path = "std::net::UdpSocket", reason = "algorithms do no I/O" },
+    { path = "std::thread::Thread", reason = "algorithms have no threads, and WebAssembly has none" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "algorithms have no threads, and WebAssembly has none" },
+    { path = "std::thread::sleep", reason = "a tick must not wait" },
+    { path = "std::fs::read", reason = "algorithms do no I/O" },
+    { path = "std::fs::read_to_string", reason = "algorithms do no I/O" },
+    { path = "std::fs::write", reason = "algorithms do no I/O" },
+    { path = "std::env::var", reason = "output must not depend on the environment" },
+    { path = "std::env::var_os", reason = "output must not depend on the environment" },
+]

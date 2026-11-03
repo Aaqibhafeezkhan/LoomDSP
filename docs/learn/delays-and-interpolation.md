@@ -3,7 +3,7 @@
 How a delay line works inside a circular buffer, why moving the delay time needs cubic interpolation, why a delay-based all-pass needs at least two samples of delay, and how to tune a delay inside a feedback loop.
 
 - **Used by:** [Delay line and all-pass spec](../design/delay.md), [Module catalogue](../product/module-catalogue.md) (`MT-DELAY-02`, `MT-DELAY-03`).
-- **Code:** [`crates/loom-modules/src/time.rs`](../../crates/loom-modules/src/time.rs).
+- **Code:** [`crates/loom-dsp/src/delay.rs`](../../crates/loom-dsp/src/delay.rs), [`crates/loom-modules/src/time.rs`](../../crates/loom-modules/src/time.rs).
 
 ## A circular buffer moves two pointers, not the audio
 

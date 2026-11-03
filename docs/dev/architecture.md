@@ -7,6 +7,7 @@ How LoomDSP's code fits together, for people who want to change it. Read [AGENTS
 ```mermaid
 flowchart BT
     rt[loom-rt<br/>real-time helpers]
+    dsp[loom-dsp<br/>pure DSP algorithms]
     core[loom-core<br/>module API, graph,<br/>compiler, engine]
     modules[loom-modules<br/>built-in modules]
     patch[loom-patch<br/>RON patch files]
@@ -17,8 +18,8 @@ flowchart BT
     cli[loom-cli<br/>the loom tool]
     app[loom-app<br/>desktop app]
 
-    core --> rt
-    modules --> core
+    core --> rt & dsp
+    modules --> core & dsp
     patch --> core
     test --> core
     analysis --> core
@@ -30,6 +31,7 @@ flowchart BT
 | Crate | Job | Rules |
 |---|---|---|
 | `loom-rt` | Small real-time helpers: denormal flushing, parameter smoothing. | No dependencies on the rest. |
+| `loom-dsp` | Pure DSP algorithms with no ports or graph (ADR-0035, [spec](../design/dsp-algorithms.md)). Modules wrap them. | No dependency that reaches users, no `unsafe`, and no allocation after `new`, each enforced by a check. Same real-time rules as `loom-core`. |
 | `loom-core` | The `Module` trait, the editable `Graph`, the compiler, the `Engine` that runs on the audio thread, and the `Controller` that edits it. | Portable: builds for WebAssembly. No threads, files, or audio APIs. |
 | `loom-modules` | Every built-in module, plus integration tests and benchmarks. The `test-modules` feature adds `test_modules`, modules with IDs under `test.` for tests and `loom-app --test-modules`. | Same as `loom-core`. |
 | `loom-patch` | Loads, saves, and migrates patch files. | Same as `loom-core`. |
