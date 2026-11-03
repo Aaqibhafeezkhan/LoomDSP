@@ -91,7 +91,9 @@ fn panel_view(d: &ModuleDescriptor) -> PanelView {
                     WidgetViewKind::Knob { steps }
                 }
                 WidgetKind::Toggle => WidgetViewKind::Toggle,
-                WidgetKind::Meter => WidgetViewKind::Meter,
+                WidgetKind::Meter => WidgetViewKind::Meter {
+                    zero: d.meter_display(w).map_or(0.0, |display| display.range.zero()),
+                },
                 WidgetKind::Scope => WidgetViewKind::Scope,
                 WidgetKind::Shape { width, .. } => WidgetViewKind::Shape { width },
                 // The names come from the parameter (panels.md, Choice names).
@@ -131,7 +133,7 @@ fn panel_view(d: &ModuleDescriptor) -> PanelView {
                 output.map_or((label, HoverText::default()), |p| {
                     (label, HoverText::new(label, p.description, p.name))
                 })
-            } else if w.shows_output() {
+            } else if w.shows_output() && d.meter_display(w).is_none() {
                 // A meter's or scope's text is its output's: two texts for
                 // one signal could disagree. A scope has no caption: its
                 // frame fills the widget.
@@ -310,6 +312,7 @@ pub fn update_panel_values_dragging(
     dragging: Option<loom_core::AssignmentId>,
 ) {
     let reaches = crate::modulation::reaches(controller.graph());
+    let sample_rate = controller.config().sample_rate;
     // The dragged knob's arc shows only the dragged assignment. Whether it
     // shows the live dot still depends on all of them.
     let dragged = dragging
@@ -322,7 +325,7 @@ pub fn update_panel_values_dragging(
                 WidgetValue {
                     shape: (0..=SHAPE_SEGMENTS)
                         .map(|i| {
-                            let y = sample(&node.params, i as f32 / SHAPE_SEGMENTS as f32);
+                            let y = sample(&node.params, i as f32 / SHAPE_SEGMENTS as f32, sample_rate);
                             if y.is_finite() { y.clamp(0.0, 1.0) } else { 0.0 }
                         })
                         .collect(),
@@ -360,12 +363,18 @@ pub fn update_panel_values_dragging(
                         }
                     }
                     _ => {
-                        let (position, peak, right) = shown.get(&(id.0, index)).copied().unwrap_or_default();
+                        let (stored, peak, right) = shown.get(&(id.0, index)).copied().unwrap_or_default();
+                        // A display value arrives as stored. A meter draws its
+                        // place in the range (panel-widgets.md), and its text
+                        // says the value, even past the end of the range.
+                        let position = d
+                            .meter_display(w)
+                            .map_or(stored, |display| display.range.position(stored));
                         WidgetValue {
                             position,
                             peak,
                             right,
-                            text: display_text(d, w, position, right),
+                            text: display_text(d, w, stored, right),
                             ..WidgetValue::default()
                         }
                     }
@@ -396,11 +405,17 @@ fn driven_run(controller: &Controller, id: ModuleId, w: &loom_core::Widget) -> O
 
 /// The value line of a light's or meter's hover text: the label and the
 /// value. A light shows its brightness as a number, or "lit" and "dark" for
-/// a trigger. A meter shows its RMS level in dB.
+/// a trigger. A meter shows its RMS level in dB, and a meter on a display value
+/// shows that value. `position` is the value as stored.
 fn display_text(d: &ModuleDescriptor, w: &loom_core::Widget, position: f32, right: Option<(f32, f32)>) -> String {
     if w.kind == WidgetKind::Scope {
         // The trace is the value.
         return String::new();
+    }
+    if let Some(display) = d.meter_display(w) {
+        return format!("{}: {position:.1} {}", display.label, display.range.unit)
+            .trim_end()
+            .to_string();
     }
     if w.kind == WidgetKind::Meter {
         let label = d.outputs.iter().find(|p| p.name == w.bind).map_or(w.bind, |p| p.label);

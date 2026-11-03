@@ -5,7 +5,8 @@
 //! Every message to the app redraws the window, so a plain timer would draw
 //! 30 frames a second even when nothing moves. This watcher reads the
 //! engine's display table on its own thread and sends a message only when a
-//! light's brightness changes by at least one of 256 levels.
+//! light's brightness, or a meter's place in its range, changes by at least
+//! one of 256 levels.
 //!
 //! A trigger light holds its flash: a read of 1.0 lights it at full, and it
 //! fades to dark over [`FADE`]. The watcher is the only reader of trigger
@@ -14,7 +15,7 @@
 
 use iced::futures::Stream;
 use iced::futures::channel::mpsc;
-use loom_core::{DisplayKind, DisplayReader, DisplaySource};
+use loom_core::{DisplayKind, DisplayRange, DisplayReader, DisplaySource, ModuleDescriptor, Widget};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,9 @@ pub type Light = (u32, usize);
 pub struct Watch {
     pub reader: DisplayReader,
     pub lights: Vec<(Light, DisplaySource)>,
+    /// The range of each entry in `lights`, if it has one (see [`range`]). A
+    /// meter on a display value may read outside 0 to 1.
+    pub ranges: Vec<Option<DisplayRange>>,
     /// Counts the engines the app has built. A new engine numbers its modules
     /// from 1 again, so the same lights can read a different table.
     pub generation: u64,
@@ -106,10 +110,31 @@ pub fn level(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// The drawn levels of `readings`, if any differs from `last`.
-pub fn changed(last: &[Option<u8>], readings: &[f32]) -> Option<Vec<Option<u8>>> {
-    let levels: Vec<Option<u8>> = readings.iter().map(|&r| Some(level(r))).collect();
-    (levels != last).then_some(levels)
+/// The range a change in `widget`'s value is measured in, if it has one: what
+/// it shows. A meter on a display value shows its place in the value's range. A
+/// light has none, as it draws its value as brightness, whatever the range.
+pub fn range(descriptor: &ModuleDescriptor, widget: &Widget) -> Option<DisplayRange> {
+    descriptor.meter_display(widget).map(|display| display.range)
+}
+
+/// A reading as a step that shows. A light has 256 levels. A meter has as many
+/// steps across its range, and more past its ends: the bar stops there, but its
+/// text still says the value.
+fn step(reading: f32, range: Option<DisplayRange>) -> i32 {
+    match range {
+        Some(range) => ((reading - range.min) / (range.max - range.min) * 255.0).round() as i32,
+        None => i32::from(level(reading)),
+    }
+}
+
+/// The steps of `readings`, if any differs from `last`.
+pub fn changed(last: &[Option<i32>], readings: &[f32], ranges: &[Option<DisplayRange>]) -> Option<Vec<Option<i32>>> {
+    let steps: Vec<Option<i32>> = readings
+        .iter()
+        .zip(ranges)
+        .map(|(&reading, &range)| Some(step(reading, range)))
+        .collect();
+    (steps != last).then_some(steps)
 }
 
 /// Reads the lights every [`INTERVAL`] and yields their values when one
@@ -124,7 +149,7 @@ pub fn stream(watch: &Watch) -> impl Stream<Item = Vec<(Light, f32)>> + use<> {
         while !tx.is_closed() {
             let snapshot = watch.shown(&mut fades, Instant::now());
             let readings: Vec<f32> = snapshot.iter().map(|&(_, r)| r).collect();
-            if let Some(levels) = changed(&last, &readings) {
+            if let Some(levels) = changed(&last, &readings, &watch.ranges) {
                 match tx.try_send(snapshot) {
                     Ok(()) => last = levels,
                     // The UI has not taken the last one yet: try again next

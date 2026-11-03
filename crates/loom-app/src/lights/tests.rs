@@ -2,13 +2,44 @@ use super::*;
 
 #[test]
 fn only_visible_changes_are_sent() {
-    let first = changed(&[None, None], &[0.0, 1.0]).expect("the first reading is sent");
+    let ranges = [None; 2];
+    let first = changed(&[None, None], &[0.0, 1.0], &ranges).expect("the first reading is sent");
     assert_eq!(first, vec![Some(0), Some(255)]);
     // Less than one level of 256: not drawn, not sent.
-    assert_eq!(changed(&first, &[0.001, 0.999]), None);
-    assert_eq!(changed(&first, &[0.5, 1.0]), Some(vec![Some(128), Some(255)]));
+    assert_eq!(changed(&first, &[0.001, 0.999], &ranges), None);
+    assert_eq!(changed(&first, &[0.5, 1.0], &ranges), Some(vec![Some(128), Some(255)]));
     // Out of range values are clamped, as the light draws them.
-    assert_eq!(changed(&first, &[-3.0, 7.0]), None);
+    assert_eq!(changed(&first, &[-3.0, 7.0], &ranges), None);
+}
+
+/// A meter on a display value moves within its own range, so a value below 0
+/// is a visible change. Clamped to 0..1, every such value would read the same.
+#[test]
+fn a_change_is_measured_in_the_range_of_the_value() {
+    let ranges = [Some(DisplayRange {
+        min: -36.0,
+        max: 0.0,
+        unit: "dB",
+    })];
+    let first = changed(&[None], &[0.0], &ranges).expect("the first reading is sent");
+    assert_eq!(first, vec![Some(255)]);
+    assert_eq!(changed(&first, &[-18.0], &ranges), Some(vec![Some(128)]));
+    // Less than one level of 256 is about 0.14 dB here.
+    assert_eq!(changed(&first, &[-0.01], &ranges), None);
+    // Past the end of the range the bar stops, but the text changes.
+    let far = changed(&first, &[-40.0], &ranges).expect("a change of text is sent");
+    assert!(changed(&far, &[-60.0], &ranges).is_some());
+    assert_eq!(changed(&far, &[-40.01], &ranges), None);
+}
+
+/// A meter measures a change in the display value's range. A light on the same
+/// value measures it as brightness, because that is what it draws.
+#[test]
+fn a_light_compares_brightness_and_a_meter_its_range() {
+    let d = &loom_modules::dynamics::DYNAMICS;
+    let meter = range(d, &Widget::meter(0, 0, "reduction")).expect("a meter has a range");
+    assert_eq!(meter.min, -36.0);
+    assert_eq!(range(d, &Widget::light(0, 0, "reduction")), None);
 }
 
 /// A flash starts at full and is dark 120 ms later. A new flash starts
@@ -38,7 +69,7 @@ fn a_faded_light_asks_for_no_more_frames() {
         let now = start + INTERVAL * tick;
         // One trigger, read at the first tick.
         let reading = if tick == 0 { 1.0 } else { 0.0 };
-        if let Some(levels) = changed(&last, &[fade.brightness(reading, now)]) {
+        if let Some(levels) = changed(&last, &[fade.brightness(reading, now)], &[None]) {
             sent.push(tick);
             last = levels;
         }
