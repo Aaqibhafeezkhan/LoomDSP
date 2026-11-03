@@ -1,7 +1,7 @@
 //! The patch canvas widget: input handling and drawing.
 
 use crate::camera::Camera;
-use crate::controls::{ControlGeometry, PanelValues, focus_ring, knob_drag, knob_step, radio_option, select_box};
+use crate::controls::{ControlGeometry, PanelValues, ValueDrag, focus_ring, knob_step, radio_option, select_box};
 use crate::gpu::{Cable, CanvasPrimitive, Geometry, Overlay, Shape};
 use crate::hover::{HOVER_PADDING, HOVER_TEXT_PX, HoverTarget, HoverTimer};
 use crate::scene::{
@@ -28,6 +28,8 @@ mod event;
 mod hover_text;
 mod input;
 mod panel_input;
+mod select_popup;
+mod typed_field;
 
 pub use event::CanvasEvent;
 
@@ -70,6 +72,9 @@ pub struct LearnView {
     pub labels: BTreeMap<(u32, usize), String>,
 }
 
+/// Says why typed text is not a value of a control: module, widget, text.
+type TypedCheck<'a> = Box<dyn Fn(u32, usize, &str) -> Result<(), String> + 'a>;
+
 /// The patch canvas. Draws a [`Scene`] and reports gestures as
 /// [`CanvasEvent`]s.
 pub struct PatchCanvas<'a, Message> {
@@ -92,6 +97,10 @@ pub struct PatchCanvas<'a, Message> {
     matrix_escape: bool,
     /// Leaves unmodified keys to the focused matrix while keeping pointer input active.
     matrix_keyboard: bool,
+    /// An app text field has focus, so its keys never act on the canvas.
+    text_field_keys: bool,
+    /// The check for typed values. See [`PatchCanvas::typed_check`].
+    typed_check: Option<TypedCheck<'a>>,
     still: Option<Still>,
     window_drag_line: bool,
 }
@@ -175,7 +184,7 @@ pub enum PointerDrag {
     Move(Vec<u32>),
     /// A growable tile is being resized.
     Resize(u32),
-    /// A knob is turned: module ID and widget index.
+    /// A knob or a fader is dragged: module ID and widget index.
     Knob(u32, usize),
     /// A button is held: module ID and widget index.
     Button(u32, usize),
@@ -186,7 +195,8 @@ pub enum PointerDrag {
         /// True when the cable was pulled off an input.
         pulled: bool,
     },
-    /// A knob's range arc is dragged: module ID and widget index.
+    /// A knob's range arc or a fader's bar is dragged: module ID and widget
+    /// index.
     Depth(u32, usize),
     /// A selection box is drawn.
     Select,
@@ -239,6 +249,8 @@ impl<'a, Message> PatchCanvas<'a, Message> {
             matrix_line: None,
             matrix_escape: false,
             matrix_keyboard: false,
+            text_field_keys: false,
+            typed_check: None,
             still: None,
             window_drag_line: false,
         }
@@ -276,6 +288,23 @@ impl<'a, Message> PatchCanvas<'a, Message> {
     /// Leaves unmodified keyboard input to the matrix without blocking the pointer.
     pub fn matrix_keyboard(mut self, enabled: bool) -> Self {
         self.matrix_keyboard = enabled;
+        self
+    }
+
+    /// Says that an app text field has focus. The canvas then leaves every key
+    /// press to it except Tab, which moves focus as usual. The pointer still
+    /// works (panel-widgets.md, Typing a value).
+    pub fn text_field_keys(mut self, enabled: bool) -> Self {
+        self.text_field_keys = enabled;
+        self
+    }
+
+    /// Sets the check for typed values: given a module, a widget, and the
+    /// text, why it is not a value. The field shows the reason and Enter does
+    /// nothing (panel-widgets.md, Typing a value). Only the app knows the
+    /// parameter, so the canvas asks.
+    pub fn typed_check(mut self, check: impl Fn(u32, usize, &str) -> Result<(), String> + 'a) -> Self {
+        self.typed_check = Some(Box::new(check));
         self
     }
 
@@ -460,8 +489,10 @@ enum Interaction {
     Turning {
         module: u32,
         widget: usize,
-        /// Pointer height on screen at the last move.
-        last_y: f32,
+        /// How pointer movement changes the value.
+        drag: ValueDrag,
+        /// Where the pointer was along the drag at the last move.
+        last: f32,
         position: f32,
     },
     /// A button is held. Pointer up reports a release, wherever the pointer
@@ -475,18 +506,36 @@ enum Interaction {
         /// cable (modulation.md, Making an assignment).
         pulled: bool,
     },
-    /// Dragging a knob's range arc: its depth, not its value.
+    /// Dragging a knob's range arc or a fader's bar: its depth, not its value.
     Depth {
         module: u32,
         widget: usize,
-        /// Pointer height on screen at the last move.
-        last_y: f32,
+        /// How pointer movement changes the depth.
+        drag: ValueDrag,
+        /// Where the pointer was along the drag at the last move.
+        last: f32,
     },
     Selecting {
         start: Point,
         current: Point,
         base: BTreeSet<u32>,
     },
+}
+
+impl Interaction {
+    /// The cursor during this gesture, or `None` with no gesture. A value drag
+    /// shows its own direction, so a horizontal fader keeps the cursor it had
+    /// on hover.
+    fn cursor(&self) -> Option<mouse::Interaction> {
+        Some(match self {
+            Self::Panning { .. } | Self::Moving { .. } => mouse::Interaction::Grabbing,
+            Self::Resizing { .. } => mouse::Interaction::ResizingDiagonallyDown,
+            Self::Turning { drag, .. } | Self::Depth { drag, .. } => drag.cursor(),
+            Self::Holding { .. } => mouse::Interaction::Pointer,
+            Self::Wiring { .. } | Self::Selecting { .. } => mouse::Interaction::Crosshair,
+            Self::Idle => return None,
+        })
+    }
 }
 
 /// What a stationary click on a choice control does.
@@ -502,11 +551,17 @@ struct SelectPopup {
     module: u32,
     widget: usize,
     highlight: usize,
+    /// The first row that shows, for a list longer than it can show.
+    scroll: usize,
+    /// Wheel movement that has not yet made a whole row.
+    wheel: f32,
 }
 
 #[derive(Default)]
 struct State {
     camera: Camera,
+    /// The canvas size at the last event, for key handling that needs it.
+    size: Size,
     framed_key: Option<u64>,
     interaction: Interaction,
     /// A release after CursorLeft cannot target the inspector until the
@@ -526,6 +581,8 @@ struct State {
     focus: Option<(u32, usize)>,
     /// Open select list, if any.
     select_popup: Option<SelectPopup>,
+    /// The open field for a typed value, if any.
+    typed: Option<typed_field::TypedField>,
     /// True when the focus came from Tab, so its hover text shows. A click
     /// also focuses a control, but the pointer is on it then.
     tab_focus: bool,
@@ -661,15 +718,10 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
-        match state.interaction {
-            Interaction::Panning { .. } | Interaction::Moving { .. } => mouse::Interaction::Grabbing,
-            Interaction::Resizing { .. } => mouse::Interaction::ResizingDiagonallyDown,
-            Interaction::Turning { .. } | Interaction::Depth { .. } => mouse::Interaction::ResizingVertically,
-            Interaction::Holding { .. } => mouse::Interaction::Pointer,
-            Interaction::Wiring { .. } => mouse::Interaction::Crosshair,
-            Interaction::Selecting { .. } => mouse::Interaction::Crosshair,
-            Interaction::Idle if cursor.is_over(layout.bounds()) => self.hover_interaction(state),
-            Interaction::Idle => mouse::Interaction::default(),
+        match state.interaction.cursor() {
+            Some(gesture) => gesture,
+            None if cursor.is_over(layout.bounds()) => self.hover_interaction(state),
+            None => mouse::Interaction::default(),
         }
     }
 
@@ -740,6 +792,8 @@ where
             Detail::Middle => geometry.bars(true, false),
             Detail::Far => geometry.bars(true, true),
         };
+        // A box's text bar draws over the box, and only at middle zoom.
+        let value_bars = geometry.value_bars(detail(state.camera.zoom) == Detail::Middle);
 
         renderer.fill_quad(
             renderer::Quad {
@@ -756,12 +810,14 @@ where
                 traces,
                 overlay: self.overlay_in(state, state.camera.visible(bounds.size())),
                 bars,
+                value_bars,
                 camera: state.camera,
                 cable_dim: CABLE_OPACITY,
             },
         );
         self.draw_text(state, values, renderer, bounds);
         self.draw_select_popup(state, renderer, bounds);
+        self.draw_typed_field(state, renderer, bounds);
         self.draw_hover_text(state, renderer, bounds);
     }
 }
