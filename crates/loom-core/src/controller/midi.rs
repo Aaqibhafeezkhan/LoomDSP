@@ -7,6 +7,17 @@ use super::*;
 /// MIDI mappings and learn (`docs/design/midi-learn.md`), and the MIDI
 /// inputs the engine listens to.
 impl Controller {
+    /// Maps a hardware control to a parameter, with the default options. See
+    /// [`Controller::map_midi_with`].
+    pub fn map_midi(
+        &mut self,
+        control: MidiControl,
+        target: ModuleId,
+        param: usize,
+    ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
+        self.map_midi_with(control, target, param, MidiMappingOptions::DEFAULT)
+    }
+
     /// Maps a hardware control to a parameter. Takes effect on the next
     /// [`Controller::commit`].
     ///
@@ -14,15 +25,17 @@ impl Controller {
     /// removes any mapping on the parameter and any mapping on the control.
     /// Those are returned, at most two, so the UI can say what moved.
     /// Spec: `docs/design/midi-learn.md`.
-    pub fn map_midi(
+    pub fn map_midi_with(
         &mut self,
         control: MidiControl,
         target: ModuleId,
         param: usize,
+        options: MidiMappingOptions,
     ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
         if !control.is_valid() {
             return Err(LoomError::InvalidMidiControl(control));
         }
+        options.check().map_err(LoomError::InvalidMidiOptions)?;
         self.check_target(target, param)?;
         let replaced: Vec<MidiMappingId> = self
             .graph
@@ -38,41 +51,131 @@ impl Controller {
             })
             .collect();
         let id = self.midi.new_mapping();
-        self.graph
-            .midi_mappings
-            .insert(id, MidiMapping { control, target, param });
+        self.graph.midi_mappings.insert(
+            id,
+            MidiMapping {
+                control,
+                target,
+                param,
+                options,
+                learned: false,
+            },
+        );
         self.dirty = true;
         Ok((id, removed))
     }
 
-    /// Maps a hardware control to a parameter by name.
+    /// Maps a hardware control to a parameter by name, with the default
+    /// options.
     pub fn map_midi_named(
         &mut self,
         control: MidiControl,
         target: ModuleId,
         param: &str,
     ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
+        self.map_midi_named_with(control, target, param, MidiMappingOptions::DEFAULT)
+    }
+
+    /// Maps a hardware control to a parameter by name.
+    pub fn map_midi_named_with(
+        &mut self,
+        control: MidiControl,
+        target: ModuleId,
+        param: &str,
+        options: MidiMappingOptions,
+    ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
         let param = self.param_index(target, param)?;
-        self.map_midi(control, target, param)
+        self.map_midi_with(control, target, param, options)
+    }
+
+    /// Changes the options of the mapping on a parameter, and returns its new
+    /// id, or `None` if the parameter has no mapping. Takes effect on the next
+    /// [`Controller::commit`].
+    ///
+    /// New options make a new mapping for the engine, so its state starts
+    /// again and a Pickup waits (spec, Mapping modes).
+    pub fn set_midi_options(
+        &mut self,
+        target: ModuleId,
+        param: usize,
+        options: MidiMappingOptions,
+    ) -> Result<Option<MidiMappingId>, LoomError> {
+        options.check().map_err(LoomError::InvalidMidiOptions)?;
+        self.check_param(target, param)?;
+        let Some((id, mapping)) = self.graph.midi_mapping_of(target, param) else {
+            return Ok(None);
+        };
+        if mapping.options == options {
+            return Ok(Some(id));
+        }
+        let mapping = MidiMapping {
+            options,
+            learned: false,
+            ..*mapping
+        };
+        Ok(Some(self.renew_midi_mapping(id, mapping)))
+    }
+
+    /// Gives a mapping a new id, so the engine starts its state again.
+    pub(super) fn renew_midi_mapping(&mut self, id: MidiMappingId, mapping: MidiMapping) -> MidiMappingId {
+        self.midi.forget(id);
+        self.graph.midi_mappings.remove(&id);
+        let id = self.midi.new_mapping();
+        self.graph.midi_mappings.insert(id, mapping);
+        self.dirty = true;
+        id
     }
 
     /// Finishes MIDI learn: maps the control that moved to a parameter, and
-    /// sets the parameter from that control change, so the user hears at
-    /// once that the link works. Commit afterwards.
+    /// sets the parameter from that control change as the mapping's mode
+    /// would, so the user hears at once that the link works. A control that
+    /// was mapped elsewhere keeps its options, because they describe the
+    /// hardware. A new control starts at the defaults. Commit afterwards.
     pub fn learn_midi(
         &mut self,
         seen: ControlChangeSeen,
         target: ModuleId,
         param: usize,
     ) -> Result<(MidiMappingId, Vec<MidiMapping>), LoomError> {
-        let result = self.map_midi(seen.control, target, param)?;
+        let options = self
+            .graph
+            .midi_mapping_on(seen.control)
+            .map_or(MidiMappingOptions::DEFAULT, |(_, mapping)| mapping.options);
+        let result = self.map_midi_with(seen.control, target, param, options)?;
+        if let Some(mapping) = self.graph.midi_mappings.get_mut(&result.0) {
+            mapping.learned = true;
+        }
         // The control spans the selected range (control-ranges.md, rule 4).
-        let spec = self.node(target)?.spec(param).ok_or_else(|| LoomError::NoSuchParam {
+        let node = self.node(target)?;
+        let spec = node.spec(param).ok_or_else(|| LoomError::NoSuchParam {
             module: target,
             param: param.to_string(),
         })?;
-        self.set_param(target, param, control_value(&spec, seen.value))?;
+        // The engine has no state for this mapping yet, so use the same steps
+        // on a state that starts from the parameter's value, not waiting.
+        let current = node.params[param];
+        let mut state = ControlState::seeded(result.0, &spec, current, false);
+        if let ControlOutcome::Set(value) = state.control_change(&options, &spec, seen.value) {
+            self.set_param(target, param, value)?;
+        }
         Ok(result)
+    }
+
+    /// The pickups that are waiting and whose hardware has moved, for the
+    /// ghost marks. The UI decides how long a mark stays.
+    pub fn midi_waiting(&self) -> Vec<MidiWaiting> {
+        self.graph
+            .midi_mappings()
+            .filter_map(|(id, mapping)| {
+                let entry = self.midi.feedback().read(mapping.control);
+                (entry.id == id && entry.waiting).then(|| MidiWaiting {
+                    target: mapping.target,
+                    param: mapping.param,
+                    position: mapping.options.position(entry.value),
+                    sequence: entry.sequence,
+                })
+            })
+            .collect()
     }
 
     /// Removes the MIDI mapping on a parameter, if there is one. Takes effect
@@ -262,11 +365,17 @@ impl MidiSync {
             if entry.id == id {
                 self.seen.insert(id, entry.sequence);
             }
+            // A waiting pickup set nothing in the engine, so a newer screen
+            // edit in the graph must stay. Otherwise the graph takes exactly
+            // what the engine set, and maps nothing itself.
             if apply
-                && let Some(node) = graph.nodes.get_mut(&mapping.target)
-                && let Some(spec) = node.spec(mapping.param)
+                && !entry.waiting
+                && let Some(value) = graph
+                    .nodes
+                    .get_mut(&mapping.target)
+                    .and_then(|node| node.params.get_mut(mapping.param))
             {
-                node.params[mapping.param] = control_value(&spec, entry.value);
+                *value = self.feedback.result(mapping.control);
                 changed.push((mapping.target, mapping.param));
             }
         }

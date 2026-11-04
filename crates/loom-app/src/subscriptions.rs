@@ -161,12 +161,15 @@ impl App {
             };
             Subscription::run_with(watch, learn::stream).map(|_| Message::Midi)
         });
+        // Runs only while a ghost mark shows, so an idle app stays idle.
+        let ghosts = (!self.learn.ghosts().shown().is_empty())
+            .then(|| iced::time::every(learn::GHOST_CHECK).map(|_| Message::MidiGhosts));
         let input = [self.input_subscription(), always_subscription()];
         // The timer runs only while a drop is being collected, so an idle
         // app stays idle.
         let drops_done = (!self.drops.is_empty())
             .then(|| iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::DropsDone));
-        Subscription::batch(watch.into_iter().chain(input).chain(drops_done))
+        Subscription::batch(watch.into_iter().chain(ghosts).chain(input).chain(drops_done))
     }
 
     /// The listener for input that depends on who has it. Its messages say who
