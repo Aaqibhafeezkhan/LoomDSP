@@ -293,7 +293,7 @@ pub struct ParamOptions {
 }
 
 /// A condition on one choice parameter of the same module (ADR-0030).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShownWhen {
     /// The choice parameter's name.
     pub param: &'static str,
@@ -1043,6 +1043,10 @@ pub struct Widget {
     /// principle 10). Hover text and the inspector keep the full label.
     /// `Some("")` shows no caption. Set with [`Widget::captioned`].
     pub caption: Option<&'static str>,
+    /// When a display widget shows: only while this choice parameter holds
+    /// one of these choices. `None` always shows. A control follows its
+    /// parameter's `shown_when` instead. Set with [`Widget::shown_when`].
+    pub shown_when: Option<ShownWhen>,
 }
 
 impl Widget {
@@ -1082,6 +1086,43 @@ impl Widget {
         self
     }
 
+    /// The same display widget, shown only while the choice parameter `param`
+    /// holds one of `choices`, counted from 0. Its columns close up when it
+    /// hides, so the panel gets narrower (panel-widgets.md, Level history).
+    /// The registry refuses it on a control, which follows its parameter's
+    /// `shown_when`.
+    pub const fn shown_when(mut self, param: &'static str, choices: &'static [u32]) -> Self {
+        self.shown_when = Some(ShownWhen { param, choices });
+        self
+    }
+
+    /// A spectrum on output `output`: its frequency content, from a scope
+    /// probe (panel-widgets.md, Spectrum).
+    pub const fn spectrum(x: u8, y: u8, output: &'static str) -> Self {
+        Self {
+            kind: WidgetKind::Spectrum,
+            x,
+            y,
+            bind: output,
+            caption: None,
+            shown_when: None,
+        }
+    }
+
+    /// A level history on output `output`: its RMS and peak over the last
+    /// seconds, from the same probe as a meter (panel-widgets.md, Level
+    /// history).
+    pub const fn level_history(x: u8, y: u8, output: &'static str) -> Self {
+        Self {
+            kind: WidgetKind::LevelHistory,
+            x,
+            y,
+            bind: output,
+            caption: None,
+            shown_when: None,
+        }
+    }
+
     /// An XY pad: `horizontal` follows the point left and right, and `vertical`
     /// up and down. Neither parameter's label names the pair, so it takes its
     /// own caption (panel-widgets.md, XY pad).
@@ -1092,6 +1133,7 @@ impl Widget {
             y,
             bind: horizontal,
             caption: Some(caption),
+            shown_when: None,
         }
     }
 
@@ -1105,6 +1147,7 @@ impl Widget {
             y,
             bind: low,
             caption: Some(caption),
+            shown_when: None,
         }
     }
 
@@ -1116,6 +1159,7 @@ impl Widget {
             y,
             bind: low,
             caption: Some(caption),
+            shown_when: None,
         }
     }
 
@@ -1127,6 +1171,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1139,6 +1184,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1150,6 +1196,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1162,6 +1209,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1173,6 +1221,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1187,6 +1236,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1199,6 +1249,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1210,6 +1261,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1221,6 +1273,7 @@ impl Widget {
             y,
             bind: display,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1234,6 +1287,7 @@ impl Widget {
             y,
             bind: display,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1245,6 +1299,7 @@ impl Widget {
             y,
             bind: output,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1257,6 +1312,7 @@ impl Widget {
             y,
             bind: output,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1279,6 +1335,7 @@ impl Widget {
             y,
             bind: output,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1298,6 +1355,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1311,6 +1369,7 @@ impl Widget {
             y,
             bind: param,
             caption: None,
+            shown_when: None,
         }
     }
 
@@ -1322,15 +1381,20 @@ impl Widget {
                 | WidgetKind::Readout { .. }
                 | WidgetKind::Meter
                 | WidgetKind::Scope
+                | WidgetKind::LevelHistory
+                | WidgetKind::Spectrum
                 | WidgetKind::Shape { .. }
         )
     }
 
     /// True for widgets that can be bound to one of the module's outputs, fed
-    /// by a port probe: meters and scopes. A meter can show a display value
-    /// instead: see [`ModuleDescriptor::meter_display`].
+    /// by a port probe: meters, scopes, level histories, and spectra. A meter can show
+    /// a display value instead: see [`ModuleDescriptor::meter_display`].
     pub const fn shows_output(&self) -> bool {
-        matches!(self.kind, WidgetKind::Meter | WidgetKind::Scope)
+        matches!(
+            self.kind,
+            WidgetKind::Meter | WidgetKind::Scope | WidgetKind::LevelHistory | WidgetKind::Spectrum
+        )
     }
 }
 
@@ -1373,6 +1437,13 @@ pub enum WidgetKind {
     /// One of the module's outputs over time, from a port probe: a
     /// triggered trace in a frame.
     Scope,
+    /// One of the module's outputs over the last seconds, from a port probe:
+    /// RMS as a filled shape and the peak as a line (panel-widgets.md, Level
+    /// history).
+    LevelHistory,
+    /// The frequency content of one of the module's outputs, from a port probe
+    /// (panel-widgets.md, Spectrum).
+    Spectrum,
     /// Read-only shape sampled from the module's parameters on the UI thread.
     Shape {
         /// Width in panel grid units.
@@ -1463,7 +1534,9 @@ impl PartialEq for WidgetKind {
             | (Self::Select, Self::Select)
             | (Self::Light, Self::Light)
             | (Self::Meter, Self::Meter)
-            | (Self::Scope, Self::Scope) => true,
+            | (Self::Scope, Self::Scope)
+            | (Self::LevelHistory, Self::LevelHistory)
+            | (Self::Spectrum, Self::Spectrum) => true,
             (Self::Segmented { width: a }, Self::Segmented { width: b }) => a == b,
             // Kinds compare their visible form. Function addresses are not
             // stable identities for a shape sampler across codegen units.
@@ -1602,6 +1675,8 @@ impl ModuleDescriptor {
             WidgetKind::Readout { width } => (width, 2),
             WidgetKind::Meter => (3, 6),
             WidgetKind::Scope => (9, 5),
+            WidgetKind::LevelHistory => (9, 6),
+            WidgetKind::Spectrum => (9, 5),
             WidgetKind::Shape { width, .. } => (width, 5),
             WidgetKind::Toggle | WidgetKind::Light => (3, 2),
             WidgetKind::Select => (6, 2),
@@ -1614,6 +1689,24 @@ impl ModuleDescriptor {
                 (6, u8::try_from(choices + 1).unwrap_or(u8::MAX))
             }
         }
+    }
+
+    /// True when `widget` shows for these parameter values: a control while
+    /// its parameter does, and a display under its own condition. Parameter
+    /// values that are missing count as the defaults.
+    pub fn is_widget_shown(&self, widget: &Widget, values: &[f32]) -> bool {
+        if widget.is_control() {
+            return self.param_index(widget.bind).is_none_or(|i| self.is_shown(i, values));
+        }
+        let Some(when) = widget.shown_when else {
+            return true;
+        };
+        let Some(mode) = self.param_index(when.param) else {
+            return true;
+        };
+        let value = values.get(mode).copied().unwrap_or(self.params[mode].default);
+        let choice = (value - self.params[mode].min).round();
+        when.choices.iter().any(|&c| c as f32 == choice)
     }
 
     /// True when parameter `index` shows its widget for these values
@@ -1790,6 +1883,18 @@ impl ModuleDescriptor {
         let panel = &self.panel;
         for (i, widget) in panel.widgets.iter().enumerate() {
             let name = |problem: &str| format!("panel widget `{}` ({:?}): {problem}", widget.bind, widget.kind);
+            if let Some(when) = widget.shown_when {
+                if widget.is_control() {
+                    return Err(name("a control follows its parameter's condition, not its own"));
+                }
+                let Some(mode) = self.param_index(when.param).map(|i| &self.params[i]) else {
+                    return Err(name("shown when a parameter this module does not have"));
+                };
+                let count = mode.options.choices.len();
+                if count == 0 || when.choices.is_empty() || when.choices.iter().any(|&c| c as usize >= count) {
+                    return Err(name("shown when a choice the parameter does not have"));
+                }
+            }
             if widget.is_control() {
                 let Some(index) = self.param_index(widget.bind) else {
                     return Err(name("no such parameter"));
