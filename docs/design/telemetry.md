@@ -28,8 +28,8 @@ Every message carries the probe ID and an engine frame number (frames since the 
 
 ## Rules
 
-1. **The audio thread never waits for the UI.** Both queues are bounded `rtrb` queues of fixed-size `Copy` messages, allocated when the engine is created. *Why:* NFR-RT-01. A push into a full queue fails at once instead of blocking.
-2. **Full queue: drop the newest telemetry.** The engine counts drops in `EngineStats::dropped_meters` and `EngineStats::dropped_scope`. *Why:* NFR-RT-07. Visual data can be lost safely. Edits travel on a different queue and are never dropped.
+1. **The audio thread never waits for the UI.** All queues are bounded `rtrb` queues of fixed-size `Copy` messages, allocated when the engine is created. *Why:* NFR-RT-01. A push into a full queue fails at once instead of blocking.
+2. **Full queue: drop the newest telemetry.** The engine counts drops in `EngineStats::dropped_meters`, `EngineStats::dropped_scope`, and `EngineStats::dropped_pairs`. *Why:* NFR-RT-07. Visual data can be lost safely. Edits travel on a different queue and are never dropped.
 3. **Meters and scopes have separate queues.** *Why:* scopes send about 750 chunks per second per probe at 48 kHz. If they shared a queue with meters, a busy scope could starve every meter.
 4. **Probes take effect at commit, like structural edits.** *Why:* a probe needs a pointer into the schedule's buffers, and only the compiler knows them. Recompiling is cheap, and module state survives the swap.
 5. **Probes are view state.** They live in the `Controller`, not in the `Graph`, and are not saved in patches. Removing a module removes its probes. *Why:* what the UI is looking at is not part of the sound.
@@ -46,12 +46,13 @@ ADR-0001 suggests triple buffering for large telemetry. A triple buffer shows on
 |---|---|---|
 | `EngineConfig::meter_capacity` | 1024 readings | About 2.7 s of one meter at 48 kHz with 128-frame blocks |
 | `EngineConfig::scope_capacity` | 1024 chunks | About 1.4 s of one scope at 48 kHz, about 280 KB |
+| `EngineConfig::pair_capacity` | 1024 chunks | About 0.7 s of one pair at 48 kHz, about 280 KB |
 
 Drain the queues once per UI frame. At 60 frames per second, one scope fills about 13 chunks per frame, so the defaults leave plenty of room for several probes.
 
 ## In the desktop app
 
-The app hands the `Telemetry` handle from `create_engine` to a telemetry thread (`crates/loom-app/src/monitor.rs`). The thread drains both queues every 33 ms, or every 16 ms while a scope or a spectrum is on screen, so they never fill, and sends the UI a message only when a meter level visibly changes. *Why a thread:* in Iced every message redraws the window, so draining on a UI timer would draw frames even when every meter is silent. `crates/loom-app/src/live.rs` holds the parts:
+The app hands the `Telemetry` handle from `create_engine` to a telemetry thread (`crates/loom-app/src/monitor.rs`). The thread drains the queues every 33 ms, or every 16 ms while a scope, a spectrum, or an XY scope is on screen, so they never fill, and sends the UI a message only when a meter level visibly changes. *Why a thread:* in Iced every message redraws the window, so draining on a UI timer would draw frames even when every meter is silent. `crates/loom-app/src/live.rs` holds the parts:
 
 - **`Live::sync`** runs before every `Controller::commit` and whenever the meters on screen change. It keeps a `Meter` probe on the output of every meter widget on screen ([panels](panels.md#level-meters-and-audio-load-m1)), and forgets probes of removed modules. With signal activity on, every output with a cable gets one too; activity is off.
 - **`Levels`**, on the telemetry thread, turns readings into levels from 0 to 1: -60 dB and below is 0, 0 dB (1.0, or 10 V) and above is 1. The peak is the highest since the last drain. The RMS is taken over every frame since the last drain, weighted by block length, because a block can be shorter than one cycle of the signal. Both rise at once and fall by 1.0 per second, using the time since the last drain, so the drain rate does not change them. The peak is never below the RMS.
@@ -65,24 +66,28 @@ The app hands the `Telemetry` handle from `create_engine` to a telemetry thread 
 
 - **`SpectrumAnalyser`** (`crates/loom-app/src/spectrum.rs`) runs the FFT on the chunks of one scope probe, for a spectrum on screen ([panel widgets](panel-widgets.md#spectrum)). A scope and a spectrum on one output share a probe, so their results travel apart in the `Update`.
 
+- **`XyTrace`** (`crates/loom-app/src/xy.rs`) keeps the last pairs of one paired probe and turns them into the points an XY scope draws ([panel widgets](panel-widgets.md#xy-scope)).
+
 The planned direction for displays: signal displays are modules in the grid, not views laid over the canvas (ADR-0011, everything is a module). A scope module saves with the patch, sits next to the signal it shows, travels inside sub-patches, and can go on a front panel. It animates only while its tile is visible and large enough to read.
 
 Module display values, such as the brightness of a light, do not use these queues. Only the latest value matters for them, so they use a latest-value table instead ([panels](panels.md#display-values-69)).
 
 ## Paired probes
 
-**Status:** Agreed ([#280](https://github.com/brylie/LoomDSP/issues/280)).
+**Status:** Implemented ([#280](https://github.com/brylie/LoomDSP/issues/280)).
 
 The XY scope ([panel widgets](panel-widgets.md#xy-scope)) draws one signal against another. Two scope probes cannot do this: each queue drops chunks on its own when full, so a sample of `x` could be paired with a sample of `y` from another block, and the trace would show shapes that are not in the signal.
 
-- **Probe.** `Controller::add_probe_pair(x_output, y_output)` returns a `ProbeId`. It is one probe with two buffer pointers in the schedule.
+- **Probe.** `Controller::add_probe_pair(x_output, y_output, y_input)` returns a `ProbeId`. It is one probe in the schedule with a left and an optional right buffer pointer for each side, so four pointers at most. `y_input` is the input that feeds `y_output`, or `None`: with no cable in it and a stereo `x_output`, the pair reads the left side of `x_output` as `x` and its right side as `y`.
+- **Stereo.** Otherwise a stereo output reads as the mean of its sides, as a scope does ([stereo](stereo.md), rule 22).
+- **Roots.** A pair keeps its modules scheduled, as any probe does, so a module with no path to the output still sends pairs.
 - **Chunk.** After each internal block, the engine copies the block into `PairChunk`s: up to 32 frames each, `x` and `y` interleaved (64 values), with the probe ID and the frame number of the first frame, like `ScopeChunk`. Both values of a frame always come from the same block, the same chunk, and the same push. *Why 32 frames:* the same byte size as a 64-sample scope chunk.
 - **Queue.** A third bounded queue, `pair_capacity` (default 1024 chunks, about 0.7 s of one pair at 48 kHz). Full queue: drop the newest chunk and count it in `EngineStats::dropped_pairs` (rule 2). *Why separate:* rule 3.
 - **Read.** `Telemetry::pairs()` takes every waiting chunk, oldest first. A gap in frame numbers means chunks were dropped; the UI clears its history, as `ScopeTrace` does.
 - **Feedback loops.** A pair inside a loop sees every frame, like a scope, because loop modules run one frame at a time and the copy happens after the block.
-- **Both ports must be outputs of the same patch level.** The registry refuses nothing else. If `x_output` and `y_output` are the same port, the trace is a diagonal line.
+- **Both ports must exist.** The controller refuses an output the graph does not have. If `x_output` and `y_output` are the same port, the trace is a diagonal line. A sub-patch's outputs follow the same rule when sub-patches come.
 - No sound change (rule 6); a test checks bit-identical output with and without a pair. The `no_alloc` test covers adding and removing a pair.
-- App side: `XyTrace` keeps the last `time` seconds of pairs. It draws at most 2048 points, keeping every Nth pair when there are more ([XY scope](panel-widgets.md#xy-scope)).
+- App side: `XyTrace` keeps 0.1 s of pairs, the longest `time`, and draws the last `time` seconds. It draws at most 2048 points, keeping every Nth pair when there are more ([XY scope](panel-widgets.md#xy-scope)).
 
 ## Tests
 

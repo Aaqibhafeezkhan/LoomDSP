@@ -29,6 +29,8 @@ const TRACE_MIN_PX: f32 = 1.0;
 const INSET: f32 = 2.0;
 /// Width of a lighter second line, in world units.
 const PEAK_WIDTH: f32 = 0.8;
+/// How bright an XY scope's oldest point is, from 0 to 1.
+const XY_FADEST: f32 = 0.15;
 /// How far a level history's column reaches over the next one, in world units.
 const SEAM: f32 = 0.6;
 /// Where a spectrum's faint grid lines sit: 100 Hz, 1 kHz, and 10 kHz, on its
@@ -156,6 +158,18 @@ pub(crate) fn trace_area(rect: Rectangle) -> Rectangle {
     rect.shrink(INSET)
 }
 
+/// The area inside an XY scope's rectangle that holds its trace: the largest
+/// centred square. Both axes then have the same scale at any tile size, so a
+/// circle stays a circle (panel-widgets.md, XY scope).
+pub(crate) fn xy_scope_area(rect: Rectangle) -> Rectangle {
+    let area = trace_area(rect);
+    let side = area.width.min(area.height);
+    Rectangle::new(
+        Point::new(area.center_x() - side * 0.5, area.center_y() - side * 0.5),
+        iced::Size::new(side, side),
+    )
+}
+
 /// GPU instances for every scope trace in a scene.
 #[derive(Debug, Default)]
 pub(crate) struct TraceGeometry {
@@ -185,7 +199,11 @@ impl TraceGeometry {
                 let (Some(rect), Some(trace)) = (module.widget_bounds(index), traces.get(module.id, index)) else {
                     continue;
                 };
-                let area = trace_area(rect);
+                let area = if widget.kind == WidgetViewKind::XyScope {
+                    xy_scope_area(rect)
+                } else {
+                    trace_area(rect)
+                };
                 let at = |[x, y]: [f32; 2]| {
                     Point::new(
                         area.x + x * area.width,
@@ -223,6 +241,18 @@ impl TraceGeometry {
                     if full {
                         segments.extend(second_line());
                     }
+                } else if widget.kind == WidgetViewKind::XyScope {
+                    // Older points fade, so the newest part is brightest. The
+                    // app sends one point at the middle zoom, drawn as a dot.
+                    if let [only] = trace.points.as_slice() {
+                        segments.push(Segment::new(at(*only), at(*only), palette.light_on, area));
+                    }
+                    let last = trace.points.len().saturating_sub(2).max(1) as f32;
+                    segments.extend(trace.points.windows(2).enumerate().map(|(i, pair)| {
+                        let age = XY_FADEST + (1.0 - XY_FADEST) * i as f32 / last;
+                        let colour = crate::controls::mix(palette.background, palette.light_on, age);
+                        Segment::new(at(pair[0]), at(pair[1]), colour, area)
+                    }));
                 } else if widget.kind == WidgetViewKind::Spectrum {
                     if full {
                         for x in SPECTRUM_GRID {

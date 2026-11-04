@@ -66,6 +66,7 @@ mod targets;
 mod ui_test;
 mod undo;
 mod view;
+mod xy;
 
 use clap::Parser;
 use iced::{Color, Point, Size, Task, Theme};
@@ -1010,6 +1011,11 @@ impl App {
             )
             .collect();
         self.live.sync_scopes(&mut self.controller, &scopes);
+        let pairs: Vec<_> = scene::xy_outputs(&self.controller, &self.visible_displays)
+            .into_iter()
+            .map(|scope| (scope.x, scope.y, scope.y_input))
+            .collect();
+        self.live.sync_pairs(&mut self.controller, &pairs);
         self.publish_watch();
     }
 
@@ -1049,6 +1055,17 @@ impl App {
                 Some((self.live.scope_probe(spectrum.output)?, want))
             })
             .collect();
+        let xy = scene::xy_outputs(&self.controller, &self.visible_displays)
+            .into_iter()
+            .filter_map(|scope| {
+                let want = monitor::XyWant {
+                    frames: (scope.time * rate).round().max(1.0) as usize,
+                    range: scope.range,
+                    rotate: scope.rotate,
+                };
+                Some((self.live.pair_probe(scope.x, scope.y)?, want))
+            })
+            .collect();
         let activity = self.live.activity_probes().collect();
         self.carrying.retain(|output| self.live.probe(*output).is_some());
         let list = monitor::WatchList {
@@ -1057,6 +1074,7 @@ impl App {
             scopes,
             histories,
             spectra,
+            xy,
             peak_resets: self.peak_resets(),
             full_traces: self.full_traces,
         };
@@ -1079,6 +1097,12 @@ impl App {
                     .into_iter()
                     .filter(|spectrum| self.live.scope_probe(spectrum.output).is_some())
                     .map(|spectrum| spectrum.widget),
+            )
+            .chain(
+                scene::xy_outputs(&self.controller, &self.visible_displays)
+                    .into_iter()
+                    .filter(|scope| self.live.pair_probe(scope.x, scope.y).is_some())
+                    .map(|scope| scope.widget),
             )
             .collect();
         self.traces.retain(|module, widget| shown.contains(&(module, widget)));
@@ -1168,6 +1192,18 @@ impl App {
             .map(|history| (history.widget, self.live.probe(history.output)))
             .collect();
         self.give_traces(histories, &shown);
+    }
+
+    /// Takes new XY traces from the telemetry thread.
+    fn take_xy(&mut self, traces: Vec<(ProbeId, loom_canvas::Trace)>) {
+        if traces.is_empty() {
+            return;
+        }
+        let shown: Vec<_> = scene::xy_outputs(&self.controller, &self.visible_displays)
+            .iter()
+            .map(|scope| (scope.widget, self.live.pair_probe(scope.x, scope.y)))
+            .collect();
+        self.give_traces(traces, &shown);
     }
 
     /// Takes new spectra from the telemetry thread. A scope on the same probe
@@ -1810,6 +1846,7 @@ impl App {
                 self.take_traces(update.traces);
                 self.take_histories(update.histories);
                 self.take_spectra(update.spectra);
+                self.take_xy(update.xy);
                 self.take_peaks(update.peaks);
                 for (probe, carrying) in update.activity {
                     if let Some(output) = self.live.output_of(probe) {

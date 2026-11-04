@@ -370,6 +370,15 @@ fn widget(d: &ModuleDescriptor, w: &Widget) -> String {
             };
             format!("{display}: {output}")
         }
+        WidgetKind::XyScope { y } => {
+            let output = |bound: &str| {
+                d.outputs
+                    .iter()
+                    .find(|p| p.name == bound)
+                    .map_or_else(|| format!("`{bound}`"), port_name)
+            };
+            format!("XY scope: {} across, {} up", output(w.bind()), output(y))
+        }
         WidgetKind::Shape { label, .. } => format!("Shape preview: {} (read-only)", name(label, w.bind())),
         _ => format!("Widget: `{}`", w.bind()),
     }
