@@ -121,6 +121,18 @@ run = ["sh scripts/test-check-test-placement.sh", "sh scripts/check-test-placeme
 description = "Test worktree target ownership and orphan pruning"
 run = "sh scripts/test-worktree-targets.sh"
 
+[tasks.metrics]
+description = "Measure the workspace for an architecture review: sizes, complexity, churn, rule checks, seams; writes target/metrics.md"
+# The architecture review skill (.claude/skills/review-architecture) reads the
+# same report. Informational: CI uploads it and does not fail on it.
+# rust-code-analysis-cli gives cognitive and cyclomatic complexity per
+# function from a real parser. It is a tool of this task only, not of the
+# [tools] list above, so no other task or CI job compiles it (it builds
+# tree-sitter grammars from C, minutes on a cache miss). A command-line tool
+# only, never linked into the crates (MPL-2.0).
+tools = { "cargo:rust-code-analysis-cli" = "latest" }
+run = ["mkdir -p target", "python3 .claude/skills/review-architecture/scripts/measure.py > target/metrics.md", "sed -n '1,40p' target/metrics.md"]
+
 [tasks.help-pages]
 description = "Regenerate the module help pages in docs/modules from the descriptors"
 # A test (`committed_pages_are_current` in loom-cli) fails while they are
