@@ -22,7 +22,13 @@ fn area() -> Rectangle {
 
 /// The first cable of the patch, as the canvas names its source.
 fn first_cable(app: &App) -> (PortRef, InputRef) {
-    let (from, to) = app.controller.graph().cables().next().expect("the patch has cables");
+    let (from, to) = app
+        .session
+        .controller
+        .graph()
+        .cables()
+        .next()
+        .expect("the patch has cables");
     let output = PortRef {
         module: from.module.0,
         output: true,
@@ -39,7 +45,7 @@ fn open(app: &mut App, output: PortRef, world: Point) {
         at: Point::new(100.0, 100.0),
         area: area(),
     }));
-    assert!(app.probe_menu.is_some());
+    assert!(app.overlays.probe_menu().is_some());
 }
 
 /// The new module's cable: from the probed output into its `in`.
@@ -52,7 +58,8 @@ fn feeds(app: &App, module: u32, output: PortRef) -> bool {
         module: ModuleId(module),
         port: 0,
     };
-    app.controller
+    app.session
+        .controller
         .graph()
         .cables()
         .any(|(from, to)| from == source && to == input)
@@ -68,25 +75,25 @@ fn add_scope_and_meter_on_an_output_and_a_cable() {
         for on_cable in [false, true] {
             let mut app = app();
             let (output, to) = first_cable(&app);
-            let port = app.scene.port_position(output).unwrap();
+            let port = app.session.scene.port_position(output).unwrap();
             let world = if on_cable {
                 port + iced::Vector::new(20.0, 5.0)
             } else {
                 port
             };
-            let modules = app.controller.graph().nodes().count();
-            let cables = app.controller.graph().cables().count();
-            let tiles: Vec<Rectangle> = app.scene.modules().iter().map(|m| m.bounds()).collect();
+            let modules = app.session.controller.graph().nodes().count();
+            let cables = app.session.controller.graph().cables().count();
+            let tiles: Vec<Rectangle> = app.session.scene.modules().iter().map(|m| m.bounds()).collect();
 
             open(&mut app, output, world);
             let _ = app.update(Message::ProbeMenu(super::Message::Pick(probe)));
-            assert!(app.probe_menu.is_none());
+            assert!(app.overlays.probe_menu().is_none());
 
-            let graph = app.controller.graph();
+            let graph = app.session.controller.graph();
             assert_eq!(graph.nodes().count(), modules + 1);
             assert_eq!(graph.cables().count(), cables + 1);
-            let id = *app.selection.iter().next().expect("the new module is selected");
-            assert_eq!(app.selection.len(), 1);
+            let id = *app.session.selection.iter().next().expect("the new module is selected");
+            assert_eq!(app.session.selection.len(), 1);
             assert_eq!(graph.node(ModuleId(id)).unwrap().descriptor.id, probe.id());
             assert!(feeds(&app, id, output), "{probe:?} is fed by the output");
             let source = OutputRef {
@@ -94,17 +101,22 @@ fn add_scope_and_meter_on_an_output_and_a_cable() {
                 port: output.index,
             };
             assert!(graph.cables().any(|c| c == (source, to)), "the clicked cable stays");
-            let tile = app.scene.module(id).unwrap().bounds();
+            let tile = app.session.scene.module(id).unwrap().bounds();
             assert!(tile.x > world.x, "the new tile is right of where the menu opened");
             assert!(!tiles.iter().any(|t| t.intersects(&tile)), "{probe:?} overlaps a tile");
             assert_eq!(
-                app.edits.history.undo_step().map(|s| s.name().to_string()).as_deref(),
+                app.session
+                    .edits
+                    .history
+                    .undo_step()
+                    .map(|s| s.name().to_string())
+                    .as_deref(),
                 Some(probe.verb())
             );
 
             app.undo();
-            assert_eq!(app.controller.graph().nodes().count(), modules);
-            assert_eq!(app.controller.graph().cables().count(), cables);
+            assert_eq!(app.session.controller.graph().nodes().count(), modules);
+            assert_eq!(app.session.controller.graph().cables().count(), cables);
         }
     }
 }
@@ -115,9 +127,9 @@ fn add_scope_and_meter_on_an_output_and_a_cable() {
 fn escape_and_a_click_outside_close_the_menu() {
     let mut app = app();
     let (output, _) = first_cable(&app);
-    let port = app.scene.port_position(output).unwrap();
-    let modules = app.controller.graph().nodes().count();
-    let undo = app.edits.history.undo_step().map(|s| s.name().to_string());
+    let port = app.session.scene.port_position(output).unwrap();
+    let modules = app.session.controller.graph().nodes().count();
+    let undo = app.session.edits.history.undo_step().map(|s| s.name().to_string());
 
     open(&mut app, output, port);
     let press = |key| {
@@ -133,17 +145,20 @@ fn escape_and_a_click_outside_close_the_menu() {
     };
     let _ = app.update(press(iced::keyboard::Key::Character("a".into())));
     assert!(
-        app.probe_menu.is_some() && app.browser.is_none(),
+        app.overlays.probe_menu().is_some() && app.overlays.browser().is_none(),
         "A does not open the browser"
     );
     let _ = app.update(press(iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)));
-    assert!(app.probe_menu.is_none());
+    assert!(app.overlays.probe_menu().is_none());
 
     open(&mut app, output, port);
     let _ = app.update(Message::ProbeMenu(super::Message::Close));
-    assert!(app.probe_menu.is_none());
-    assert_eq!(app.controller.graph().nodes().count(), modules);
-    assert_eq!(app.edits.history.undo_step().map(|s| s.name().to_string()), undo);
+    assert!(app.overlays.probe_menu().is_none());
+    assert_eq!(app.session.controller.graph().nodes().count(), modules);
+    assert_eq!(
+        app.session.edits.history.undo_step().map(|s| s.name().to_string()),
+        undo
+    );
 }
 
 /// Cut and duplicate do not change the patch behind the open menu.
@@ -151,14 +166,14 @@ fn escape_and_a_click_outside_close_the_menu() {
 fn clipboard_keys_do_nothing_while_the_menu_is_open() {
     let mut app = app();
     let (output, _) = first_cable(&app);
-    let port = app.scene.port_position(output).unwrap();
+    let port = app.session.scene.port_position(output).unwrap();
     let _ = app.update(Message::Canvas(CanvasEvent::Select(vec![output.module])));
-    let modules = app.controller.graph().nodes().count();
+    let modules = app.session.controller.graph().nodes().count();
     open(&mut app, output, port);
     let _ = app.update(tests::command_key("d"));
     let _ = app.update(tests::command_key("x"));
-    assert_eq!(app.controller.graph().nodes().count(), modules);
-    assert!(app.probe_menu.is_some());
+    assert_eq!(app.session.controller.graph().nodes().count(), modules);
+    assert!(app.overlays.probe_menu().is_some());
 }
 
 /// If the output's module was removed while the menu was open, picking
@@ -167,14 +182,17 @@ fn clipboard_keys_do_nothing_while_the_menu_is_open() {
 fn a_removed_output_adds_nothing() {
     let mut app = app();
     let (output, _) = first_cable(&app);
-    let port = app.scene.port_position(output).unwrap();
+    let port = app.session.scene.port_position(output).unwrap();
     open(&mut app, output, port);
     let _ = app.update(Message::Canvas(CanvasEvent::Delete(vec![output.module])));
-    let modules = app.controller.graph().nodes().count();
-    let undo = app.edits.history.undo_step().map(|s| s.name().to_string());
+    let modules = app.session.controller.graph().nodes().count();
+    let undo = app.session.edits.history.undo_step().map(|s| s.name().to_string());
     let _ = app.update(Message::ProbeMenu(super::Message::Pick(Probe::Scope)));
-    assert_eq!(app.controller.graph().nodes().count(), modules);
-    assert_eq!(app.edits.history.undo_step().map(|s| s.name().to_string()), undo);
+    assert_eq!(app.session.controller.graph().nodes().count(), modules);
+    assert_eq!(
+        app.session.edits.history.undo_step().map(|s| s.name().to_string()),
+        undo
+    );
     assert!(
         app.alerts.status().contains("the output is gone"),
         "{}",

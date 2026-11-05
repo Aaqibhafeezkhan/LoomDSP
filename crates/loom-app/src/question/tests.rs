@@ -10,7 +10,7 @@ use iced::keyboard::{Key, Modifiers, key::Named};
 fn changed() -> Ui {
     let mut app = app();
     app.edit(|app| {
-        app.controller.add_module("loom.osc.sine").unwrap();
+        app.session.controller.add_module("loom.osc.sine").unwrap();
         app.commit();
     });
     assert!(app.unsaved());
@@ -30,12 +30,12 @@ fn answer(ui: &mut Ui, answer: Answer) {
 
 /// How many modules the patch has.
 fn modules(app: &App) -> usize {
-    app.controller.graph().nodes().count()
+    app.session.controller.graph().nodes().count()
 }
 
 /// Selects the patch's first module, so that F1 has help to open.
 fn select_a_module(ui: &mut Ui) {
-    let (id, _) = ui.app.controller.graph().nodes().next().expect("a module");
+    let (id, _) = ui.app.session.controller.graph().nodes().next().expect("a module");
     ui.send(AppMessage::Canvas(loom_canvas::CanvasEvent::Select(vec![id.0])));
     ui.redraw();
 }
@@ -62,7 +62,7 @@ fn a_clean_patch_is_not_asked_about() {
     let mut app = app();
     assert!(!app.unsaved());
     let _ = app.update(AppMessage::File(FileAction::Close));
-    assert!(app.question.is_none());
+    assert!(app.overlays.question.is_none());
     assert!(app.quit);
 }
 
@@ -78,7 +78,7 @@ fn each_way_of_dropping_the_patch_asks() {
     let mut ui = changed();
     let before = modules(&ui.app);
     ui.send(AppMessage::File(FileAction::New));
-    assert!(ui.app.question.is_some());
+    assert!(ui.app.overlays.question.is_some());
     assert_eq!(modules(&ui.app), before, "it waits for the answer");
     answer(&mut ui, Answer::DontSave);
     assert!(modules(&ui.app) < before);
@@ -92,7 +92,7 @@ fn each_way_of_dropping_the_patch_asks() {
     assert_eq!(fake::asked(), Vec::new(), "no picker before the answer");
     answer(&mut ui, Answer::DontSave);
     assert!(matches!(fake::asked().as_slice(), [Asked::Open(_)]));
-    assert_eq!(ui.app.document.file(), Some(other.as_path()));
+    assert_eq!(ui.app.session.document.file(), Some(other.as_path()));
     fake::answer_open(None);
 
     // Closing the window.
@@ -111,7 +111,7 @@ fn cancel_changes_nothing() {
         let before = modules(&ui.app);
         ui.send(AppMessage::File(FileAction::Close));
         ui.send(AppMessage::Question(cancel));
-        assert!(ui.app.question.is_none());
+        assert!(ui.app.overlays.question.is_none());
         assert!(!ui.app.quit);
         assert!(ui.app.unsaved());
         assert_eq!(modules(&ui.app), before);
@@ -141,7 +141,7 @@ fn a_cancelled_save_stays() {
     answer(&mut ui, Answer::Save);
     assert!(!ui.app.quit);
     assert!(ui.app.unsaved());
-    assert!(ui.app.question.is_none());
+    assert!(ui.app.overlays.question.is_none());
 }
 
 /// A failed save stays and says why, with nothing lost.
@@ -165,7 +165,7 @@ fn a_failed_save_stays_and_says_why() {
 
     // OK closes it. Escape would too, and neither quits.
     ui.tap(Key::Named(Named::Enter), Modifiers::empty());
-    assert!(ui.app.question.is_none());
+    assert!(ui.app.overlays.question.is_none());
     assert!(!ui.app.quit);
 }
 
@@ -205,7 +205,7 @@ fn cancelling_replace_keeps_everything() {
     let dir = TempDir::new("question-keep");
     let mut ui = asked_to_replace(&dir);
     ui.tap(Key::Named(Named::Enter), Modifiers::empty());
-    assert!(ui.app.question.is_none());
+    assert!(ui.app.overlays.question.is_none());
     assert_eq!(std::fs::read_to_string(dir.0.join("foo.ron")).unwrap(), "theirs");
     assert!(ui.app.unsaved());
     assert!(!ui.app.quit);
@@ -223,7 +223,7 @@ fn save_as_asks_about_replace_and_goes_no_further() {
     answer(&mut ui, Answer::Replace);
     assert!(!ui.app.unsaved());
     assert!(!ui.app.quit);
-    assert_eq!(ui.app.document.file(), Some(dir.0.join("foo.ron").as_path()));
+    assert_eq!(ui.app.session.document.file(), Some(dir.0.join("foo.ron").as_path()));
 }
 
 /// Tab and the arrow keys move the highlight and wrap around, Enter gives it,
@@ -279,15 +279,15 @@ fn a_focused_field_gets_nothing() {
     let mut ui = changed();
     ui.focus(crate::patch_info::TAG_INPUT);
     ui.typewrite("a");
-    let draft = ui.app.patch_info.tag_draft.clone();
+    let draft = ui.app.session.patch_info.tag_draft.clone();
     ui.send(AppMessage::File(FileAction::Close));
     ui.redraw();
     ui.typewrite("drone");
-    assert_eq!(ui.app.patch_info.tag_draft, draft);
-    assert!(ui.app.question.is_some());
+    assert_eq!(ui.app.session.patch_info.tag_draft, draft);
+    assert!(ui.app.overlays.question.is_some());
     ui.tap(Key::Named(Named::Enter), Modifiers::empty());
-    assert!(ui.app.question.is_none(), "Enter answered the question");
-    assert!(ui.app.document.info().tags.is_empty(), "and added no tag");
+    assert!(ui.app.overlays.question.is_none(), "Enter answered the question");
+    assert!(ui.app.session.document.info().tags.is_empty(), "and added no tag");
 }
 
 /// What would change the patch or open something behind the question does
@@ -297,20 +297,20 @@ fn shortcuts_do_nothing_behind_the_question() {
     let mut ui = changed();
     select_a_module(&mut ui);
     let count = modules(&ui.app);
-    let steps = ui.app.edits.history.len();
+    let steps = ui.app.session.edits.history.len();
     ui.send(AppMessage::File(FileAction::Close));
     ui.redraw();
     let before = model(&ui);
     ui.tap(Key::Character("z".into()), Modifiers::COMMAND);
     assert_eq!(modules(&ui.app), count, "undo did nothing");
-    assert_eq!(ui.app.edits.history.len(), steps);
+    assert_eq!(ui.app.session.edits.history.len(), steps);
     ui.tap(Key::Character("n".into()), Modifiers::COMMAND);
     assert_eq!(modules(&ui.app), count, "New did nothing");
     ui.tap(Key::Named(Named::Backspace), Modifiers::empty());
     assert_eq!(modules(&ui.app), count, "Delete did nothing");
     ui.tap(Key::Named(Named::Space), Modifiers::empty());
     ui.tap(Key::Named(Named::F1), Modifiers::empty());
-    assert!(ui.app.help.is_none(), "help stays closed");
+    assert!(ui.app.overlays.help.is_none(), "help stays closed");
     assert_eq!(model(&ui), before, "the question stays as it was");
 }
 
@@ -321,12 +321,12 @@ fn escape_leaves_help_open_under_the_question() {
     let mut ui = changed();
     select_a_module(&mut ui);
     ui.tap(Key::Named(Named::F1), Modifiers::empty());
-    assert!(ui.app.help.is_some());
+    assert!(ui.app.overlays.help.is_some());
     ui.send(AppMessage::File(FileAction::Close));
     ui.redraw();
     ui.tap(Key::Named(Named::Escape), Modifiers::empty());
-    assert!(ui.app.question.is_none());
-    assert!(ui.app.help.is_some(), "help is still open");
+    assert!(ui.app.overlays.question.is_none());
+    assert!(ui.app.overlays.help.is_some(), "help is still open");
 }
 
 /// A second close request is ignored, and the question stays as it was.
@@ -352,7 +352,7 @@ fn the_panic_key_works_over_the_question() {
         "{}",
         ui.app.alerts.status()
     );
-    assert!(ui.app.question.is_some());
+    assert!(ui.app.overlays.question.is_some());
 }
 
 /// The gate lets through what keeps the music going, and what the canvas sends
@@ -392,16 +392,16 @@ fn rows_still_reach_a_browser_under_the_question() {
     let _ = app.rig.store.save(preferences);
     let _ = app.update(AppMessage::File(FileAction::Browse));
     app.edit(|app| {
-        app.controller.add_module("loom.osc.sine").unwrap();
+        app.session.controller.add_module("loom.osc.sine").unwrap();
         app.commit();
     });
     let _ = app.update(AppMessage::File(FileAction::Close));
-    assert!(app.question.is_some());
+    assert!(app.overlays.question.is_some());
     let rows = vec![crate::patches::Row::read(&dir.0.join("a.ron"))];
     let open = app.patches_open;
     let _ = app.update(AppMessage::Patches(crate::patches::Message::Found { open, rows }));
     let _ = app.update(AppMessage::Question(Message::Escape));
-    let browser = app.patches.as_ref().expect("the browser is still open");
+    let browser = app.overlays.patches().expect("the browser is still open");
     assert_eq!(browser.shown().count(), 1);
 }
 

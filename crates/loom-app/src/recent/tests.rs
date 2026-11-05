@@ -21,7 +21,7 @@ fn patches(dir: &Path, count: usize) -> Vec<PathBuf> {
 /// An app that makes one edit, so that dropping the patch asks.
 fn changed(app: &mut App) {
     app.edit(|app| {
-        app.controller.add_module("loom.osc.sine").unwrap();
+        app.session.controller.add_module("loom.osc.sine").unwrap();
         app.commit();
     });
     assert!(app.unsaved());
@@ -109,7 +109,7 @@ fn an_example_copy_is_not_listed() {
     let mut app = app();
     fake::use_examples(None);
     assert!(app.open_path(&example));
-    assert_eq!(app.document.file(), None);
+    assert_eq!(app.session.document.file(), None);
     assert!(app.rig.recent.files().is_empty());
 }
 
@@ -198,10 +198,10 @@ fn choosing_a_row_asks_first() {
     changed(&mut ui.app);
     ui.send(AppMessage::OpenRecent);
     ui.send(AppMessage::Recent(Message::Pick(0)));
-    assert!(ui.app.question.is_some());
-    assert_eq!(ui.app.document.file(), None);
+    assert!(ui.app.overlays.question.is_some());
+    assert_eq!(ui.app.session.document.file(), None);
     ui.send(AppMessage::Question(QuestionMessage::Answer(Answer::DontSave)));
-    assert_eq!(ui.app.document.file(), Some(files[0].as_path()));
+    assert_eq!(ui.app.session.document.file(), Some(files[0].as_path()));
 }
 
 /// A missing file is dimmed. Choosing it takes it off the list, with a status
@@ -220,7 +220,7 @@ fn a_missing_file_is_dimmed_and_removed_when_chosen() {
     assert!(rows[0].missing);
     assert!(!rows[1].missing);
     ui.send(AppMessage::Recent(Message::Pick(0)));
-    assert!(ui.app.question.is_none(), "nothing to ask about");
+    assert!(ui.app.overlays.question.is_none(), "nothing to ask about");
     assert_eq!(ui.app.rig.recent.files(), &files[1..]);
     assert!(ui.app.alerts.status().contains("0.ron"), "{}", ui.app.alerts.status());
 }
@@ -237,7 +237,7 @@ fn a_file_is_looked_up_again_when_chosen() {
     std::fs::remove_file(&files[0]).unwrap();
     ui.send(AppMessage::Recent(Message::Pick(0)));
     assert!(ui.app.rig.recent.files().is_empty());
-    assert_eq!(ui.app.document.file(), None);
+    assert_eq!(ui.app.session.document.file(), None);
 }
 
 /// An app with its library at `library`, on an untitled patch.
@@ -274,7 +274,7 @@ fn both_dialogs_start_in_the_remembered_folder() {
     let _ = app.update(AppMessage::File(FileAction::Open));
     fake::answer_open(None);
     let _ = fake::asked();
-    assert_eq!(app.document.file(), Some(mine.as_path()));
+    assert_eq!(app.session.document.file(), Some(mine.as_path()));
 
     // With a current file, its folder.
     let _ = app.update(AppMessage::File(FileAction::Open));
@@ -367,10 +367,10 @@ fn dropping_one_patch_opens_it_after_the_question() {
     let mut app = app();
     changed(&mut app);
     drop_files(&mut app, &files);
-    assert!(app.question.is_some());
-    assert_eq!(app.document.file(), None);
+    assert!(app.overlays.question.is_some());
+    assert_eq!(app.session.document.file(), None);
     let _ = app.update(AppMessage::Question(QuestionMessage::Answer(Answer::DontSave)));
-    assert_eq!(app.document.file(), Some(files[0].as_path()));
+    assert_eq!(app.session.document.file(), Some(files[0].as_path()));
     assert_eq!(app.rig.recent.files(), &files[..1]);
     assert!(app.alerts.status().starts_with("opened"), "{}", app.alerts.status());
 }
@@ -382,7 +382,7 @@ fn dropping_several_opens_the_first_and_says_so() {
     let files = patches(&dir.0, 2);
     let mut app = app();
     drop_files(&mut app, &files);
-    assert_eq!(app.document.file(), Some(files[0].as_path()));
+    assert_eq!(app.session.document.file(), Some(files[0].as_path()));
     assert!(
         app.alerts
             .status()
@@ -400,7 +400,7 @@ fn dropping_several_keeps_the_load_notes() {
     let files = patches(&dir.0, 1);
     let mut app = app();
     drop_files(&mut app, &[files[0].clone(), dir.0.join("other.wav")]);
-    let note = app.document.load_notes().first().expect("a load note").clone();
+    let note = app.session.document.load_notes().first().expect("a load note").clone();
     let status = app.alerts.status();
     assert!(
         status.starts_with("Opened \"0.ron\". Drop one patch at a time."),
@@ -416,7 +416,7 @@ fn dropping_something_else_shows_the_message() {
     changed(&mut app);
     drop_files(&mut app, &[PathBuf::from("/a/b.wav")]);
     assert_eq!(app.alerts.status(), "Only LoomDSP patches (.ron) can be opened here.");
-    assert!(app.question.is_none());
+    assert!(app.overlays.question.is_none());
     assert!(app.unsaved());
 }
 
@@ -439,7 +439,7 @@ fn a_drop_during_a_question_is_ignored() {
     );
     assert!(app.drops.is_empty());
     let _ = app.update(AppMessage::Question(QuestionMessage::Escape));
-    assert_eq!(app.document.file(), None);
+    assert_eq!(app.session.document.file(), None);
 }
 
 /// Overlays close only once the patch has opened, so Cancel changes nothing.
@@ -449,14 +449,14 @@ fn overlays_stay_open_until_the_patch_opens() {
     let files = patches(&dir.0, 1);
     let mut app = app();
     let _ = app.update(AppMessage::Preferences(crate::settings::Message::Open));
-    assert!(app.rig.window.is_some());
+    assert!(app.overlays.preferences().is_some());
     changed(&mut app);
     drop_files(&mut app, &files);
     let _ = app.update(AppMessage::Question(QuestionMessage::Answer(Answer::Cancel)));
-    assert!(app.rig.window.is_some(), "Cancel changes nothing");
+    assert!(app.overlays.preferences().is_some(), "Cancel changes nothing");
     drop_files(&mut app, &files);
     let _ = app.update(AppMessage::Question(QuestionMessage::Answer(Answer::DontSave)));
-    assert!(app.rig.window.is_none());
+    assert!(app.overlays.preferences().is_none());
 }
 
 /// With the list open, the clipboard shortcuts reach nothing behind it. Cut
@@ -467,17 +467,17 @@ fn clipboard_keys_do_nothing_behind_the_list() {
     let files = patches(&dir.0, 1);
     let mut ui = Ui::with_app(app());
     ui.app.rig.recent.remember(&files[0]).unwrap();
-    let (id, _) = ui.app.controller.graph().nodes().next().expect("a module");
+    let (id, _) = ui.app.session.controller.graph().nodes().next().expect("a module");
     ui.send(AppMessage::Canvas(loom_canvas::CanvasEvent::Select(vec![id.0])));
     ui.redraw();
-    let count = ui.app.controller.graph().nodes().count();
+    let count = ui.app.session.controller.graph().nodes().count();
     ui.send(AppMessage::OpenRecent);
     ui.redraw();
     for key in ["x", "d"] {
         ui.tap(Key::Character(key.into()), Modifiers::COMMAND);
-        assert_eq!(ui.app.controller.graph().nodes().count(), count, "{key}");
+        assert_eq!(ui.app.session.controller.graph().nodes().count(), count, "{key}");
     }
-    assert!(ui.app.recent_rows.is_some(), "the list stays open");
+    assert!(ui.app.overlays.recent_rows().is_some(), "the list stays open");
 }
 
 /// Opening the list takes the keys from a focused matrix, so Delete removes
@@ -488,19 +488,19 @@ fn the_list_takes_the_keys_from_a_focused_matrix() {
     let files = patches(&dir.0, 1);
     let mut ui = Ui::with_app(app());
     ui.app.rig.recent.remember(&files[0]).unwrap();
-    ui.app.matrix.tab = crate::matrix::Tab::Matrix;
-    ui.app.matrix.focused = true;
+    ui.app.right_tab = crate::matrix::Tab::Matrix;
+    ui.app.session.matrix.focused = true;
     ui.redraw();
     ui.send(AppMessage::OpenRecent);
     ui.redraw();
-    assert!(!ui.app.matrix.focused);
+    assert!(!ui.app.session.matrix.focused);
     let messages = ui.tap(Key::Named(Named::Delete), Modifiers::empty());
     assert!(
         !messages.iter().any(|m| matches!(m, AppMessage::MatrixKey(_))),
         "{messages:?}"
     );
     ui.tap(Key::Named(Named::Escape), Modifiers::empty());
-    assert!(ui.app.recent_rows.is_none(), "one Escape closes it");
+    assert!(ui.app.overlays.recent_rows().is_none(), "one Escape closes it");
 }
 
 /// Open with a current file starts in its folder, and does not make the

@@ -242,7 +242,7 @@ struct Shown {
 fn shown(
     options: &Options,
     controller: &mut Controller,
-    positions: &BTreeMap<u32, Point>,
+    positions: &BTreeMap<u32, (f32, f32)>,
     sizes: &BTreeMap<u32, (u8, u8)>,
     size: Size,
 ) -> Result<(Scene, Shown), String> {
@@ -310,20 +310,20 @@ fn shown(
 /// PNG.
 pub fn run(args: &crate::Args, path: &Path) -> Result<(), String> {
     let config = loom_core::EngineConfig::with_sample_rate(48_000.0);
-    let mut session = crate::App::session(config, args.test_modules, args.source())?;
+    let mut loaded = crate::Loaded::read(config, args.test_modules, args.source())?;
     let options = &args.view;
     let logical = options.size.map_or(CANVAS, ImageSize::logical);
     let (scene, shown) = shown(
         options,
-        &mut session.controller,
-        &session.positions,
-        &session.sizes,
+        &mut loaded.controller,
+        &loaded.positions,
+        &loaded.sizes,
         logical,
     )?;
     let mut values = PanelValues::new();
     crate::scene::update_panel_values_dragging(
         &mut values,
-        &session.controller,
+        &loaded.controller,
         &BTreeMap::new(),
         &crate::clip::ClipHolds::default(),
         shown.dragging,
@@ -357,15 +357,15 @@ pub fn run_window(args: &crate::Args, path: &Path) -> Result<(), String> {
     drop(ui);
     let (scene, shown) = shown(
         options,
-        &mut app.controller,
-        &app.positions,
-        &app.sizes,
+        &mut app.session.controller,
+        &app.session.positions,
+        &app.session.sizes,
         canvas.bounds.size(),
     )?;
-    app.scene = scene;
-    app.gestures.show_depth(shown.dragging);
+    app.session.scene = scene;
+    app.session.gestures.show_depth(shown.dragging);
     app.refresh_values();
-    app.selection.extend(shown.selected);
+    app.session.selection.extend(shown.selected);
     app.still = Some(shown.still);
 
     let pixels = draw_window(&app, &mut renderer, logical, options.scale);

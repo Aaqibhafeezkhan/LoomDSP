@@ -8,6 +8,7 @@
 
 use crate::devices::{self, Host, MidiPort, Playing, Wanted};
 use crate::input_session::{Demand, InputSession};
+use crate::overlays::Overlay;
 use crate::preferences::{AudioPrefs, BufferChoice, DeviceChoice, InputChoice, Preferences, RateChoice, Store};
 use crate::style::{self, button};
 use crate::{App, alerts, undo};
@@ -87,9 +88,9 @@ pub struct Rig {
     pub(crate) input: InputSession,
     /// The device playing now, when one is.
     pub playing: Option<Playing>,
-    /// The window, while it is open, with the device lists read when it
-    /// opened.
-    pub window: Option<Window>,
+    /// Lists a control channel command reads while the window is closed, so
+    /// it checks a change as the window does without opening anything.
+    borrowed_lists: Option<DeviceLists>,
     /// A mode change the engine's full queue refused, sent again on the
     /// next update.
     pub safety_pending: Option<OutputSafety>,
@@ -133,11 +134,27 @@ pub struct LostAudio {
     pub last_error: Option<String>,
 }
 
-/// The device lists the window shows.
-pub struct Window {
+/// The devices the machine offers, as read when the window opened.
+pub struct DeviceLists {
     outputs: Result<Outputs, String>,
     inputs: Result<devices::Inputs, String>,
     midi: Result<Vec<String>, String>,
+}
+
+impl DeviceLists {
+    fn read(host: &dyn Host) -> Self {
+        Self {
+            outputs: host.outputs(),
+            inputs: host.audio_inputs(),
+            midi: host.midi_inputs(),
+        }
+    }
+}
+
+/// What the Preferences window holds while it is open.
+pub struct Window {
+    /// The device lists it shows.
+    lists: DeviceLists,
     /// The **Your name** field as typed, saved on Enter or on close.
     author: String,
 }
@@ -145,9 +162,7 @@ pub struct Window {
 impl Window {
     fn read(host: &dyn Host, author: String) -> Self {
         Self {
-            outputs: host.outputs(),
-            inputs: host.audio_inputs(),
-            midi: host.midi_inputs(),
+            lists: DeviceLists::read(host),
             author,
         }
     }
@@ -165,7 +180,7 @@ impl Rig {
             ports: Vec::new(),
             input: InputSession::new(),
             playing: None,
-            window: None,
+            borrowed_lists: None,
             safety_pending: None,
             last_stop: None,
             recorder: None,
@@ -326,30 +341,31 @@ impl App {
         match message {
             Message::Open => {
                 let author = self.rig.store.saved().author.clone();
-                self.rig.window = Some(Window::read(&*self.rig.host, author));
-                self.browser = None;
+                let window = Window::read(&*self.rig.host, author);
+                self.overlays.open(Overlay::Preferences(Box::new(window)));
             }
             Message::Close => {
                 self.save_author();
-                self.rig.window = None;
+                self.overlays.close_preferences();
                 // Learning a panic trigger needs the window open to show
                 // "Waiting for MIDI...", so closing it cancels the learn.
                 self.rig.panic_learn = None;
             }
             Message::Refresh => {
-                if let Some(old) = self.rig.window.take() {
-                    self.rig.window = Some(Window::read(&*self.rig.host, old.author));
+                let lists = DeviceLists::read(&*self.rig.host);
+                if let Some(window) = self.overlays.preferences_mut() {
+                    window.lists = lists;
                 }
             }
             Message::Author(text) => {
-                if let Some(window) = &mut self.rig.window {
+                if let Some(window) = self.overlays.preferences_mut() {
                     window.author = text;
                 }
             }
             Message::SaveAuthor => self.save_author(),
             Message::ChooseLicence => {
                 let current = self.rig.store.saved().licence.clone();
-                self.chooser = Some(crate::licence_chooser::Chooser::open(
+                self.overlays.chooser = Some(crate::licence_chooser::Chooser::open(
                     crate::licence_chooser::Target::Default,
                     current.as_deref(),
                 ));
@@ -374,8 +390,8 @@ impl App {
         rate: Option<Option<u32>>,
         buffer: Option<Option<u32>>,
     ) -> Result<Change, String> {
-        if self.stream.without_device() {
-            let flag = if self.stream.playback().is_off() {
+        if self.session.engine.stream.without_device() {
+            let flag = if self.session.engine.stream.playback().is_off() {
                 "--no-audio"
             } else {
                 "--fake-audio"
@@ -383,14 +399,14 @@ impl App {
             return Err(format!("there are no audio devices to choose with {flag}"));
         }
         let read;
-        let window = match &self.rig.window {
-            Some(window) => window,
+        let lists = match self.overlays.preferences() {
+            Some(window) => &window.lists,
             None => {
-                read = Window::read(&*self.rig.host, String::new());
+                read = DeviceLists::read(&*self.rig.host);
                 &read
             }
         };
-        let outputs = window
+        let outputs = lists
             .outputs
             .as_ref()
             .map_err(|e| format!("could not list the audio outputs: {e}"))?;
@@ -443,24 +459,22 @@ impl App {
     /// channel change is checked as the window checks it. Returns true when
     /// it read them, and the caller then calls [`App::forget_device_lists`].
     pub(crate) fn read_device_lists(&mut self) -> bool {
-        if self.rig.window.is_some() {
+        if self.overlays.preferences().is_some() {
             return false;
         }
-        let author = self.rig.store.saved().author.clone();
-        self.rig.window = Some(Window::read(&*self.rig.host, author));
+        self.rig.borrowed_lists = Some(DeviceLists::read(&*self.rig.host));
         true
     }
 
-    /// Drops the lists [`App::read_device_lists`] read, so the window stays
-    /// closed.
+    /// Drops the lists [`App::read_device_lists`] read.
     pub(crate) fn forget_device_lists(&mut self) {
-        self.rig.window = None;
+        self.rig.borrowed_lists = None;
     }
 
     /// The MIDI input a control channel `midi` command names (rule S2).
     pub(crate) fn control_midi_input(&self, wanted: &str) -> Result<String, String> {
-        let names = match &self.rig.window {
-            Some(window) => window.midi.clone(),
+        let names = match self.overlays.preferences() {
+            Some(window) => window.lists.midi.clone(),
             None => self.rig.host.midi_inputs(),
         }
         .map_err(|e| format!("could not list the MIDI inputs: {e}"))?;
@@ -474,7 +488,7 @@ impl App {
 
     /// Opens or closes the window, for Cmd+, or Ctrl+,.
     pub(crate) fn toggle_preferences(&mut self) {
-        let message = if self.rig.window.is_some() {
+        let message = if self.overlays.preferences().is_some() {
             Message::Close
         } else {
             Message::Open
@@ -485,7 +499,7 @@ impl App {
     /// Picks the output safety mode (preferences.md, Changing the mode at
     /// run time).
     fn choose_output_safety(&mut self, mode: OutputSafety) {
-        if !self.stream.set_output_safety(mode) {
+        if !self.session.engine.stream.set_output_safety(mode) {
             return;
         }
         self.rig.safety_flag = false;
@@ -496,7 +510,7 @@ impl App {
         }
         // With no device there is no engine playing to tell. The next
         // engine is built with the new mode.
-        if self.stream.is_playing() {
+        if self.session.engine.stream.is_playing() {
             self.rig.safety_pending = Some(mode);
             self.send_pending_safety();
         }
@@ -506,7 +520,9 @@ impl App {
     /// (patch-metadata.md, Defaults). Only the name is stored, never other
     /// contact details (rule 4).
     fn save_author(&mut self) {
-        let Some(window) = &self.rig.window else { return };
+        let Some(window) = self.overlays.preferences() else {
+            return;
+        };
         let author = window.author.trim().to_string();
         if self.rig.store.saved().author == author {
             return;
@@ -540,10 +556,10 @@ impl App {
         if let Some(error) = self.rig.save(preferences) {
             self.alerts.warn(error);
         }
-        self.live.set_activity(on);
-        self.carrying.clear();
+        self.session.engine.live.set_activity(on);
+        self.session.carrying.clear();
         self.sync_live();
-        if let Err(error) = self.controller.commit() {
+        if let Err(error) = self.session.controller.commit() {
             self.alerts.warn(error.to_string());
         }
     }
@@ -551,7 +567,7 @@ impl App {
     /// Sends a mode change the queue refused before. Runs on every update.
     pub(crate) fn send_pending_safety(&mut self) {
         let Some(mode) = self.rig.safety_pending else { return };
-        if self.controller.set_output_safety(mode).is_ok() {
+        if self.session.controller.set_output_safety(mode).is_ok() {
             self.rig.safety_pending = None;
             #[cfg(test)]
             self.rig.sent.push(mode);
@@ -563,6 +579,7 @@ impl App {
         !self.rig.flags.no_input
             && (self.rig.flags.input.is_some() || !matches!(self.rig.store.saved().audio.input, InputChoice::Off))
             && self
+                .session
                 .controller
                 .graph()
                 .nodes()
@@ -572,14 +589,17 @@ impl App {
     /// Keeps the input stream in step with the patch and the current output.
     pub(crate) fn sync_audio_input(&mut self) {
         let wanted = self.input_wanted();
-        let needed = wanted && self.stream.is_playing() && !self.stream.playback().is_fake();
+        let needed =
+            wanted && self.session.engine.stream.is_playing() && !self.session.engine.stream.playback().is_fake();
         let buffer = self
             .rig
             .playing
             .as_ref()
             .and_then(|playing| playing.buffer)
             .or_else(|| {
-                self.stream
+                self.session
+                    .engine
+                    .stream
                     .stats()
                     .map(|stats| stats.snapshot().largest_buffer)
                     .filter(|&frames| frames > 0)
@@ -591,11 +611,11 @@ impl App {
             flag: self.rig.flags.input.as_deref(),
             choice: &self.rig.store.saved().audio.input,
             buffer,
-            sample_rate: self.stream.sample_rate() as u32,
+            sample_rate: self.session.engine.stream.sample_rate() as u32,
         };
         self.rig
             .input
-            .sync(demand, &*self.rig.host, &mut self.controller, &mut self.alerts);
+            .sync(demand, &*self.rig.host, &mut self.session.controller, &mut self.alerts);
     }
 
     /// Changes the input without restarting the output stream.
@@ -606,7 +626,7 @@ impl App {
         let mut preferences = self.rig.store.saved().clone();
         preferences.audio.input = choice;
         let error = self.rig.save(preferences);
-        self.rig.input.choose(&mut self.controller, &mut self.alerts);
+        self.rig.input.choose(&mut self.session.controller, &mut self.alerts);
         self.sync_audio_input();
         if let Some(error) = error {
             self.alerts.warn(error);
@@ -647,7 +667,7 @@ impl App {
             }
         }
 
-        if !self.stream.without_device() {
+        if !self.session.engine.stream.without_device() {
             // The new device opens first: if it fails, the old one keeps
             // playing and nothing is saved (Rule D5).
             let output = match devices::open_choice(&*self.rig.host, &play) {
@@ -699,7 +719,9 @@ impl App {
     }
 
     fn outputs(&self) -> Option<&Outputs> {
-        self.rig.window.as_ref().and_then(|w| w.outputs.as_ref().ok())
+        let open = self.overlays.preferences().map(|window| &window.lists);
+        open.or(self.rig.borrowed_lists.as_ref())
+            .and_then(|lists| lists.outputs.as_ref().ok())
     }
 
     fn default_device_name(&self) -> Option<String> {
@@ -764,19 +786,19 @@ impl App {
     /// stay the same and the history still applies.
     fn rebuilt_engine(&self, rate: f32) -> Result<EngineParts, loom_core::LoomError> {
         let config = EngineConfig {
-            output_safety: self.stream.output_safety(),
+            output_safety: self.session.engine.stream.output_safety(),
             ..EngineConfig::with_sample_rate(rate)
         };
         let mut parts = create_engine(crate::registry(self.test_modules), config);
         let controller = &mut parts.controller;
-        let current = undo::Snapshot::take(&self.controller, &self.positions);
+        let current = undo::Snapshot::take(&self.session.controller, &self.session.positions);
         let empty = undo::Snapshot::take(controller, &BTreeMap::new());
         if let Some(step) = undo::diff(&empty, &current, &BTreeSet::new()) {
-            undo::apply(&step, true, controller, &mut self.positions.clone())?;
+            undo::apply(&step, true, controller, &mut self.session.positions.clone())?;
         }
         // The transport keeps its tempo, time signature, and whether it
         // runs. Its position starts at beat 0.
-        let transport = self.controller.transport();
+        let transport = self.session.controller.transport();
         controller.set_tempo(transport.tempo)?;
         controller.set_time_signature(transport.time_signature)?;
         controller.set_running(transport.running)?;
@@ -790,10 +812,10 @@ impl App {
     /// The new engine holds the patch as it is now, at the current rate.
     /// Does nothing while a device plays or an idle engine is in place.
     pub(crate) fn keep_engine_idle(&mut self) {
-        if self.stream.has_engine() {
+        if self.session.engine.stream.has_engine() {
             return;
         }
-        let Ok(parts) = self.rebuilt_engine(self.stream.sample_rate()) else {
+        let Ok(parts) = self.rebuilt_engine(self.session.engine.stream.sample_rate()) else {
             return;
         };
         let EngineParts {
@@ -804,16 +826,20 @@ impl App {
         } = parts;
         self.rig.attach(midi);
         self.generation += 1;
-        self.controller = controller;
+        self.session.controller = controller;
         // The new engine needs the panic trigger and the open MIDI inputs,
         // as in `play`, so panic and held-note release still work.
         self.send_panic_trigger();
         self.connect_midi(false, false);
-        self.monitor = crate::monitor::Monitor::new(telemetry, self.controller.config().sample_rate, self.generation);
-        self.traces = loom_canvas::ScopeTraces::new();
-        self.live = crate::live::Live::showing_activity();
-        self.live.set_activity(self.rig.store.saved().show_activity);
-        self.stream.keep_idle(engine);
+        self.session.engine.monitor =
+            crate::monitor::Monitor::new(telemetry, self.session.controller.config().sample_rate, self.generation);
+        self.session.traces = loom_canvas::ScopeTraces::new();
+        self.session.engine.live = crate::live::Live::showing_activity();
+        self.session
+            .engine
+            .live
+            .set_activity(self.rig.store.saved().show_activity);
+        self.session.engine.stream.keep_idle(engine);
         // The stopped engine's live values are gone; show the new one's.
         self.refresh_values();
     }
@@ -832,17 +858,21 @@ impl App {
         let playing = Playing::of(&output);
         let label = format!("{} at {} Hz", output.name(), output.sample_rate());
         self.generation += 1;
-        self.controller = controller;
+        self.session.controller = controller;
         self.send_panic_trigger();
         self.connect_midi(false, false);
-        self.monitor = crate::monitor::Monitor::new(telemetry, self.controller.config().sample_rate, self.generation);
-        self.traces = loom_canvas::ScopeTraces::new();
-        self.live = crate::live::Live::showing_activity();
-        self.live.set_activity(self.rig.store.saved().show_activity);
-        self.lights.clear();
-        self.meter_levels.clear();
-        self.stream.prepare(output.sample_rate() as f32);
-        self.holding = false;
+        self.session.engine.monitor =
+            crate::monitor::Monitor::new(telemetry, self.session.controller.config().sample_rate, self.generation);
+        self.session.traces = loom_canvas::ScopeTraces::new();
+        self.session.engine.live = crate::live::Live::showing_activity();
+        self.session
+            .engine
+            .live
+            .set_activity(self.rig.store.saved().show_activity);
+        self.session.lights.clear();
+        self.session.meter_levels.clear();
+        self.session.engine.stream.prepare(output.sample_rate() as f32);
+        self.session.engine.holding = false;
         let refused = self.rig.record_into(&mut output);
         let started = self.rig.host.start(output, engine);
         // Set on success; on an error this returns early.
@@ -850,15 +880,15 @@ impl App {
         match started {
             Ok(audio) => {
                 record_error = refused.map(|e| self.rig.end_recording(&e));
-                self.stream.started(audio, label);
+                self.session.engine.stream.started(audio, label);
                 self.rig.playing = Some(playing);
-                self.midi = self.rig.midi_in.clone();
+                self.session.engine.midi = self.rig.midi_in.clone();
             }
             Err(refused) => {
                 let (engine, e) = *refused;
-                self.stream.refused(engine, &e);
+                self.session.engine.stream.refused(engine, &e);
                 self.rig.playing = None;
-                self.midi = None;
+                self.session.engine.midi = None;
                 return Err(e);
             }
         }
@@ -892,7 +922,7 @@ impl App {
         // A new stream gets a new watcher, and a clean first read sends
         // nothing, so nothing else would turn these off.
         self.alerts.set_output_warnings(false, false);
-        if let Some(audio) = self.stream.take_running() {
+        if let Some(audio) = self.session.engine.stream.take_running() {
             audio.stop_immediate();
         }
         self.rig.input.stream_stopped();
@@ -903,10 +933,10 @@ impl App {
     pub(crate) fn handle_audio_loss(&mut self, reason: &str) {
         // Rule 3: The engine is never rebuilt twice for one loss. A second error
         // from the same dead stream is ignored.
-        if !self.stream.is_playing() && self.rig.lost_audio.is_some() {
+        if !self.session.engine.stream.is_playing() && self.rig.lost_audio.is_some() {
             return;
         }
-        if !self.stream.is_playing() && self.rig.playing.is_none() {
+        if !self.session.engine.stream.is_playing() && self.rig.playing.is_none() {
             return;
         }
         let was_system_default = matches!(self.rig.wanted().device, devices::Pick::SystemDefault);
@@ -922,7 +952,7 @@ impl App {
             .unwrap_or_else(|| "audio device".into());
 
         self.stop_audio_immediate();
-        self.midi = None;
+        self.session.engine.midi = None;
         self.keep_engine_idle();
 
         if was_system_default {
@@ -1004,22 +1034,22 @@ impl App {
 
     /// Checks for audio device loss, silent stalls, and device reconnection at `now`.
     pub(crate) fn check_audio(&mut self, now: Instant) {
-        if self.stream.without_device() {
+        if self.session.engine.stream.without_device() {
             return;
         }
 
         // 1. If audio is running, check for loss (dead stream, stall > 1s, missing device)
-        if self.stream.is_playing() {
+        if self.session.engine.stream.is_playing() {
             let mut callbacks_advancing = false;
-            if let Some(stats) = self.stream.stats().cloned() {
+            if let Some(stats) = self.session.engine.stream.stats().cloned() {
                 let snap = stats.snapshot();
                 if snap.is_dead {
                     self.handle_audio_loss("the audio device reported an error");
                     return;
                 }
-                if self.stream.observe_callbacks(snap.callbacks, now) {
+                if self.session.engine.stream.observe_callbacks(snap.callbacks, now) {
                     callbacks_advancing = true;
-                } else if self.stream.stalled(now) {
+                } else if self.session.engine.stream.stalled(now) {
                     let mut rate_changed = false;
                     let device_default = matches!(
                         self.rig.store.saved().audio.sample_rate,
@@ -1162,9 +1192,9 @@ impl App {
         // A new stream gets a new watcher, and a clean first read sends
         // nothing, so nothing else would turn these off.
         self.alerts.set_output_warnings(false, false);
-        if let Some(audio) = self.stream.take_running() {
+        if let Some(audio) = self.session.engine.stream.take_running() {
             // A full queue cannot fade: the limit then stops the stream.
-            let _ = self.controller.fade_out();
+            let _ = self.session.controller.fade_out();
             self.rig.last_stop = Some(audio.stop(STOP_LIMIT));
         }
         self.rig.input.stream_stopped();
@@ -1176,14 +1206,17 @@ impl App {
     fn open_input(&mut self, name: &str) -> Result<(), String> {
         let midi = self.rig.midi_in.clone().ok_or("no engine to play")?;
         let input = self.rig.free_input().ok_or("too many MIDI inputs are open")?;
-        self.controller.open_midi_input(input).map_err(|e| e.to_string())?;
+        self.session
+            .controller
+            .open_midi_input(input)
+            .map_err(|e| e.to_string())?;
         match self.rig.host.open_midi(name, midi, input) {
             Ok(port) => {
                 self.rig.ports.push(port);
                 Ok(())
             }
             Err(e) => {
-                let _ = self.controller.release_midi_input(input);
+                let _ = self.session.controller.release_midi_input(input);
                 Err(e)
             }
         }
@@ -1195,7 +1228,7 @@ impl App {
         let port = self.rig.ports.remove(index);
         let input = port.input();
         port.close();
-        let _ = self.controller.release_midi_input(input);
+        let _ = self.session.controller.release_midi_input(input);
     }
 
     /// After a new engine is attached: tracks the open inputs on it, or the
@@ -1204,7 +1237,7 @@ impl App {
     /// failed to open; the others still play.
     pub(crate) fn connect_midi(&mut self, first: bool, connect: bool) -> Option<String> {
         for input in self.rig.ports.iter().map(|port| port.input()).collect::<Vec<_>>() {
-            let _ = self.controller.open_midi_input(input);
+            let _ = self.session.controller.open_midi_input(input);
         }
         if !(first && connect) {
             return None;
@@ -1232,8 +1265,8 @@ impl App {
     /// follows too.
     pub(crate) fn poll_midi(&mut self) {
         let Ok(list) = self.rig.host.midi_list() else { return };
-        if let Some(window) = &mut self.rig.window {
-            window.midi = Ok(list.iter().map(|input| input.name.clone()).collect());
+        if let Some(window) = self.overlays.preferences_mut() {
+            window.lists.midi = Ok(list.iter().map(|input| input.name.clone()).collect());
         }
         if self.rig.midi_in.is_none() || list == self.rig.seen_midi {
             self.rig.seen_midi = list;
@@ -1300,7 +1333,7 @@ impl App {
 
     /// The window, over the canvas, while it is open.
     pub(crate) fn preferences_view(&self) -> Option<Element<'_, crate::Message>> {
-        let window = self.rig.window.as_ref()?;
+        let window = self.overlays.preferences()?;
         let heading = |label: &'static str| text(label).size(style::HEADING);
         let note = |line: String| text(line).size(style::BODY).color(crate::DIM);
 
@@ -1323,7 +1356,7 @@ impl App {
             };
             safety = safety.push(
                 column![
-                    radio(label, mode, Some(self.stream.output_safety()), |m| {
+                    radio(label, mode, Some(self.session.engine.stream.output_safety()), |m| {
                         crate::Message::Preferences(Message::Safety(m))
                     })
                     .size(style::SWITCH)
@@ -1449,7 +1482,7 @@ impl App {
     ) -> Element<'a, crate::Message> {
         let mut section = column![].spacing(8);
         let shown = self.rig.shown_audio();
-        match &window.outputs {
+        match &window.lists.outputs {
             Err(e) => section = section.push(note(format!("Could not list the audio outputs: {e}"))),
             Ok(outputs) => {
                 let default_name = outputs.default.clone().unwrap_or_else(|| "none".into());
@@ -1531,7 +1564,7 @@ impl App {
                 }
             }
         }
-        match &window.inputs {
+        match &window.lists.inputs {
             Err(error) => section = section.push(note(format!("Could not list the audio inputs: {error}"))),
             Ok(inputs) => {
                 let choices: Vec<Item<InputChoice>> = std::iter::once(Item {
@@ -1575,7 +1608,9 @@ impl App {
                         ));
                     }
                     let buffer = output.buffer.or_else(|| {
-                        self.stream
+                        self.session
+                            .engine
+                            .stream
                             .stats()
                             .map(|stats| stats.snapshot().largest_buffer)
                             .filter(|&frames| frames > 0)
@@ -1595,15 +1630,17 @@ impl App {
 
     /// The line under the audio controls: what is playing now.
     pub(crate) fn playing_line(&self) -> String {
-        if self.stream.playback().is_off() {
+        if self.session.engine.stream.playback().is_off() {
             return "Audio is off for this run (--no-audio).".to_string();
         }
-        if self.stream.playback().is_fake() {
+        if self.session.engine.stream.playback().is_fake() {
             return "No device for this run (--fake-audio).".to_string();
         }
         match &self.rig.playing {
             Some(playing) => {
                 let frames = self
+                    .session
+                    .engine
                     .stream
                     .stats()
                     .map(|s| s.snapshot().largest_buffer)
@@ -1611,7 +1648,7 @@ impl App {
                     .and_then(|f| u32::try_from(f).ok());
                 playing.describe(frames)
             }
-            None => format!("Not playing: {}.", self.stream.label()),
+            None => format!("Not playing: {}.", self.session.engine.stream.label()),
         }
     }
 
@@ -1621,7 +1658,7 @@ impl App {
         note: impl Fn(String) -> iced::widget::Text<'a>,
     ) -> Element<'a, crate::Message> {
         let mut section = column![].spacing(6);
-        match &window.midi {
+        match &window.lists.midi {
             Err(e) => section = section.push(note(format!("Could not list the MIDI inputs: {e}"))),
             Ok(names) if names.is_empty() => section = section.push(note("No MIDI inputs found.".into())),
             Ok(names) => {

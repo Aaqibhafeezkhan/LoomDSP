@@ -23,7 +23,7 @@ pub(crate) const OWNERS: [InputOwner; 10] = [
 
 /// Selects the first module, which help and the clipboard keys need.
 pub(crate) fn select_first_module(ui: &mut Ui) {
-    let (id, _) = ui.app.controller.graph().nodes().next().expect("a module");
+    let (id, _) = ui.app.session.controller.graph().nodes().next().expect("a module");
     ui.send(Message::Canvas(CanvasEvent::Select(vec![id.0])));
     ui.redraw();
 }
@@ -34,7 +34,7 @@ pub(crate) fn open_overlay(ui: &mut Ui, owner: InputOwner) {
     match owner {
         InputOwner::Question => {
             ui.app.edit(|app| {
-                app.controller.add_module("loom.osc.sine").unwrap();
+                app.session.controller.add_module("loom.osc.sine").unwrap();
                 app.commit();
             });
             ui.send(Message::File(crate::FileAction::New));
@@ -42,13 +42,14 @@ pub(crate) fn open_overlay(ui: &mut Ui, owner: InputOwner) {
         InputOwner::Help => ui.send(Message::ShowHelp),
         InputOwner::Chooser => ui.send(Message::PatchInfo(crate::patch_info::Message::ChooseLicence)),
         InputOwner::Patches => {
-            ui.app.patches = Some(patches::PatchBrowser::open(1, std::env::temp_dir().join("no-such-folder")).0);
+            let browser = patches::PatchBrowser::open(1, std::env::temp_dir().join("no-such-folder")).0;
+            ui.app.overlays.open(crate::overlays::Overlay::Patches(browser));
         }
         InputOwner::Preferences => ui.send(Message::Preferences(settings::Message::Open)),
         InputOwner::Browser => ui.send(Message::OpenBrowser),
-        InputOwner::RecentList => ui.app.recent_rows = Some(Vec::new()),
+        InputOwner::RecentList => ui.app.overlays.open(crate::overlays::Overlay::RecentList(Vec::new())),
         InputOwner::ProbeMenu => {
-            let (from, _) = ui.app.controller.graph().cables().next().expect("a cable");
+            let (from, _) = ui.app.session.controller.graph().cables().next().expect("a cable");
             let output = PortRef {
                 module: from.module.0,
                 output: true,
@@ -62,7 +63,7 @@ pub(crate) fn open_overlay(ui: &mut Ui, owner: InputOwner) {
             }));
         }
         InputOwner::TileMenu => {
-            let (id, _) = ui.app.controller.graph().nodes().next().expect("a module");
+            let (id, _) = ui.app.session.controller.graph().nodes().next().expect("a module");
             ui.send(Message::Canvas(CanvasEvent::TileMenu {
                 module: id.0,
                 at: Point::new(100.0, 100.0),
@@ -163,11 +164,11 @@ fn a_route_reads_who_was_listening_before_the_event() {
     let mut app = crate::ui_test::Ui::open("subtractive.ron").app;
     let before = app.listening();
     app.edit(|app| {
-        app.controller.add_module("loom.osc.sine").unwrap();
+        app.session.controller.add_module("loom.osc.sine").unwrap();
         app.commit();
     });
     let _ = app.update(Message::File(crate::FileAction::New));
-    assert!(app.question.is_some());
+    assert!(app.overlays.question.is_some());
     let enter = iced::Event::Keyboard(keyboard::Event::KeyPressed {
         key: Key::Named(Named::Enter),
         modified_key: Key::Named(Named::Enter),
@@ -182,7 +183,10 @@ fn a_route_reads_who_was_listening_before_the_event() {
         status: Status::Captured,
         listening: before,
     });
-    assert!(app.question.is_some(), "the question is still waiting for its answer");
+    assert!(
+        app.overlays.question.is_some(),
+        "the question is still waiting for its answer"
+    );
 }
 
 /// The panic key and dropped files go through the listener that never restarts.
@@ -254,7 +258,7 @@ fn help_is_on_top_of_a_dialog_and_closes_alone() {
             ui.press();
             ui.release();
         }
-        assert!(ui.app.help.is_none(), "{owner:?}, {close}: help closed");
+        assert!(ui.app.overlays.help.is_none(), "{owner:?}, {close}: help closed");
         assert_eq!(ui.app.input_owner(), owner, "{owner:?}, {close}: the dialog stayed");
     }
 }
@@ -294,7 +298,7 @@ fn up_and_down_leave_the_patch_list_alone_behind_help() {
 /// Taps Cmd with a character, and returns the number of modules after it.
 fn tap_command(ui: &mut Ui, c: &str) -> usize {
     ui.tap(Key::Character(c.into()), Modifiers::COMMAND);
-    ui.app.controller.graph().nodes().count()
+    ui.app.session.controller.graph().nodes().count()
 }
 
 /// #581: with an overlay open and no text field in focus, Cmd+X and Cmd+D leave
@@ -308,7 +312,7 @@ fn clipboard_keys_do_nothing_behind_an_overlay() {
             let mut ui = Ui::open("subtractive.ron");
             select_first_module(&mut ui);
             open_overlay(&mut ui, owner);
-            let modules = ui.app.controller.graph().nodes().count();
+            let modules = ui.app.session.controller.graph().nodes().count();
             ui.run_task(crate::editing::unfocus_text_fields());
             ui.redraw();
             assert!(!ui.text_field_focused(), "{owner:?}: a field would take the key");
@@ -328,7 +332,7 @@ fn clipboard_keys_do_nothing_behind_an_overlay() {
 fn duplicate_does_nothing_from_a_focused_search_field() {
     let mut ui = Ui::open("subtractive.ron");
     select_first_module(&mut ui);
-    let modules = ui.app.controller.graph().nodes().count();
+    let modules = ui.app.session.controller.graph().nodes().count();
     open_overlay(&mut ui, InputOwner::Patches);
     ui.focus(patches::SEARCH);
     assert!(ui.text_field_focused());
@@ -340,12 +344,12 @@ fn duplicate_does_nothing_from_a_focused_search_field() {
 fn clipboard_keys_work_with_no_overlay() {
     let mut ui = Ui::open("subtractive.ron");
     select_first_module(&mut ui);
-    let modules = ui.app.controller.graph().nodes().count();
+    let modules = ui.app.session.controller.graph().nodes().count();
     assert_eq!(tap_command(&mut ui, "d"), modules + 1, "Cmd+D duplicates");
     ui.clipboard.0 = None;
     ui.tap(Key::Character("c".into()), Modifiers::COMMAND);
     assert!(ui.clipboard.0.is_some(), "Cmd+C copies");
-    let before = ui.app.controller.graph().nodes().count();
+    let before = ui.app.session.controller.graph().nodes().count();
     assert!(tap_command(&mut ui, "x") < before, "Cmd+X cuts");
 }
 
@@ -404,4 +408,36 @@ fn the_subscription_sends_what_it_hears_with_who_was_listening() {
         ),
         "{routed:?}"
     );
+}
+
+/// For each overlay, a key sent the way the `Injector` and the headless `Ui`
+/// send it makes the same message as the real window's subscription.
+#[test]
+fn the_injector_and_the_subscription_agree_for_each_overlay() {
+    use iced_runtime::futures::futures::{StreamExt, executor::block_on, stream};
+    use iced_runtime::futures::subscription::{Event as Runtime, into_recipes};
+    let escape = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key: Key::Named(Named::Escape),
+        modified_key: Key::Named(Named::Escape),
+        physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+        location: keyboard::Location::Standard,
+        modifiers: Modifiers::empty(),
+        text: None,
+        repeat: false,
+    });
+    for owner in OWNERS {
+        let mut ui = Ui::open("subtractive.ron");
+        open_overlay(&mut ui, owner);
+
+        let injected = heard_messages(&escape, Status::Ignored, ui.app.listening());
+
+        let runtime = Runtime::Interaction {
+            window: window::Id::unique(),
+            event: escape.clone(),
+            status: Status::Ignored,
+        };
+        let recipe = into_recipes(ui.app.input_subscription()).remove(0);
+        let heard: Vec<Message> = block_on(recipe.stream(stream::iter(vec![runtime]).boxed()).collect());
+        assert_eq!(format!("{injected:?}"), format!("{heard:?}"), "{owner:?}");
+    }
 }
