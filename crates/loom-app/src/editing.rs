@@ -8,6 +8,36 @@ use iced::{Point, Task};
 use loom_core::{LoomError, ModuleId};
 use std::collections::BTreeSet;
 
+/// Why toolbar Undo or Redo is disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryBlock {
+    /// The history has no step that way.
+    Nothing,
+    /// An edit is still in progress, such as a held arrow key.
+    EditOpen,
+}
+
+impl HistoryBlock {
+    /// The button's hover text while it is disabled.
+    pub(crate) fn hover(self, redo: bool) -> &'static str {
+        match (self, redo) {
+            (Self::Nothing, false) => "Nothing to undo",
+            (Self::Nothing, true) => "Nothing to redo",
+            (Self::EditOpen, _) => "Waits until the edit in progress ends",
+        }
+    }
+
+    /// Why `press` cannot press the button, for the control channel.
+    pub(crate) fn press_error(self, redo: bool) -> &'static str {
+        match (self, redo) {
+            (Self::Nothing, false) => "Undo is disabled: nothing to undo",
+            (Self::Nothing, true) => "Redo is disabled: nothing to redo",
+            (Self::EditOpen, false) => "Undo is disabled: an edit is in progress",
+            (Self::EditOpen, true) => "Redo is disabled: an edit is in progress",
+        }
+    }
+}
+
 /// True when a text field or text box in the window has focus. Iced's
 /// text widgets have no undo of their own, so while one is being edited the
 /// undo shortcuts do nothing rather than change the patch behind it
@@ -198,11 +228,73 @@ impl App {
 
     /// Records a released arrow edit before an action outside the canvas.
     pub(crate) fn close_pending_arrow_group(&mut self) {
-        if self.session.arrow_group_pending {
-            self.session.arrow_group_pending = false;
-            self.session.arrow_group_closed = true;
+        self.arrow_event(crate::edits::ArrowEvent::Close);
+    }
+
+    /// Applies an arrow-group event: ends or opens the gesture as the group
+    /// says, then keeps the group's new state (`docs/design/undo.md`).
+    pub(crate) fn arrow_event(&mut self, event: crate::edits::ArrowEvent) {
+        let (next, effect) = self.session.edits.arrow_group().on(event);
+        if effect.ends() {
             self.end_gesture();
         }
+        if effect.starts() {
+            self.close_slider_gesture();
+            self.session.edits.start_gesture();
+            self.begin_edit();
+        }
+        self.session.edits.set_arrow_group(next);
+    }
+
+    /// What toolbar Undo would do, or why it is disabled. The button and
+    /// the control channel both ask this, so a script presses what a click
+    /// could. An edit that Undo closes first, a released arrow group or an
+    /// inspector slider gesture, is not a step until it closes, so Undo
+    /// works then too and takes that edit. While an arrow key is held, Undo
+    /// would do nothing, so it is disabled (undo.md).
+    pub(crate) fn undo_hint(&self) -> Result<String, HistoryBlock> {
+        if self.history_waits() {
+            return Err(HistoryBlock::EditOpen);
+        }
+        if let Some(edit) = self.edit_undo_closes() {
+            return Ok(format!("Undo: {edit}"));
+        }
+        let step = self.session.edits.history.undo_step().ok_or(HistoryBlock::Nothing)?;
+        Ok(format!("Undo: {}", step.name()))
+    }
+
+    /// What toolbar Redo would do, or why it is disabled. An edit that Redo
+    /// closes first is a new edit, and a new edit drops the redo steps, so
+    /// there is nothing to redo then (undo.md).
+    pub(crate) fn redo_hint(&self) -> Result<String, HistoryBlock> {
+        if self.history_waits() {
+            return Err(HistoryBlock::EditOpen);
+        }
+        if self.edit_undo_closes().is_some() {
+            return Err(HistoryBlock::Nothing);
+        }
+        let step = self.session.edits.history.redo_step().ok_or(HistoryBlock::Nothing)?;
+        Ok(format!("Redo: {}", step.name()))
+    }
+
+    /// The edit in progress that Undo and Redo close before they act, as
+    /// hover text names it: an inspector slider gesture or a released arrow
+    /// group (`close_slider_gesture`).
+    fn edit_undo_closes(&self) -> Option<&'static str> {
+        let edits = &self.session.edits;
+        if edits.slider_gesture_open() {
+            Some("the slider edit")
+        } else if matches!(edits.arrow_group(), crate::edits::ArrowGroup::Released { .. }) {
+            Some("the arrow key edit")
+        } else {
+            None
+        }
+    }
+
+    /// True while a gesture is open that Undo and Redo do not close first,
+    /// such as a held arrow key or a drag, so they would do nothing.
+    fn history_waits(&self) -> bool {
+        self.session.edits.gesture_open() && self.edit_undo_closes().is_none()
     }
 
     pub(crate) fn undo(&mut self) {

@@ -6,6 +6,7 @@ use crate::controls::{
     range_handle, range_nearest, range_track, select_box, xy_area, xy_bar_at, xy_edge_ring, xy_nearest_edge,
     xy_position, xy_throw,
 };
+use crate::draft::{DraftSubmit, TypedDraft};
 use crate::gpu::{Cable, CanvasPrimitive, Geometry, Overlay, Shape};
 use crate::hover::{HOVER_PADDING, HOVER_TEXT_PX, HoverTarget, HoverTimer};
 use crate::scene::{
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 
 mod draw;
 mod event;
+mod focus;
 mod hover_text;
 mod input;
 mod panel_input;
@@ -49,9 +51,6 @@ const CLICK_SLOP: f32 = 4.0;
 const SELECT_ROW_PX: f32 = 23.0;
 /// Minimum popup width in screen pixels, so names stay legible at middle zoom.
 const SELECT_WIDTH_PX: f32 = 124.0;
-/// Arrow presses within this time share one undo gesture (panels.md).
-const ARROW_GROUP: Duration = Duration::from_millis(500);
-
 /// Titles are drawn when they would be at least this tall on screen.
 const TITLE_MIN_PX: f32 = 6.5;
 /// Port labels are drawn when they would be at least this tall on screen.
@@ -97,19 +96,14 @@ pub struct PatchCanvas<'a, Message> {
     frame_key: u64,
     browser_key: u64,
     animate: bool,
-    interactive: bool,
     learn: Option<&'a LearnView>,
     /// The row selected in the modulation matrix, without changing the pin.
     matrix_line: Option<crate::scene::ModulationView>,
-    /// Lets Escape hide a badge pin while the matrix owns keyboard focus.
-    matrix_escape: bool,
-    /// Leaves unmodified keys to the focused matrix while keeping pointer input active.
-    matrix_keyboard: bool,
-    /// An app text field has focus, so its keys never act on the canvas.
-    text_field_keys: bool,
-    /// The focused text field moves to the next field on Tab, so the canvas
-    /// leaves Tab alone too.
-    text_field_keeps_tab: bool,
+    /// Who else in the window has the keys. See [`CanvasFocusPolicy`].
+    focus_policy: CanvasFocusPolicy,
+    /// The app's arrow-key undo group, as of this view. See
+    /// [`PatchCanvas::arrow_group`].
+    arrow_group: ArrowGroupView,
     /// The check for typed values. See [`PatchCanvas::typed_check`].
     typed_check: Option<TypedCheck<'a>>,
     still: Option<Still>,
@@ -271,13 +265,10 @@ impl<'a, Message> PatchCanvas<'a, Message> {
             frame_key: 0,
             browser_key: 0,
             animate: false,
-            interactive: true,
             learn: None,
             matrix_line: None,
-            matrix_escape: false,
-            matrix_keyboard: false,
-            text_field_keys: false,
-            text_field_keeps_tab: false,
+            focus_policy: CanvasFocusPolicy::default(),
+            arrow_group: ArrowGroupView::Closed,
             typed_check: None,
             still: None,
             window_drag_line: false,
@@ -306,31 +297,19 @@ impl<'a, Message> PatchCanvas<'a, Message> {
         self
     }
 
-    /// Lets a focused matrix pass Escape to a pinned badge after its cell
-    /// editor has closed.
-    pub fn matrix_escape(mut self, enabled: bool) -> Self {
-        self.matrix_escape = enabled;
+    /// Says who else in the window has the keyboard, so the canvas leaves
+    /// them alone (panels.md, Keyboard without a mouse). The app builds it
+    /// from who has the input.
+    pub fn focus_policy(mut self, policy: CanvasFocusPolicy) -> Self {
+        self.focus_policy = policy;
         self
     }
 
-    /// Leaves unmodified keyboard input to the matrix without blocking the pointer.
-    pub fn matrix_keyboard(mut self, enabled: bool) -> Self {
-        self.matrix_keyboard = enabled;
-        self
-    }
-
-    /// Says that the focused text field moves to the next field on Tab, so the
-    /// canvas leaves Tab alone too (panels.md, Keyboard without a mouse).
-    pub fn text_field_keeps_tab(mut self, enabled: bool) -> Self {
-        self.text_field_keeps_tab = enabled;
-        self
-    }
-
-    /// Says that an app text field has focus. The canvas then leaves every key
-    /// press to it except Tab, which moves focus as usual. The pointer still
-    /// works (panel-widgets.md, Typing a value).
-    pub fn text_field_keys(mut self, enabled: bool) -> Self {
-        self.text_field_keys = enabled;
+    /// Says where the app's arrow-key undo group is (`docs/design/undo.md`).
+    /// The app owns the group; the canvas only reads it, to know when an
+    /// arrow press or another key matters, and to wake for its deadline.
+    pub fn arrow_group(mut self, group: ArrowGroupView) -> Self {
+        self.arrow_group = group;
         self
     }
 
@@ -390,14 +369,6 @@ impl<'a, Message> PatchCanvas<'a, Message> {
         self
     }
 
-    /// While false, the canvas ignores the keyboard and the pointer, and
-    /// lets go of any hold or drag. For a pop-up that takes the keys, such
-    /// as the module browser.
-    pub fn interactive(mut self, interactive: bool) -> Self {
-        self.interactive = interactive;
-        self
-    }
-
     /// Moves the camera continuously in a slow loop. For measuring frame
     /// rate while panning and zooming (ADR-0010 performance gates).
     pub fn animate(mut self, animate: bool) -> Self {
@@ -441,6 +412,26 @@ impl<'a, Message> PatchCanvas<'a, Message> {
         }
     }
 
+    /// Everything one event does: what it means, the hover text, and the
+    /// wake-up for the arrow group's deadline.
+    fn on_event(
+        &self,
+        state: &mut State,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        self.handle(state, event, bounds, cursor, shell);
+        self.sync_hover_text(state, event, shell);
+        // Asked again on every event, because a later request for the next
+        // frame replaces a pending one for a time, and the group would then
+        // stay open on an idle patch.
+        if let ArrowGroupView::Released { due } = self.arrow_group {
+            shell.request_redraw_at(due);
+        }
+    }
+
     fn emit(&self, shell: &mut Shell<'_, Message>, event: CanvasEvent) {
         shell.publish((self.on_event)(event));
     }
@@ -451,9 +442,9 @@ impl<'a, Message> PatchCanvas<'a, Message> {
         state.interaction = interaction;
     }
 
-    /// Ends the gesture of the current interaction, if it has one, and the
-    /// gesture of a held arrow key. Used when the interaction is replaced or
-    /// cut off, so a start always has an end.
+    /// Ends the gesture of the current interaction, if it has one. Used when
+    /// the interaction is replaced or cut off, so a start always has an end.
+    /// The arrow group ends separately, with [`PatchCanvas::end_arrow_group`].
     fn end_gestures(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
         if matches!(
             state.interaction,
@@ -477,9 +468,79 @@ impl<'a, Message> PatchCanvas<'a, Message> {
             state.interaction = Interaction::Idle;
             self.emit(shell, CanvasEvent::GestureEnd);
         }
-        if std::mem::take(&mut state.arrow_gesture) {
-            state.arrow_deadline = None;
+    }
+
+    /// Ends the arrow group. With `always` false, only when this view shows
+    /// one open, so the paths that run on every key or redraw stay quiet.
+    /// The app ignores an end with no group open, so sending one too many is
+    /// safe; with `always` true it is sent where no key-up or timer would
+    /// follow to close a group the view does not show yet.
+    fn end_arrow_group(&self, shell: &mut Shell<'_, Message>, always: bool) {
+        if always || self.arrow_group != ArrowGroupView::Closed {
             self.emit(shell, CanvasEvent::ArrowGroupEnd);
+        }
+    }
+
+    /// Reports an arrow key about to edit.
+    fn arrow_step(&self, shell: &mut Shell<'_, Message>) {
+        self.emit(shell, CanvasEvent::ArrowStep { at: Instant::now() });
+    }
+}
+
+/// The app's arrow-key undo group, as the canvas sees it in one view
+/// (`docs/design/undo.md`). The app owns the group and its history step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ArrowGroupView {
+    /// No arrow group is open.
+    #[default]
+    Closed,
+    /// An arrow key is down, and its edits are one step.
+    Held,
+    /// The last arrow key came up. Another arrow press before `due` joins
+    /// the same step.
+    Released {
+        /// When the group ends if no arrow comes.
+        due: Instant,
+    },
+}
+
+/// Who else in the window has the keyboard, so the canvas knows which
+/// keys and presses are its own. The app builds it from who has the input,
+/// once per view.
+///
+/// It is a set of flags rather than one enum because they combine: the
+/// matrix's depth field is a text field inside the matrix, so
+/// `matrix_keyboard` and `text_field_keys` are both true while it has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasFocusPolicy {
+    /// False while a pop-up such as the module browser has the input. The
+    /// canvas then ignores the keyboard and the pointer, and lets go of any
+    /// hold or drag.
+    pub interactive: bool,
+    /// The focused matrix has the keys: unmodified keys are left to it, and
+    /// the pointer still works.
+    pub matrix_keyboard: bool,
+    /// The matrix has the keys and no cell editor is open, so Escape can
+    /// still hide a pinned badge's lines.
+    pub matrix_escape: bool,
+    /// An app text field has focus. The canvas then leaves every key to it
+    /// except Tab, which moves focus as usual. The pointer still works
+    /// (panel-widgets.md, Typing a value).
+    pub text_field_keys: bool,
+    /// The focused text field moves to the next field on Tab, so the canvas
+    /// leaves Tab alone too (panels.md, Keyboard without a mouse).
+    pub text_field_keeps_tab: bool,
+}
+
+impl Default for CanvasFocusPolicy {
+    /// The canvas has the keys and the pointer.
+    fn default() -> Self {
+        Self {
+            interactive: true,
+            matrix_keyboard: false,
+            matrix_escape: false,
+            text_field_keys: false,
+            text_field_keeps_tab: false,
         }
     }
 }
@@ -601,17 +662,6 @@ impl Interaction {
     }
 }
 
-/// The keyboard inside a composite widget (panel-widgets.md, rule 4).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Inside {
-    module: u32,
-    widget: usize,
-    /// The picked part: 0 is the low handle, 1 the band, and 2 the high handle.
-    part: u8,
-    /// How the arrows change the part while it is grabbed.
-    grab: Option<RangeGrab>,
-}
-
 /// What a stationary click on a choice control does.
 #[derive(Debug, Clone)]
 enum ChoiceClick {
@@ -621,11 +671,9 @@ enum ChoiceClick {
     ClearClip(u32, usize),
 }
 
-/// The choice list that is open above the canvas.
-#[derive(Debug, Clone, Copy)]
+/// The choice list that is open above the canvas, for the focused control.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SelectPopup {
-    module: u32,
-    widget: usize,
     highlight: usize,
     /// The first row that shows, for a list longer than it can show.
     scroll: usize,
@@ -653,17 +701,12 @@ struct State {
     /// Whether scopes were last reported as drawing full traces.
     reported_full_traces: Option<bool>,
     animation: Option<(Instant, Camera)>,
-    /// The control with keyboard focus: module ID and widget index.
-    focus: Option<(u32, usize)>,
-    /// Open select list, if any.
-    select_popup: Option<SelectPopup>,
-    /// The open field for a typed value, if any.
-    typed: Option<typed_field::TypedField>,
-    /// True when the focus came from Tab, so its hover text shows. A click
-    /// also focuses a control, but the pointer is on it then.
-    tab_focus: bool,
+    /// The control with keyboard focus, and what the keys do on it.
+    focus: focus::FocusState,
     /// True from a Tab press until the pointer moves: the focused control's
-    /// hover text wins over the port or control under a resting pointer.
+    /// hover text wins over the port or control under a resting pointer. It
+    /// is not part of [`focus::FocusState`], because it outlives a control:
+    /// Tab off a module and then Enter keep it.
     focus_first: bool,
     /// The output whose modulation lines stay on screen: its badge was
     /// clicked (`docs/design/modulation.md`, Lines).
@@ -676,9 +719,6 @@ struct State {
     hover_text: HoverTimer,
     /// The last press on a control, for double-click.
     last_click: Option<(Instant, u32, usize, ControlPart)>,
-    /// The focused range while the keyboard is inside it (panel-widgets.md,
-    /// rule 4).
-    inside: Option<Inside>,
     /// The last press on empty canvas, in screen coordinates, for
     /// double-click.
     last_empty_click: Option<(Instant, Point)>,
@@ -695,10 +735,6 @@ struct State {
     key_holds: [Option<KeyHold>; 2],
     /// Modules with lights on screen, as last reported.
     reported_lights: Option<Vec<u32>>,
-    /// True while an arrow group is open, including its 500 ms release gap.
-    arrow_gesture: bool,
-    /// A released arrow keeps its gesture open for the next quick press.
-    arrow_deadline: Option<Instant>,
 }
 
 impl State {
@@ -764,9 +800,7 @@ where
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
-        let bounds = layout.bounds();
-        self.handle(state, event, bounds, cursor, shell);
-        self.sync_hover_text(state, event, shell);
+        self.on_event(state, event, layout.bounds(), cursor, shell);
     }
 
     fn operate(
@@ -790,11 +824,11 @@ where
         };
         operation.custom(None, layout.bounds(), &mut pointer);
         // The open typed field, for the same snapshot.
-        if let Some(field) = &state.typed {
+        if let (Some((module, widget)), Some(field)) = (state.focus.control(), state.focus.typed()) {
             let mut typed = CanvasTyped {
-                module: field.module,
-                widget: field.widget,
-                text: field.text.clone(),
+                module,
+                widget,
+                text: field.draft.text.clone(),
             };
             operation.custom(None, layout.bounds(), &mut typed);
         }

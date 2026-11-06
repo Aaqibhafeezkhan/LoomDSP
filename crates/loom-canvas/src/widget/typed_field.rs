@@ -14,12 +14,11 @@ const FIELD_PADDING_PX: f32 = 6.0;
 /// Size of the field's text, in screen pixels.
 const FIELD_TEXT_PX: f32 = 12.0;
 
-/// The open field.
+/// The open field, on the focused control.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct TypedField {
-    pub(super) module: u32,
-    pub(super) widget: usize,
-    pub(super) text: String,
+    /// The text and why it is not a value yet, as the inspector keeps it too.
+    pub(super) draft: TypedDraft,
     /// Where the caret is, as a byte index on a character boundary.
     caret: usize,
     /// True while the whole text is selected, so a character replaces it.
@@ -30,19 +29,43 @@ pub(super) struct TypedField {
 }
 
 impl TypedField {
+    /// A field opened by typing `text`: the caret after it, nothing
+    /// selected. `check` says why a text is not a value.
+    pub(super) fn typing(text: &str, check: impl FnOnce(&str) -> Result<(), String>) -> Self {
+        Self {
+            draft: TypedDraft::new(text.to_string(), check),
+            caret: text.len(),
+            selected: false,
+            unchanged: None,
+        }
+    }
+
+    /// A field opened by Enter on a control showing `shown`: all of it
+    /// selected, so a typed number replaces it, and Enter on it unchanged
+    /// changes nothing. The text is checked at once, so a shown value that
+    /// does not parse shows its reason as soon as the field opens.
+    pub(super) fn opened(shown: String, check: impl FnOnce(&str) -> Result<(), String>) -> Self {
+        Self {
+            caret: shown.len(),
+            selected: true,
+            unchanged: Some(shown.clone()),
+            draft: TypedDraft::new(shown, check),
+        }
+    }
+
     /// Inserts typed text at the caret, or in place of the selected text.
     fn insert(&mut self, typed: &str) {
         if std::mem::take(&mut self.selected) {
-            self.text.clear();
+            self.draft.text.clear();
             self.caret = 0;
         }
-        self.text.insert_str(self.caret, typed);
+        self.draft.text.insert_str(self.caret, typed);
         self.caret += typed.len();
     }
 
     /// The caret position one character before the caret.
     fn before(&self) -> usize {
-        self.text[..self.caret]
+        self.draft.text[..self.caret]
             .char_indices()
             .next_back()
             .map_or(0, |(at, _)| at)
@@ -50,7 +73,7 @@ impl TypedField {
 
     /// The caret position one character after the caret.
     fn after(&self) -> usize {
-        self.text[self.caret..]
+        self.draft.text[self.caret..]
             .chars()
             .next()
             .map_or(self.caret, |c| self.caret + c.len_utf8())
@@ -60,7 +83,7 @@ impl TypedField {
     fn clear_selected(&mut self) -> bool {
         let selected = std::mem::take(&mut self.selected);
         if selected {
-            self.text.clear();
+            self.draft.text.clear();
             self.caret = 0;
         }
         selected
@@ -91,17 +114,23 @@ pub(super) fn typed_reason_bounds(field: Rectangle, width: f32, bounds: Rectangl
 }
 
 impl<Message> PatchCanvas<'_, Message> {
-    /// Why the text cannot be committed, or `None` if it can.
-    pub(super) fn typed_error(&self, field: &TypedField) -> Option<String> {
-        self.typed_check
-            .as_ref()
-            .and_then(|check| check(field.module, field.widget, &field.text).err())
+    /// The check for text typed on `widget` of `module`: why it is not a
+    /// value, if it is not. Only the app knows the parameter, so it is the
+    /// app's check (see [`PatchCanvas::typed_check`]).
+    pub(super) fn draft_check(&self, module: u32, widget: usize) -> impl Fn(&str) -> Result<(), String> + '_ {
+        move |text| {
+            self.typed_check
+                .as_ref()
+                .map_or(Ok(()), |check| check(module, widget, text))
+        }
     }
 
-    /// Screen rectangle of the field: at a fixed size, centred on its widget,
-    /// and inside the canvas.
-    pub(super) fn typed_field_bounds(&self, state: &State, bounds: Rectangle, field: &TypedField) -> Option<Rectangle> {
-        let rect = self.scene.module(field.module)?.widget_bounds(field.widget)?;
+    /// Screen rectangle of the open field: at a fixed size, centred on its
+    /// widget, and inside the canvas.
+    pub(super) fn typed_field_bounds(&self, state: &State, bounds: Rectangle) -> Option<Rectangle> {
+        state.focus.typed()?;
+        let (module, widget) = state.focus.control()?;
+        let rect = self.scene.module(module)?.widget_bounds(widget)?;
         let centre = state.camera.to_screen(rect.center());
         let x = (centre.x - FIELD_WIDTH_PX * 0.5).clamp(0.0, (bounds.width - FIELD_WIDTH_PX).max(0.0));
         let y = (centre.y - FIELD_HEIGHT_PX * 0.5).clamp(0.0, (bounds.height - FIELD_HEIGHT_PX).max(0.0));
@@ -109,24 +138,6 @@ impl<Message> PatchCanvas<'_, Message> {
             Point::new(x, y),
             Size::new(FIELD_WIDTH_PX, FIELD_HEIGHT_PX),
         ))
-    }
-
-    /// Closes a field whose control has gone, been hidden, or lost its
-    /// selection, or when MIDI learn starts. No value changes.
-    pub(super) fn close_stale_typed(&self, state: &mut State) {
-        let live = state.typed.as_ref().is_some_and(|field| {
-            self.learn.is_none()
-                && self.selection.len() == 1
-                && self.selection.contains(&field.module)
-                && self
-                    .scene
-                    .module(field.module)
-                    .and_then(|module| module.panel.widgets.get(field.widget))
-                    .is_some_and(|widget| widget.number_steps().is_some() && !widget.hidden)
-        });
-        if !live {
-            state.typed = None;
-        }
     }
 
     /// Opens the field if this key starts one on the focused control: Enter,
@@ -152,7 +163,7 @@ impl<Message> PatchCanvas<'_, Message> {
         {
             return false;
         }
-        let Some((module, widget)) = state.focus else {
+        let Some((module, widget)) = state.focus.control() else {
             return false;
         };
         let is_number = self
@@ -170,27 +181,17 @@ impl<Message> PatchCanvas<'_, Message> {
                     .values
                     .and_then(|values| values.get(module, widget))
                     .map_or_else(String::new, |value| value.text.clone());
-                state.typed = Some(TypedField {
-                    module,
-                    widget,
-                    caret: shown.len(),
-                    selected: true,
-                    unchanged: Some(shown.clone()),
-                    text: shown,
-                });
+                state
+                    .focus
+                    .open_typing(TypedField::opened(shown, self.draft_check(module, widget)));
             }
             return true;
         }
         match text.filter(|text| starts_a_number(text)) {
             Some(text) => {
-                state.typed = Some(TypedField {
-                    module,
-                    widget,
-                    text: text.to_string(),
-                    caret: text.len(),
-                    selected: false,
-                    unchanged: None,
-                });
+                state
+                    .focus
+                    .open_typing(TypedField::typing(text, self.draft_check(module, widget)));
                 true
             }
             None => false,
@@ -211,41 +212,41 @@ impl<Message> PatchCanvas<'_, Message> {
         shell: &mut Shell<'_, Message>,
     ) -> bool {
         use keyboard::key::Named;
-        let Some(mut field) = state.typed.take() else {
+        let Some((module, widget)) = state.focus.control() else {
+            return false;
+        };
+        let Some(mut field) = state.focus.take_typing() else {
             return false;
         };
         match key.as_ref() {
             keyboard::Key::Named(Named::Tab) => return false,
             keyboard::Key::Named(Named::Escape) => {}
-            keyboard::Key::Named(Named::Enter) if repeat => state.typed = Some(field),
-            keyboard::Key::Named(Named::Enter) => {
-                if field.unchanged.as_ref() == Some(&field.text) {
-                    // Nothing was typed, so nothing changes.
-                } else if self.typed_error(&field).is_some() {
-                    state.typed = Some(field);
-                } else {
-                    self.emit(
-                        shell,
-                        CanvasEvent::TypedValue {
-                            module: field.module,
-                            widget: field.widget,
-                            text: field.text,
-                        },
-                    );
-                }
-            }
+            keyboard::Key::Named(Named::Enter) if repeat => state.focus.open_typing(field),
+            keyboard::Key::Named(Named::Enter) => match field.draft.submit(field.unchanged.as_deref()) {
+                // Nothing was typed, so nothing changes.
+                DraftSubmit::Unchanged => {}
+                DraftSubmit::Blocked => state.focus.open_typing(field),
+                DraftSubmit::Commit => self.emit(
+                    shell,
+                    CanvasEvent::TypedValue {
+                        module,
+                        widget,
+                        text: field.draft.text,
+                    },
+                ),
+            },
             named_key => {
                 match named_key {
                     keyboard::Key::Named(Named::Backspace) => {
                         if !field.clear_selected() && field.caret > 0 {
                             let at = field.before();
-                            field.text.remove(at);
+                            field.draft.text.remove(at);
                             field.caret = at;
                         }
                     }
                     keyboard::Key::Named(Named::Delete) => {
-                        if !field.clear_selected() && field.caret < field.text.len() {
-                            field.text.remove(field.caret);
+                        if !field.clear_selected() && field.caret < field.draft.text.len() {
+                            field.draft.text.remove(field.caret);
                         }
                     }
                     keyboard::Key::Named(Named::ArrowLeft) => {
@@ -257,7 +258,7 @@ impl<Message> PatchCanvas<'_, Message> {
                     }
                     keyboard::Key::Named(Named::ArrowRight) => {
                         field.caret = if std::mem::take(&mut field.selected) {
-                            field.text.len()
+                            field.draft.text.len()
                         } else {
                             field.after()
                         };
@@ -268,7 +269,7 @@ impl<Message> PatchCanvas<'_, Message> {
                     }
                     keyboard::Key::Named(Named::End) => {
                         field.selected = false;
-                        field.caret = field.text.len();
+                        field.caret = field.draft.text.len();
                     }
                     _ if modifiers.command() || modifiers.control() || modifiers.alt() => {}
                     _ => {
@@ -277,7 +278,8 @@ impl<Message> PatchCanvas<'_, Message> {
                         }
                     }
                 }
-                state.typed = Some(field);
+                field.draft.recheck(self.draft_check(module, widget));
+                state.focus.open_typing(field);
             }
         }
         shell.request_redraw();
@@ -297,25 +299,25 @@ impl<Message> PatchCanvas<'_, Message> {
         screen: Option<Point>,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
-        let Some(field) = state.typed.as_ref() else {
+        if state.focus.typed().is_none() {
             return false;
-        };
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(_)) => {
                 let inside = self
-                    .typed_field_bounds(state, bounds, field)
+                    .typed_field_bounds(state, bounds)
                     .zip(screen)
                     .is_some_and(|(rect, at)| rect.contains(at));
                 if inside {
                     shell.capture_event();
                     return true;
                 }
-                state.typed = None;
+                state.focus.close_typing();
                 shell.request_redraw();
                 false
             }
             Event::Mouse(mouse::Event::WheelScrolled { .. }) | Event::Window(window::Event::Unfocused) => {
-                state.typed = None;
+                state.focus.close_typing();
                 shell.request_redraw();
                 false
             }
@@ -329,15 +331,15 @@ impl<Message> PatchCanvas<'_, Message> {
     where
         Renderer: text::Renderer<Font = Font>,
     {
-        let Some(field) = state.typed.as_ref() else {
+        let Some(field) = state.focus.typed() else {
             return;
         };
-        let Some(rect) = self.typed_field_bounds(state, Rectangle::new(Point::ORIGIN, bounds.size()), field) else {
+        let Some(rect) = self.typed_field_bounds(state, Rectangle::new(Point::ORIGIN, bounds.size())) else {
             return;
         };
         let area = Rectangle::new(Point::new(bounds.x + rect.x, bounds.y + rect.y), rect.size());
         let font = renderer.default_font();
-        let error = self.typed_error(field);
+        let error = field.draft.error().map(str::to_string);
         let line = |content: String, width: f32| Text {
             content,
             bounds: Size::new(width, FIELD_HEIGHT_PX),
@@ -384,21 +386,21 @@ impl<Message> PatchCanvas<'_, Message> {
                 },
                 self.palette.control_body,
             );
-            if field.selected && !field.text.is_empty() {
+            if field.selected && !field.draft.text.is_empty() {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: Rectangle::new(
                             Point::new(text_at.x - 1.0, area.y + 3.0),
-                            Size::new(width_of(&field.text).min(inner) + 2.0, FIELD_HEIGHT_PX - 6.0),
+                            Size::new(width_of(&field.draft.text).min(inner) + 2.0, FIELD_HEIGHT_PX - 6.0),
                         ),
                         ..renderer::Quad::default()
                     },
                     self.palette.control_track,
                 );
             }
-            renderer.fill_text(line(field.text.clone(), inner), text_at, self.palette.text, area);
+            renderer.fill_text(line(field.draft.text.clone(), inner), text_at, self.palette.text, area);
             if !field.selected {
-                let x = text_at.x + width_of(&field.text[..field.caret]).min(inner);
+                let x = text_at.x + width_of(&field.draft.text[..field.caret]).min(inner);
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: Rectangle::new(Point::new(x, area.y + 4.0), Size::new(1.0, FIELD_HEIGHT_PX - 8.0)),

@@ -11,6 +11,7 @@
 
 mod camera;
 mod controls;
+mod draft;
 mod drag_line;
 mod gpu;
 mod hover;
@@ -27,6 +28,7 @@ pub use controls::{
     xy_edge_point,
 };
 pub use controls::{part_bounds, range_bar_point};
+pub use draft::{DraftSubmit, TypedDraft};
 pub use drag_line::DragLine;
 pub use scene::{
     CLOCK_MARK_RADIUS, CableView, GRID, HEADER, Hit, HoverText, LABEL_COLUMNS, ModulationView, ModuleView,
@@ -37,6 +39,6 @@ pub use theme::{MIN_TEXT_CONTRAST, Palette, contrast_ratio};
 pub use tile_text::{Align, TextItem, TextKind, for_each as for_each_tile_text};
 pub use trace::{MAX_POINTS as MAX_TRACE_POINTS, ScopeTraces, Trace};
 pub use widget::{
-    CanvasEvent, CanvasPointer, CanvasTyped, CanvasView, ControlPart, LearnView, PatchCanvas, PointerDrag, Still,
-    StillDrag,
+    ArrowGroupView, CanvasEvent, CanvasFocusPolicy, CanvasPointer, CanvasTyped, CanvasView, ControlPart, LearnView,
+    PatchCanvas, PointerDrag, Still, StillDrag,
 };

@@ -2,15 +2,16 @@
 //! and the stats bar. Each is drawn from the app's parts; nothing here
 //! changes state.
 
+use crate::edits::ArrowGroup;
 use crate::matrix::{Event as MatrixEvent, Tab as RightTab};
 use crate::style::button;
 use crate::{
     App, DIM, FileAction, Message, alerts, browser, inspector, learn, matrix, pointer, probe_menu, recent, settings,
-    style, undo,
+    style,
 };
 use iced::widget::{column, container, mouse_area, row, rule, space, stack, text, toggler, tooltip};
 use iced::{Color, Element, Length};
-use loom_canvas::{DragLine, PatchCanvas};
+use loom_canvas::{ArrowGroupView, DragLine, PatchCanvas};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -28,15 +29,14 @@ impl App {
             )
             .frame_key(self.frame_key)
             .browser_key(self.browser_key)
-            .interactive(self.input_owner() == crate::input_owner::InputOwner::Canvas)
+            .focus_policy(self.canvas_focus_policy())
+            .arrow_group(match self.session.edits.arrow_group() {
+                ArrowGroup::Closed => ArrowGroupView::Closed,
+                ArrowGroup::Held => ArrowGroupView::Held,
+                ArrowGroup::Released { due } => ArrowGroupView::Released { due },
+            })
             .matrix_line(self.matrix_line())
-            .matrix_keyboard(self.matrix_has_keys())
-            .text_field_keys(self.text_focus.any)
-            .text_field_keeps_tab(self.tab_moves_between_fields())
             .typed_check(|module, widget, text| self.typed_check(module, widget, text))
-            .matrix_escape(
-                self.matrix_has_keys() && self.session.matrix.edit.is_none() && self.session.matrix.add.is_none(),
-            )
             .animate(self.animating)
             .learn(self.session.learn.shown());
         if let Some(still) = self.still {
@@ -182,9 +182,10 @@ impl App {
                 },
             ),
         ];
+        let (undo_hint, redo_hint) = (self.undo_hint(), self.redo_hint());
         let edit = row![
-            self.history_button("Undo", "Undo", self.session.edits.history.undo_step(), Message::Undo),
-            self.history_button("Redo", "Redo", self.session.edits.history.redo_step(), Message::Redo),
+            history_button("Undo", undo_hint, Message::Undo),
+            history_button("Redo", redo_hint, Message::Redo),
         ];
         let setup = row![
             // Primary only while learning: a mode that is on.
@@ -233,29 +234,6 @@ impl App {
         } else {
             "The last patches you opened or saved"
         }
-    }
-
-    /// An Undo or Redo button. It is disabled with nothing to do, and its
-    /// hover text names the step.
-    pub(crate) fn history_button<'a>(
-        &self,
-        label: &'a str,
-        verb: &str,
-        step: Option<&undo::Step>,
-        message: Message,
-    ) -> Element<'a, Message> {
-        let hint = match step {
-            Some(step) => format!("{verb}: {}", step.name()),
-            None => format!("Nothing to {}", verb.to_lowercase()),
-        };
-        tooltip(
-            button(text(label).size(style::CONTROL)).on_press_maybe(step.map(|_| message)),
-            container(text(hint).size(style::BODY))
-                .padding(6)
-                .style(container::rounded_box),
-            tooltip::Position::Bottom,
-        )
-        .into()
     }
 
     pub(crate) fn inspector(&self) -> Element<'_, Message> {
@@ -501,4 +479,23 @@ pub(crate) fn severity_colour(severity: alerts::Severity) -> Color {
         alerts::Severity::Warning => style::WARNING_TEXT,
         alerts::Severity::Alarm => style::ERROR_TEXT,
     }
+}
+
+/// A toolbar Undo or Redo button. `hint` names what it would do, and the
+/// button works only then; otherwise the hover text says why not.
+fn history_button<'a>(
+    label: &'a str,
+    hint: Result<String, crate::editing::HistoryBlock>,
+    message: Message,
+) -> Element<'a, Message> {
+    let enabled = hint.is_ok();
+    let hint = hint.unwrap_or_else(|block| block.hover(label == "Redo").to_string());
+    tooltip(
+        button(text(label).size(style::CONTROL)).on_press_maybe(enabled.then_some(message)),
+        container(text(hint).size(style::BODY))
+            .padding(6)
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    )
+    .into()
 }

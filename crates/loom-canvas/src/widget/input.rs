@@ -11,8 +11,10 @@ impl<Message> PatchCanvas<'_, Message> {
             camera: still.camera,
             // Already framed, so the first redraw keeps this camera.
             framed_key: Some(self.frame_key),
-            focus: still.focus,
-            tab_focus: still.focus.is_some(),
+            // Focus as after a Tab press, so the ring and the value show.
+            focus: still.focus.map_or(focus::FocusState::None, |(module, widget)| {
+                focus::FocusState::at(module, widget, true, focus::FocusMode::Browse)
+            }),
             pinned: still.pinned,
             ..State::default()
         };
@@ -57,7 +59,7 @@ impl<Message> PatchCanvas<'_, Message> {
         let screen = relative(cursor, bounds);
         state.size = bounds.size();
 
-        if self.matrix_escape
+        if self.focus_policy.matrix_escape
             && matches!(
                 event,
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -75,9 +77,9 @@ impl<Message> PatchCanvas<'_, Message> {
 
         let keys_elsewhere = match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                (self.matrix_keyboard && !modifiers.command())
-                    || (self.text_field_keys
-                        && (self.text_field_keeps_tab
+                (self.focus_policy.matrix_keyboard && !modifiers.command())
+                    || (self.focus_policy.text_field_keys
+                        && (self.focus_policy.text_field_keeps_tab
                             || !matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab))))
             }
             _ => false,
@@ -87,7 +89,7 @@ impl<Message> PatchCanvas<'_, Message> {
             return;
         }
 
-        if !self.interactive {
+        if !self.focus_policy.interactive {
             // Modifiers still count, so Shift held while the pop-up closes
             // is known on the next click.
             if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
@@ -100,21 +102,21 @@ impl<Message> PatchCanvas<'_, Message> {
             self.release_pointer_hold(state, shell);
             self.release_every_key_hold(state, shell);
             self.end_gestures(state, shell);
+            self.end_arrow_group(shell, false);
             state.interaction = Interaction::Idle;
-            state.typed = None;
+            state.focus.close_typing();
             if !matches!(event, Event::Window(_)) {
                 return;
             }
         }
 
-        self.close_stale_inside(state);
-        // An open list comes before every other use of the pointer. A stale
-        // one is closed first, so the event still does its normal work.
-        self.close_stale_select(state);
+        // A list, field, or grab whose control has gone is closed first, so
+        // the event still does its normal work.
+        self.reconcile_focus(state);
+        // An open list comes before every other use of the pointer.
         if self.select_popup_event(state, event, bounds, over, screen, shell) {
             return;
         }
-        self.close_stale_typed(state);
         if self.typed_field_event(state, event, bounds, screen, shell) {
             return;
         }
@@ -125,22 +127,16 @@ impl<Message> PatchCanvas<'_, Message> {
                 ..
             }) if matches!(state.interaction, Interaction::Wiring { .. }) => {
                 self.end_gestures(state, shell);
+                self.end_arrow_group(shell, false);
                 shell.request_redraw();
                 shell.capture_event();
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let new_frame = state.framed_key != Some(self.frame_key);
-                if state.framed_key.is_some_and(|key| key != self.frame_key) {
-                    // The app has replaced the patch and its gesture history.
-                    // Do not deliver the previous patch's delayed arrow end.
-                    state.arrow_deadline = None;
-                    state.arrow_gesture = false;
-                }
-                if state.arrow_deadline.is_some_and(|due| *now >= due) {
-                    state.arrow_deadline = None;
-                    if std::mem::take(&mut state.arrow_gesture) {
-                        self.emit(shell, CanvasEvent::ArrowGroupEnd);
-                    }
+                if let ArrowGroupView::Released { due } = self.arrow_group
+                    && *now >= due
+                {
+                    self.emit(shell, CanvasEvent::ArrowGroupDue { at: *now });
                 }
                 if state
                     .browser_key
@@ -155,7 +151,7 @@ impl<Message> PatchCanvas<'_, Message> {
                         state.camera.frame_readable(world, bounds.size(), READABLE_ZOOM);
                     }
                     state.framed_key = Some(self.frame_key);
-                    state.typed = None;
+                    state.focus.close_typing();
                     // A new frame key means a new patch: its lights have to
                     // be reported again, even if the list looks the same.
                     state.reported_lights = None;
@@ -280,17 +276,18 @@ impl<Message> PatchCanvas<'_, Message> {
             // takes the keys from the canvas, so a digit never opens a field
             // on a control the player has left.
             Event::Mouse(mouse::Event::ButtonPressed(_)) if !over => {
-                state.focus = None;
+                state.focus.clear();
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) if over => {
                 let Some(screen) = screen else { return };
-                if self.matrix_keyboard {
+                if self.focus_policy.matrix_keyboard {
                     self.emit(shell, CanvasEvent::PointerDown);
                 }
                 // A second button must end a hold. Replacing the interaction
                 // without a release would leave a momentary gate high.
                 self.release_pointer_hold(state, shell);
                 self.end_gestures(state, shell);
+                self.end_arrow_group(shell, false);
                 let world = state.camera.to_world(screen);
                 match button {
                     mouse::Button::Middle => {
@@ -630,6 +627,9 @@ impl<Message> PatchCanvas<'_, Message> {
                 self.release_pointer_hold(state, shell);
                 self.release_every_key_hold(state, shell);
                 self.end_gestures(state, shell);
+                // No key-up follows, so a group this view does not show yet
+                // must end too.
+                self.end_arrow_group(shell, true);
                 shell.request_redraw();
             }
             _ => {}
@@ -646,7 +646,7 @@ impl<Message> PatchCanvas<'_, Message> {
     ) {
         if let Some(tile) = self.resize_at(world) {
             self.select_for_edit(tile.id, shell);
-            state.focus = None;
+            state.focus.clear();
             self.begin(
                 state,
                 Interaction::Resizing {
@@ -664,8 +664,7 @@ impl<Message> PatchCanvas<'_, Message> {
         let hit = self.scene.hit(world, state.hit_radius());
         // A press ends the keyboard's inside of a composite widget and any
         // grab (panel-widgets.md, rule 4).
-        state.inside = None;
-        state.tab_focus = false;
+        state.focus.pressed();
         state.focus_first = false;
         // The ring of a modulated knob reaches a little past the knob's
         // cell, so it is found before the hit test's answer is used.
@@ -687,14 +686,14 @@ impl<Message> PatchCanvas<'_, Message> {
             return;
         }
         if !matches!(hit, Hit::Widget { .. }) {
-            state.focus = None;
+            state.focus.clear();
         }
         match hit {
             Hit::Widget { module, widget } if self.learn.is_some() && self.is_control(module, widget) => {
                 self.select_for_edit(module, shell);
                 // The clicked control takes the keyboard focus, so Space or
                 // Enter acts on it next, not on a control focused earlier.
-                state.focus = Some((module, widget));
+                state.focus.set(module, widget, false);
                 self.emit(shell, CanvasEvent::Learn { module, widget });
             }
             Hit::Badge(port) => {
@@ -704,7 +703,7 @@ impl<Message> PatchCanvas<'_, Message> {
             }
             Hit::Widget { module, widget } => {
                 self.select_for_edit(module, shell);
-                state.focus = Some((module, widget));
+                state.focus.set(module, widget, false);
                 let now = Instant::now();
                 // Where a double-click resets, and so what it must land on
                 // twice: `low` then `high` is not a double-click.

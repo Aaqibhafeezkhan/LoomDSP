@@ -1,3 +1,4 @@
+use super::focus::{FocusMode, FocusState, RangePart};
 use super::panel_input::{focusable, next_focus};
 use super::*;
 use crate::WidgetValue;
@@ -112,8 +113,7 @@ fn a_control_focused_by_keyboard_has_a_ring_clear_of_its_caption() {
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let unfocused = canvas.overlay(&State::default()).shapes.len();
     let tabbed = State {
-        focus: Some((1, 0)),
-        tab_focus: true,
+        focus: FocusState::at(1, 0, true, FocusMode::Browse),
         ..State::default()
     };
     let overlay = canvas.overlay(&tabbed);
@@ -134,7 +134,7 @@ fn a_control_focused_by_keyboard_has_a_ring_clear_of_its_caption() {
     );
     // Focus from a click or a drag shows no ring (#92).
     let clicked = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     assert_eq!(canvas.overlay(&clicked).shapes.len(), unfocused);
@@ -360,8 +360,7 @@ fn tab_focus_shows_hover_text_but_a_click_does_not() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let focused = |tab_focus| State {
-        focus: Some((1, 2)),
-        tab_focus,
+        focus: FocusState::at(1, 2, tab_focus, FocusMode::Browse),
         ..State::default()
     };
     assert_eq!(canvas.hover_target(&focused(true)), Some(HoverTarget::Control(1, 2)));
@@ -550,7 +549,7 @@ fn select_popup_preserves_choice_and_tile_gestures() {
         &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
         centre,
     );
-    assert!(state.select_popup.is_some());
+    assert!(state.focus.popup().is_some());
     let list = canvas
         .select_popup_bounds(&state, Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)))
         .unwrap();
@@ -562,7 +561,7 @@ fn select_popup_preserves_choice_and_tile_gestures() {
         position: 1.0,
         part: ControlPart::Main
     }));
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
 
     // Scrolling dismisses the open list without changing the canvas zoom.
     drive(&canvas, &mut state, &click(mouse::Button::Left), centre);
@@ -572,7 +571,7 @@ fn select_popup_preserves_choice_and_tile_gestures() {
         &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
         centre,
     );
-    assert!(state.select_popup.is_some());
+    assert!(state.focus.popup().is_some());
     let zoom = state.camera.zoom;
     let events = drive(
         &canvas,
@@ -583,7 +582,7 @@ fn select_popup_preserves_choice_and_tile_gestures() {
         centre,
     );
     assert!(events.is_empty());
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
     assert_eq!(state.camera.zoom, zoom);
 
     drive(&canvas, &mut state, &click(mouse::Button::Left), centre);
@@ -606,7 +605,7 @@ fn select_popup_preserves_choice_and_tile_gestures() {
             .iter()
             .any(|event| matches!(event, CanvasEvent::SetControl { .. }))
     );
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
 }
 
 /// Focused select lists open with Space, move the highlight with vertical
@@ -629,12 +628,12 @@ fn select_popup_keyboard_choices_are_explicit() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let at = scene.module(1).unwrap().widget_bounds(0).unwrap().center();
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), at).is_empty());
-    assert!(state.select_popup.is_some());
+    assert!(state.focus.popup().is_some());
     assert!(
         drive(
             &canvas,
@@ -650,8 +649,8 @@ fn select_popup_keyboard_choices_are_explicit() {
         keyboard::key::Named::Tab,
     ] {
         assert!(drive(&canvas, &mut state, &key_event(key, true), at).is_empty());
-        assert_eq!(state.focus, Some((1, 0)));
-        assert_eq!(state.select_popup.map(|popup| popup.highlight), Some(1));
+        assert_eq!(state.focus.control(), Some((1, 0)));
+        assert_eq!(state.focus.popup().map(|popup| popup.highlight), Some(1));
     }
     let chosen = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at);
     assert_eq!(
@@ -663,10 +662,10 @@ fn select_popup_keyboard_choices_are_explicit() {
             part: ControlPart::Main
         }]
     );
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
     drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), at);
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Escape, true), at).is_empty());
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
 }
 
 /// When a mode change hides the focused select with its list open, the
@@ -693,19 +692,21 @@ fn hiding_the_focused_select_closes_it_and_uses_up_the_key() {
     let at = scene.module(1).unwrap().bounds().center();
     for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Enter] {
         let mut state = State {
-            focus: Some((1, 0)),
-            select_popup: Some(SelectPopup {
-                module: 1,
-                widget: 0,
-                highlight: 1,
-                scroll: 0,
-                wheel: 0.0,
-            }),
+            focus: FocusState::at(
+                1,
+                0,
+                false,
+                FocusMode::Popup(SelectPopup {
+                    highlight: 1,
+                    scroll: 0,
+                    wheel: 0.0,
+                }),
+            ),
             ..State::default()
         };
         let events = drive(&canvas, &mut state, &key_event(key, true), at);
         assert!(events.is_empty(), "{key:?}: {events:?}");
-        assert!(state.select_popup.is_none() && state.focus.is_none());
+        assert!(state.focus.popup().is_none() && state.focus.control().is_none());
     }
 }
 
@@ -718,18 +719,21 @@ fn stale_select_popup_passes_escape_to_normal_key_handling() {
     let at = scene.module(1).unwrap().bounds().center();
     for module in [1, 999] {
         let mut state = State {
-            select_popup: Some(SelectPopup {
+            focus: FocusState::at(
                 module,
-                widget: 999,
-                highlight: 0,
-                scroll: 0,
-                wheel: 0.0,
-            }),
+                999,
+                false,
+                FocusMode::Popup(SelectPopup {
+                    highlight: 0,
+                    scroll: 0,
+                    wheel: 0.0,
+                }),
+            ),
             ..State::default()
         };
         let events = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Escape, true), at);
         assert_eq!(events, vec![CanvasEvent::Select(Vec::new())]);
-        assert!(state.select_popup.is_none());
+        assert!(state.focus.popup().is_none());
     }
 }
 
@@ -742,25 +746,28 @@ fn stale_select_popup_passes_the_pointer_to_normal_handling() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let stale = || {
-        Some(SelectPopup {
-            module: 999,
-            widget: 0,
-            highlight: 0,
-            scroll: 0,
-            wheel: 0.0,
-        })
+        FocusState::at(
+            999,
+            0,
+            false,
+            FocusMode::Popup(SelectPopup {
+                highlight: 0,
+                scroll: 0,
+                wheel: 0.0,
+            }),
+        )
     };
     let empty = Point::new(790.0, 590.0);
     let mut state = State {
-        select_popup: stale(),
+        focus: stale(),
         ..State::default()
     };
     drive(&canvas, &mut state, &click(mouse::Button::Left), empty);
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
     assert!(matches!(state.interaction, Interaction::Selecting { .. }));
 
     let mut state = State {
-        select_popup: stale(),
+        focus: stale(),
         ..State::default()
     };
     let zoom = state.camera.zoom;
@@ -793,18 +800,21 @@ fn select_popup_commits_to_its_own_widget_and_closes_with_no_edit() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let at = scene.module(1).unwrap().widget_bounds(1).unwrap().center();
+    // The list is the focused control's own, whatever had the focus before.
     let open = || {
-        Some(SelectPopup {
-            module: 1,
-            widget: 0,
-            highlight: 1,
-            scroll: 0,
-            wheel: 0.0,
-        })
+        FocusState::at(
+            1,
+            0,
+            false,
+            FocusMode::Popup(SelectPopup {
+                highlight: 1,
+                scroll: 0,
+                wheel: 0.0,
+            }),
+        )
     };
     let mut state = State {
-        focus: Some((1, 1)),
-        select_popup: open(),
+        focus: open(),
         ..State::default()
     };
     let chosen = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at);
@@ -819,11 +829,11 @@ fn select_popup_commits_to_its_own_widget_and_closes_with_no_edit() {
     );
 
     let mut state = State {
-        select_popup: open(),
+        focus: open(),
         ..State::default()
     };
     let unfocused = drive(&canvas, &mut state, &Event::Window(window::Event::Unfocused), at);
-    assert!(state.select_popup.is_none());
+    assert!(state.focus.popup().is_none());
     assert!(!unfocused.iter().any(|e| matches!(e, CanvasEvent::SetControl { .. })));
 }
 
@@ -886,7 +896,7 @@ fn a_long_select_list_scrolls() {
     };
     let zoom = state.camera.zoom;
     drive(&canvas, &mut state, &wheel(-3.0), inside);
-    assert_eq!(state.select_popup.unwrap().scroll, 3);
+    assert_eq!(state.focus.popup().copied().unwrap().scroll, 3);
     assert_eq!(state.camera.zoom, zoom, "the wheel does not zoom over a list");
 
     // Small trackpad steps add up to a whole row.
@@ -897,15 +907,15 @@ fn a_long_select_list_scrolls() {
         },
     });
     drive(&canvas, &mut state, &pixels, inside);
-    assert_eq!(state.select_popup.unwrap().scroll, 3);
+    assert_eq!(state.focus.popup().copied().unwrap().scroll, 3);
     drive(&canvas, &mut state, &pixels, inside);
-    assert_eq!(state.select_popup.unwrap().scroll, 4);
+    assert_eq!(state.focus.popup().copied().unwrap().scroll, 4);
 
     // It stops at either end.
     drive(&canvas, &mut state, &wheel(-100.0), inside);
-    assert_eq!(state.select_popup.unwrap().scroll, 18);
+    assert_eq!(state.focus.popup().copied().unwrap().scroll, 18);
     drive(&canvas, &mut state, &wheel(100.0), inside);
-    assert_eq!(state.select_popup.unwrap().scroll, 0);
+    assert_eq!(state.focus.popup().copied().unwrap().scroll, 0);
 
     // A press picks the row it is on, counting what has scrolled away.
     drive(&canvas, &mut state, &wheel(-5.0), inside);
@@ -929,7 +939,7 @@ fn a_long_select_list_scrolls() {
             box_at,
         );
     }
-    let popup = state.select_popup.unwrap();
+    let popup = state.focus.popup().copied().unwrap();
     assert_eq!((popup.highlight, popup.scroll), (15, 4));
 }
 
@@ -961,7 +971,7 @@ fn a_select_list_fits_the_canvas_and_a_short_one_keeps_the_wheel() {
         }),
         inside,
     );
-    let popup = state.select_popup.expect("stays open");
+    let popup = state.focus.popup().copied().expect("stays open");
     assert_eq!(popup.scroll, 0);
 }
 
@@ -979,7 +989,7 @@ fn a_list_on_a_grown_canvas_has_no_blank_rows() {
         ..State::default()
     };
     canvas.open_select(&mut state, 1, 0);
-    state.select_popup.as_mut().unwrap().scroll = 26;
+    state.focus.popup_mut().unwrap().scroll = 26;
 
     // Then `drive` gives it a canvas with room for all 12 rows.
     state.size = area.size();
@@ -1018,12 +1028,12 @@ fn typing_in_an_open_list_jumps_to_the_next_match() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     canvas.open_select(&mut state, 1, 0);
     let letter = |c: &str| typed(keyboard::Key::Character(c.into()), c);
-    let highlight = |state: &State| state.select_popup.unwrap().highlight;
+    let highlight = |state: &State| state.focus.popup().copied().unwrap().highlight;
 
     drive(&canvas, &mut state, &letter("s"), at);
     assert_eq!(highlight(&state), 1, "searches from after the highlight");
@@ -1035,7 +1045,7 @@ fn typing_in_an_open_list_jumps_to_the_next_match() {
     let events = drive(&canvas, &mut state, &letter("a"), at);
     assert!(events.is_empty(), "no match edits nothing: {events:?}");
     assert_eq!(highlight(&state), 3);
-    assert!(state.select_popup.is_some());
+    assert!(state.focus.popup().is_some());
 
     // Backspace sends a control character, and must not delete the module.
     let events = drive(
@@ -1171,7 +1181,7 @@ fn a_fader_takes_the_keys_of_a_knob() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let events = drive(&canvas, &mut state, &key_event(keyboard::key::Named::ArrowUp, true), at);
@@ -1249,7 +1259,10 @@ fn a_focused_text_field_keeps_keys_from_the_canvas() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event)
         .values(&values)
-        .text_field_keys(true);
+        .focus_policy(CanvasFocusPolicy {
+            text_field_keys: true,
+            ..CanvasFocusPolicy::default()
+        });
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State::default();
     for key in [
@@ -1262,7 +1275,7 @@ fn a_focused_text_field_keeps_keys_from_the_canvas() {
         let events = drive(&canvas, &mut state, &key_event(key, true), at);
         assert!(events.is_empty(), "{key:?} did nothing, but sent {events:?}");
     }
-    assert_eq!(state.focus, None, "Enter did not focus a control");
+    assert_eq!(state.focus.control(), None, "Enter did not focus a control");
 
     let paste = typed_key(
         keyboard::Key::Character("v".into()),
@@ -1285,7 +1298,7 @@ fn a_press_outside_closes_a_select_list_and_clears_focus() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         size: Size::new(800.0, 600.0),
         ..State::default()
     };
@@ -1297,8 +1310,8 @@ fn a_press_outside_closes_a_select_list_and_clears_focus() {
         Point::new(-10.0, -10.0),
     );
     assert!(events.is_empty());
-    assert!(state.select_popup.is_none());
-    assert_eq!(state.focus, None);
+    assert!(state.focus.popup().is_none());
+    assert_eq!(state.focus.control(), None);
 }
 
 /// A select list stays inside the canvas with its box panned off either edge.
@@ -1329,7 +1342,7 @@ fn no_typed_field_opens_during_a_drag() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         interaction: Interaction::Panning {
             last: Point::ORIGIN,
             click: None,
@@ -1337,7 +1350,7 @@ fn no_typed_field_opens_during_a_drag() {
         ..State::default()
     };
     type_text(&canvas, &mut state, "5", at);
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
 }
 
 /// The reason for bad text goes below the field, above it at the canvas's
@@ -1370,20 +1383,20 @@ fn a_digit_opens_the_typed_field_and_enter_commits() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     assert!(type_text(&canvas, &mut state, "129", at).is_empty());
-    assert_eq!(state.typed.as_ref().unwrap().text, "129");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "129");
 
     let named = |key| key_event(key, true);
     use keyboard::key::Named;
     drive(&canvas, &mut state, &named(Named::ArrowLeft), at);
     drive(&canvas, &mut state, &named(Named::Backspace), at);
-    assert_eq!(state.typed.as_ref().unwrap().text, "19", "Backspace takes the 2");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "19", "Backspace takes the 2");
     drive(&canvas, &mut state, &named(Named::Home), at);
     drive(&canvas, &mut state, &named(Named::Delete), at);
-    assert_eq!(state.typed.as_ref().unwrap().text, "9", "Delete takes the 1");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "9", "Delete takes the 1");
     drive(
         &canvas,
         &mut state,
@@ -1397,7 +1410,7 @@ fn a_digit_opens_the_typed_field_and_enter_commits() {
         &typed(keyboard::Key::Character("0".into()), "0"),
         at,
     );
-    assert_eq!(state.typed.as_ref().unwrap().text, "190");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "190");
 
     let committed = drive(&canvas, &mut state, &named(Named::Enter), at);
     assert_eq!(
@@ -1408,8 +1421,8 @@ fn a_digit_opens_the_typed_field_and_enter_commits() {
             text: "190".into()
         }]
     );
-    assert!(state.typed.is_none());
-    assert_eq!(state.focus, Some((1, 0)), "focus stays on the control");
+    assert!(state.focus.typed().is_none());
+    assert_eq!(state.focus.control(), Some((1, 0)), "focus stays on the control");
 }
 
 /// The first key reads the typed text, not the key, so a layout where a digit
@@ -1431,19 +1444,19 @@ fn the_field_opens_on_what_was_typed_not_on_the_key() {
         ("x", "x", false),
     ] {
         let mut state = State {
-            focus: Some((1, 0)),
+            focus: FocusState::at(1, 0, false, FocusMode::Browse),
             ..State::default()
         };
         let event = typed_key(keyboard::Key::Character(key.into()), Some(text), none, false);
         drive(&canvas, &mut state, &event, at);
-        assert_eq!(state.typed.is_some(), opens, "{key} {text}");
+        assert_eq!(state.focus.typed().is_some(), opens, "{key} {text}");
         if opens {
-            assert_eq!(state.typed.unwrap().text, text);
+            assert_eq!(state.focus.typed().unwrap().draft.text, text);
         }
     }
     // With Command, a digit or a dot stays a shortcut, so Cmd+. can panic.
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let event = typed_key(
@@ -1453,7 +1466,7 @@ fn the_field_opens_on_what_was_typed_not_on_the_key() {
         false,
     );
     drive(&canvas, &mut state, &event, at);
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
     // A control that does not take numbers ignores a digit.
     let mut state = State::default();
     drive(
@@ -1462,7 +1475,7 @@ fn the_field_opens_on_what_was_typed_not_on_the_key() {
         &typed(keyboard::Key::Character("1".into()), "1"),
         at,
     );
-    assert!(state.typed.is_none(), "no focus, no field");
+    assert!(state.focus.typed().is_none(), "no focus, no field");
 }
 
 /// While the field is open it takes every key: Backspace does not delete the
@@ -1475,7 +1488,7 @@ fn the_open_field_takes_every_key() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     use keyboard::key::Named;
@@ -1499,7 +1512,7 @@ fn the_open_field_takes_every_key() {
     }
     assert_eq!(state.camera, camera);
     assert_eq!(
-        state.typed.as_ref().unwrap().text,
+        state.focus.typed().unwrap().draft.text,
         "fa",
         "letters are text; Cmd+V is not"
     );
@@ -1511,10 +1524,10 @@ fn the_open_field_takes_every_key() {
         true,
     );
     assert!(drive(&canvas, &mut state, &held, at).is_empty());
-    assert!(state.typed.is_some(), "a repeat does not commit");
+    assert!(state.focus.typed().is_some(), "a repeat does not commit");
 
     let tabbed = drive(&canvas, &mut state, &key_event(Named::Tab, true), at);
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
     assert_eq!(tabbed, vec![CanvasEvent::Select(vec![1])], "Tab moves on as usual");
 }
 
@@ -1528,27 +1541,31 @@ fn enter_on_unchanged_text_commits_nothing() {
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     use keyboard::key::Named;
     assert!(drive(&canvas, &mut state, &key_event(Named::Enter, true), at).is_empty());
-    assert_eq!(state.typed.as_ref().unwrap().text, "128.0 BPM");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "128.0 BPM");
     assert!(drive(&canvas, &mut state, &key_event(Named::Enter, true), at).is_empty());
-    assert!(state.typed.is_none(), "closed, with no edit");
+    assert!(state.focus.typed().is_none(), "closed, with no edit");
 
     drive(&canvas, &mut state, &key_event(Named::Enter, true), at);
     type_text(&canvas, &mut state, "9", at);
-    assert_eq!(state.typed.as_ref().unwrap().text, "9", "the selection is replaced");
+    assert_eq!(
+        state.focus.typed().unwrap().draft.text,
+        "9",
+        "the selection is replaced"
+    );
     assert!(drive(&canvas, &mut state, &key_event(Named::Escape, true), at).is_empty());
-    assert!(state.typed.is_none());
-    assert_eq!(state.focus, Some((1, 0)), "Escape closes only the field");
+    assert!(state.focus.typed().is_none());
+    assert_eq!(state.focus.control(), Some((1, 0)), "Escape closes only the field");
 
     // Selected text and Backspace leave an empty field, and the next character
     // goes in it.
     drive(&canvas, &mut state, &key_event(Named::Enter, true), at);
     drive(&canvas, &mut state, &key_event(Named::Backspace, true), at);
-    assert_eq!(state.typed.as_ref().unwrap().text, "");
+    assert_eq!(state.focus.typed().unwrap().draft.text, "");
 }
 
 /// Bad text stays open and Enter does nothing. It can be corrected, and then
@@ -1566,19 +1583,16 @@ fn bad_typed_text_blocks_enter_until_it_is_corrected() {
         });
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     use keyboard::key::Named;
     type_text(&canvas, &mut state, "1a", at);
-    assert_eq!(
-        canvas.typed_error(state.typed.as_ref().unwrap()),
-        Some("Not a number in Hz".to_string())
-    );
+    assert_eq!(state.focus.typed().unwrap().draft.error(), Some("Not a number in Hz"));
     assert!(drive(&canvas, &mut state, &key_event(Named::Enter, true), at).is_empty());
-    assert!(state.typed.is_some(), "bad text keeps the field open");
+    assert!(state.focus.typed().is_some(), "bad text keeps the field open");
     drive(&canvas, &mut state, &key_event(Named::Backspace, true), at);
-    assert!(canvas.typed_error(state.typed.as_ref().unwrap()).is_none());
+    assert!(state.focus.typed().unwrap().draft.error().is_none());
     assert_eq!(drive(&canvas, &mut state, &key_event(Named::Enter, true), at).len(), 1);
 }
 
@@ -1593,7 +1607,7 @@ fn moving_focus_away_closes_the_field_with_no_change() {
     let at = scene.module(1).unwrap().bounds().center();
     let opened = || {
         let mut state = State {
-            focus: Some((1, 0)),
+            focus: FocusState::at(1, 0, false, FocusMode::Browse),
             ..State::default()
         };
         type_text(&canvas, &mut state, "5", at);
@@ -1607,23 +1621,20 @@ fn moving_focus_away_closes_the_field_with_no_change() {
 
     let mut state = opened();
     let area = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
-    let on_field = canvas
-        .typed_field_bounds(&state, area, state.typed.as_ref().unwrap())
-        .unwrap()
-        .center();
+    let on_field = canvas.typed_field_bounds(&state, area).unwrap().center();
     assert!(!edits(&drive(
         &canvas,
         &mut state,
         &click(mouse::Button::Left),
         on_field
     )));
-    assert!(state.typed.is_some(), "a press on the field stays");
+    assert!(state.focus.typed().is_some(), "a press on the field stays");
     assert!(matches!(state.interaction, Interaction::Idle));
 
     let mut state = opened();
     let empty = Point::new(790.0, 590.0);
     assert!(!edits(&drive(&canvas, &mut state, &click(mouse::Button::Left), empty)));
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
     assert!(
         matches!(state.interaction, Interaction::Selecting { .. }),
         "the press still works"
@@ -1635,7 +1646,7 @@ fn moving_focus_away_closes_the_field_with_no_change() {
         delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
     });
     assert!(!edits(&drive(&canvas, &mut state, &wheel, at)));
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
     assert_ne!(state.camera.zoom, zoom, "the wheel still zooms");
 
     let mut state = opened();
@@ -1645,7 +1656,7 @@ fn moving_focus_away_closes_the_field_with_no_change() {
         &Event::Window(window::Event::Unfocused),
         at
     )));
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
 
     // The module has gone from the selection.
     let mut state = opened();
@@ -1657,7 +1668,7 @@ fn moving_focus_away_closes_the_field_with_no_change() {
         &key_event(keyboard::key::Named::Enter, true),
         at
     )));
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
 }
 
 /// A press elsewhere in the window takes the keys from the canvas, so a digit
@@ -1668,7 +1679,7 @@ fn a_press_outside_the_canvas_takes_its_focus() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event).values(&values);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     drive(
@@ -1677,9 +1688,9 @@ fn a_press_outside_the_canvas_takes_its_focus() {
         &click(mouse::Button::Left),
         Point::new(5_000.0, 10.0),
     );
-    assert_eq!(state.focus, None);
+    assert_eq!(state.focus.control(), None);
     type_text(&canvas, &mut state, "5", Point::new(5_000.0, 10.0));
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
 }
 
 /// In MIDI learn mode no field opens: a digit does nothing, and Enter arms.
@@ -1693,14 +1704,14 @@ fn no_field_opens_in_midi_learn_mode() {
         .learn(Some(&learn));
     let at = scene.module(1).unwrap().bounds().center();
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     assert!(type_text(&canvas, &mut state, "5", at).is_empty());
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
     let armed = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at);
     assert_eq!(armed, vec![CanvasEvent::Learn { module: 1, widget: 0 }]);
-    assert!(state.typed.is_none());
+    assert!(state.focus.typed().is_none());
 }
 
 /// A drag in progress when a pop-up opens ends at the next redraw,
@@ -1717,7 +1728,10 @@ fn a_redraw_ends_gestures_and_holds_when_the_canvas_is_not_interactive() {
     let mut state = State::default();
     let pressed = drive(&canvas, &mut state, &click(mouse::Button::Left), tile);
     assert_eq!(pressed, vec![CanvasEvent::GestureStart]);
-    let blocked = PatchCanvas::new(&scene, &selected, |e| e).interactive(false);
+    let blocked = PatchCanvas::new(&scene, &selected, |e| e).focus_policy(CanvasFocusPolicy {
+        interactive: false,
+        ..CanvasFocusPolicy::default()
+    });
     let events = drive(&blocked, &mut state, &redraw, tile);
     assert!(events.contains(&CanvasEvent::GestureEnd), "{events:?}");
     assert!(matches!(state.interaction, Interaction::Idle));
@@ -1730,7 +1744,10 @@ fn a_redraw_ends_gestures_and_holds_when_the_canvas_is_not_interactive() {
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State::default();
     drive(&canvas, &mut state, &click(mouse::Button::Left), centre);
-    let blocked = PatchCanvas::new(&scene, &selected, |e| e).interactive(false);
+    let blocked = PatchCanvas::new(&scene, &selected, |e| e).focus_policy(CanvasFocusPolicy {
+        interactive: false,
+        ..CanvasFocusPolicy::default()
+    });
     let events = drive(&blocked, &mut state, &redraw, centre);
     assert!(
         events.contains(&CanvasEvent::ButtonReleased { module: 1, widget: 0 }),
@@ -1851,7 +1868,10 @@ fn paste_goes_to_the_pointer_or_the_centre_of_the_view() {
         }]
     );
     // While a pop-up has the keys, paste is the pop-up's.
-    let blocked = PatchCanvas::new(&scene, &none, |e| e).interactive(false);
+    let blocked = PatchCanvas::new(&scene, &none, |e| e).focus_policy(CanvasFocusPolicy {
+        interactive: false,
+        ..CanvasFocusPolicy::default()
+    });
     assert!(drive(&blocked, &mut state, &paste, at).is_empty());
 }
 
@@ -1865,7 +1885,10 @@ fn modifiers_stay_current_while_the_canvas_is_not_interactive() {
     let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT));
     let mut state = State::default();
 
-    let blocked = PatchCanvas::new(&scene, &selected, |e| e).interactive(false);
+    let blocked = PatchCanvas::new(&scene, &selected, |e| e).focus_policy(CanvasFocusPolicy {
+        interactive: false,
+        ..CanvasFocusPolicy::default()
+    });
     assert!(drive(&blocked, &mut state, &shift, tile).is_empty());
     assert!(state.modifiers.shift());
 
@@ -1974,7 +1997,13 @@ fn losing_the_window_releases_a_hold() {
         ..State::default()
     };
     let events = drive(&canvas, &mut state, &Event::Window(window::Event::Unfocused), centre);
-    assert_eq!(events, vec![CanvasEvent::ButtonReleased { module: 1, widget: 0 }]);
+    assert_eq!(
+        events,
+        vec![
+            CanvasEvent::ButtonReleased { module: 1, widget: 0 },
+            CanvasEvent::ArrowGroupEnd
+        ]
+    );
     assert!(matches!(state.interaction, Interaction::Idle));
     assert!(state.key_holds.iter().all(Option::is_none));
 }
@@ -2018,7 +2047,7 @@ fn each_key_releases_only_its_own_hold() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let at = Point::new(20.0, 20.0);
@@ -2026,7 +2055,7 @@ fn each_key_releases_only_its_own_hold() {
     let space = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), at);
     assert_eq!(space, vec![CanvasEvent::ButtonPressed { module: 1, widget: 0 }]);
 
-    state.focus = Some((1, 1));
+    state.focus.set(1, 1, false);
     let enter = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at);
     assert_eq!(enter, vec![CanvasEvent::ButtonPressed { module: 1, widget: 1 }]);
 
@@ -2044,7 +2073,7 @@ fn releasing_one_key_keeps_a_button_the_other_key_holds() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let at = Point::new(20.0, 20.0);
@@ -2089,7 +2118,7 @@ fn a_key_hold_survives_pointer_up_and_the_pointer_survives_a_key_up() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     drive(&canvas, &mut state, &click(mouse::Button::Left), centre);
@@ -2154,7 +2183,7 @@ fn space_with_no_focus_toggles_run() {
     let enter = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at);
     assert!(enter.is_empty());
 
-    state.focus = Some((1, 0));
+    state.focus.set(1, 0, false);
     let focused = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), at);
     assert_eq!(focused, vec![CanvasEvent::ButtonPressed { module: 1, widget: 0 }]);
 }
@@ -2220,11 +2249,11 @@ fn keyboard_focus_follows_tiles_and_controls() {
         vec![CanvasEvent::Select(vec![2])]
     );
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at).is_empty());
-    assert_eq!(state.focus, Some((2, 0)));
+    assert_eq!(state.focus.control(), Some((2, 0)));
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Tab, true), at).is_empty());
-    assert_eq!(state.focus, Some((2, 2)), "the light is skipped");
+    assert_eq!(state.focus.control(), Some((2, 2)), "the light is skipped");
     assert!(drive(&canvas, &mut state, &shifted(keyboard::key::Named::Tab), at).is_empty());
-    assert_eq!(state.focus, Some((2, 0)));
+    assert_eq!(state.focus.control(), Some((2, 0)));
     let toggle = drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), at);
     assert_eq!(
         toggle,
@@ -2233,40 +2262,93 @@ fn keyboard_focus_follows_tiles_and_controls() {
     );
 }
 
+/// A fixed time for arrow events, so tests can compare them. See
+/// [`untimed`].
+fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// The events with every arrow event's time set to [`epoch`].
+fn untimed(events: Vec<CanvasEvent>) -> Vec<CanvasEvent> {
+    events
+        .into_iter()
+        .map(|event| match event {
+            CanvasEvent::ArrowStep { .. } => CanvasEvent::ArrowStep { at: epoch() },
+            CanvasEvent::ArrowPressed { .. } => CanvasEvent::ArrowPressed { at: epoch() },
+            CanvasEvent::ArrowReleased { .. } => CanvasEvent::ArrowReleased { at: epoch() },
+            CanvasEvent::ArrowGroupDue { .. } => CanvasEvent::ArrowGroupDue { at: epoch() },
+            other => other,
+        })
+        .collect()
+}
+
+/// The group as the app shows it after a release, with a deadline far off.
+fn released_group() -> ArrowGroupView {
+    ArrowGroupView::Released {
+        due: Instant::now() + Duration::from_secs(60),
+    }
+}
+
+/// Shift pressed alone after an arrow release keeps the group open, so
+/// Shift and the next arrow join the same step. Another key ends it.
+#[test]
+fn a_modifier_alone_keeps_a_released_group() {
+    let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
+    let selected = BTreeSet::from([1]);
+    let released = PatchCanvas::new(&scene, &selected, |e| e).arrow_group(released_group());
+    let mut state = State::default();
+    let at = Point::new(700.0, 500.0);
+    for modifier in [keyboard::key::Named::Shift, keyboard::key::Named::Control] {
+        let events = drive(&released, &mut state, &key_event(modifier, true), at);
+        assert!(
+            !events.contains(&CanvasEvent::ArrowGroupEnd),
+            "{modifier:?} alone ended the group: {events:?}"
+        );
+    }
+    let other = drive(&released, &mut state, &key_event(keyboard::key::Named::Tab, true), at);
+    assert!(other.contains(&CanvasEvent::ArrowGroupEnd), "{other:?}");
+}
+
 /// An unfocused selected tile moves by one grid cell, or ten with Shift.
-/// The next key closes its pending arrow group before acting.
+/// The canvas reports each arrow step and release; with the group released,
+/// an arrow press says so first, and the next other key ends the group.
 #[test]
 fn keyboard_moves_selected_tile_and_closes_group_on_next_key() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let selected = BTreeSet::from([1]);
-    let canvas = PatchCanvas::new(&scene, &selected, |e| e);
+    let closed = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State::default();
     let at = Point::new(700.0, 500.0);
-    let first = drive(&canvas, &mut state, &arrow_up(), at);
+    let first = untimed(drive(&closed, &mut state, &arrow_up(), at));
     assert_eq!(
         first,
         vec![
-            CanvasEvent::GestureStart,
+            CanvasEvent::ArrowStep { at: epoch() },
             CanvasEvent::Move {
                 ids: vec![1],
                 delta: Vector::new(0.0, -GRID)
             }
         ]
     );
+    let up = key_event(keyboard::key::Named::ArrowUp, false);
     assert_eq!(
-        drive(
-            &canvas,
-            &mut state,
-            &key_event(keyboard::key::Named::ArrowUp, false),
-            at
-        ),
-        vec![CanvasEvent::ArrowGroupPending]
+        untimed(drive(&closed, &mut state, &up, at)),
+        vec![CanvasEvent::ArrowReleased { at: epoch() }]
     );
-    let next = drive(&canvas, &mut state, &shifted(keyboard::key::Named::ArrowRight), at);
+
+    let released = PatchCanvas::new(&scene, &selected, |e| e).arrow_group(released_group());
+    let next = untimed(drive(
+        &released,
+        &mut state,
+        &shifted(keyboard::key::Named::ArrowRight),
+        at,
+    ));
     assert_eq!(
         next,
         vec![
-            CanvasEvent::ArrowGroupResumed,
+            CanvasEvent::ArrowPressed { at: epoch() },
+            CanvasEvent::ArrowStep { at: epoch() },
             CanvasEvent::Move {
                 ids: vec![1],
                 delta: Vector::new(10.0 * GRID, 0.0)
@@ -2274,40 +2356,70 @@ fn keyboard_moves_selected_tile_and_closes_group_on_next_key() {
         ]
     );
     assert_eq!(
-        drive(
-            &canvas,
-            &mut state,
-            &key_event(keyboard::key::Named::ArrowRight, false),
-            at
-        ),
-        vec![CanvasEvent::ArrowGroupPending]
-    );
-    assert_eq!(
-        drive(&canvas, &mut state, &escape(), at),
+        drive(&released, &mut state, &escape(), at),
         vec![CanvasEvent::ArrowGroupEnd, CanvasEvent::Select(Vec::new())]
+    );
+    let plain = drive(&closed, &mut state, &escape(), at);
+    assert!(
+        !plain.contains(&CanvasEvent::ArrowGroupEnd),
+        "with no group open, Escape ends none: {plain:?}"
     );
 }
 
-/// A pointer press replaces a pending arrow group before starting its
-/// own interaction, so its eventual release cannot close the arrow step.
+/// A pointer press ends an open arrow group before starting its own
+/// interaction, so its eventual release cannot close the arrow step. With
+/// no group open it sends no end.
 #[test]
-fn pointer_press_ends_a_pending_arrow_group() {
+fn pointer_press_ends_an_open_arrow_group() {
+    let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
+    let selected = BTreeSet::from([1]);
+    let at = Point::new(700.0, 500.0);
+    for group in [ArrowGroupView::Held, released_group()] {
+        let canvas = PatchCanvas::new(&scene, &selected, |e| e).arrow_group(group);
+        let press = drive(&canvas, &mut State::default(), &click(mouse::Button::Left), at);
+        assert_eq!(press.first(), Some(&CanvasEvent::ArrowGroupEnd), "{group:?}: {press:?}");
+    }
+    let canvas = PatchCanvas::new(&scene, &selected, |e| e);
+    let press = drive(&canvas, &mut State::default(), &click(mouse::Button::Left), at);
+    assert!(!press.contains(&CanvasEvent::ArrowGroupEnd), "{press:?}");
+}
+
+/// Losing the window ends the group whatever the view shows, because no key
+/// release will come to end it.
+#[test]
+fn losing_the_window_always_ends_the_arrow_group() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
-    let mut state = State::default();
-    let at = Point::new(700.0, 500.0);
-    drive(&canvas, &mut state, &arrow_up(), at);
-    drive(
+    let lost = drive(
         &canvas,
-        &mut state,
-        &key_event(keyboard::key::Named::ArrowUp, false),
-        at,
+        &mut State::default(),
+        &Event::Window(window::Event::Unfocused),
+        Point::ORIGIN,
     );
-    let press = drive(&canvas, &mut state, &click(mouse::Button::Left), at);
-    assert_eq!(press.first(), Some(&CanvasEvent::ArrowGroupEnd), "{press:?}");
-    assert!(!state.arrow_gesture);
-    assert!(state.arrow_deadline.is_none());
+    assert!(lost.contains(&CanvasEvent::ArrowGroupEnd), "{lost:?}");
+}
+
+/// Keys that belong to an app text field leave the canvas, and end an open
+/// group, but send nothing with none open.
+#[test]
+fn keys_leaving_the_canvas_end_only_an_open_group() {
+    let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
+    let selected = BTreeSet::from([1]);
+    let policy = CanvasFocusPolicy {
+        text_field_keys: true,
+        ..CanvasFocusPolicy::default()
+    };
+    let at = Point::new(700.0, 500.0);
+    let quiet = PatchCanvas::new(&scene, &selected, |e| e).focus_policy(policy);
+    assert!(drive(&quiet, &mut State::default(), &arrow_up(), at).is_empty());
+    let open = PatchCanvas::new(&scene, &selected, |e| e)
+        .focus_policy(policy)
+        .arrow_group(released_group());
+    assert_eq!(
+        drive(&open, &mut State::default(), &arrow_up(), at),
+        vec![CanvasEvent::ArrowGroupEnd]
+    );
 }
 
 /// Keyboard navigation selects a tile, enters its control, edits it,
@@ -2328,7 +2440,7 @@ fn keys_reach_and_leave_a_panel_control() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Enter, true), at).is_empty());
-    assert_eq!(state.focus, Some((1, 0)));
+    assert_eq!(state.focus.control(), Some((1, 0)));
     let changed = drive(&canvas, &mut state, &arrow_up(), at);
     assert!(
         changed.iter().any(|e| matches!(
@@ -2347,11 +2459,13 @@ fn keys_reach_and_leave_a_panel_control() {
         &key_event(keyboard::key::Named::ArrowUp, false),
         at,
     );
+    // The app now shows the group released, so Escape ends it first.
+    let released = PatchCanvas::new(&scene, &selected, |e| e).arrow_group(released_group());
     assert_eq!(
-        drive(&canvas, &mut state, &escape(), at),
+        drive(&released, &mut state, &escape(), at),
         vec![CanvasEvent::ArrowGroupEnd]
     );
-    assert_eq!(state.focus, None);
+    assert_eq!(state.focus.control(), None);
     assert_eq!(
         drive(&canvas, &mut state, &escape(), at),
         vec![CanvasEvent::Select(Vec::new())]
@@ -2374,15 +2488,14 @@ fn a_learn_click_arms_and_focuses_without_changing_a_value() {
     let learn = LearnView::default();
     let canvas = learning(&scene, &selected, &learn);
     let mut state = State {
-        focus: Some((1, 2)),
-        tab_focus: true,
+        focus: FocusState::at(1, 2, true, FocusMode::Browse),
         ..State::default()
     };
     let knob = scene.module(1).unwrap().widget_bounds(0).unwrap().center();
     let events = drive(&canvas, &mut state, &click(mouse::Button::Left), knob);
     assert_eq!(events, vec![CanvasEvent::Learn { module: 1, widget: 0 }]);
     assert!(matches!(state.interaction, Interaction::Idle));
-    assert_eq!(state.focus, Some((1, 0)));
+    assert_eq!(state.focus.control(), Some((1, 0)));
 
     let button = scene.module(2).unwrap().widget_bounds(0).unwrap().center();
     let events = drive(&canvas, &mut state, &click(mouse::Button::Left), button);
@@ -2456,8 +2569,7 @@ fn learn_mode_keys_arm_and_never_change_a_value() {
     let canvas = learning(&scene, &selected, &learn);
     let at = Point::new(10.0, 10.0);
     let mut state = State {
-        focus: Some((1, 0)),
-        tab_focus: true,
+        focus: FocusState::at(1, 0, true, FocusMode::Browse),
         ..State::default()
     };
     for key in [keyboard::key::Named::Space, keyboard::key::Named::Enter] {
@@ -2487,7 +2599,7 @@ fn learn_mode_keys_arm_and_never_change_a_value() {
         iced::event::Status::Ignored,
         "the app must see Escape"
     );
-    assert_eq!(state.focus, None);
+    assert_eq!(state.focus.control(), None);
 
     let mut next_messages = Vec::new();
     let mut next_shell = Shell::new(&mut next_messages);
@@ -2941,8 +3053,8 @@ fn a_pin_without_its_badge_takes_no_escape() {
     assert_eq!(shell.event_status(), iced::event::Status::Ignored);
 }
 
-/// A new patch drops the pin and old arrow timer. Module IDs repeat
-/// between patches, and the new app has a fresh undo history.
+/// A new patch drops the pin. Module IDs repeat between patches. The arrow
+/// group needs nothing here: the app owns it, and a new patch closes it.
 #[test]
 fn a_new_patch_clears_old_canvas_state() {
     let (scene, values) = modulated_scene();
@@ -2951,40 +3063,80 @@ fn a_new_patch_clears_old_canvas_state() {
     let mut state = State {
         pinned: Some(OUT),
         framed_key: Some(1),
-        arrow_gesture: true,
-        arrow_deadline: Some(Instant::now() - Duration::from_millis(1)),
         ..State::default()
     };
     let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
     let events = drive(&canvas, &mut state, &redraw, Point::ORIGIN);
     assert!(!events.contains(&CanvasEvent::ArrowGroupEnd), "{events:?}");
-    assert!(!state.arrow_gesture);
-    assert!(state.arrow_deadline.is_none());
     assert_eq!(state.pinned, None);
 }
 
-/// The first frame has no old patch key, so it keeps a key gesture that
-/// began before that redraw.
+/// A redraw at or past the deadline the app gave says so, with its time,
+/// and one before it says nothing.
 #[test]
-fn first_frame_keeps_a_current_arrow_group() {
+fn a_redraw_past_the_deadline_reports_it() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let none = BTreeSet::new();
-    let canvas = PatchCanvas::new(&scene, &none, |e| e).frame_key(2);
-    let now = Instant::now();
-    let mut state = State {
-        arrow_gesture: true,
-        arrow_deadline: Some(now + Duration::from_millis(100)),
-        ..State::default()
-    };
-    let events = drive(
+    let due = Instant::now() + Duration::from_millis(100);
+    let canvas = PatchCanvas::new(&scene, &none, |e| e).arrow_group(ArrowGroupView::Released { due });
+    let redraw = |at| Event::Window(window::Event::RedrawRequested(at));
+    let mut state = State::default();
+    let early = drive(
         &canvas,
         &mut state,
-        &Event::Window(window::Event::RedrawRequested(now)),
+        &redraw(due - Duration::from_millis(1)),
         Point::ORIGIN,
     );
-    assert!(!events.contains(&CanvasEvent::ArrowGroupEnd), "{events:?}");
-    assert!(state.arrow_gesture);
-    assert!(state.arrow_deadline.is_some());
+    assert!(
+        !early.iter().any(|e| matches!(e, CanvasEvent::ArrowGroupDue { .. })),
+        "{early:?}"
+    );
+    let late = drive(&canvas, &mut state, &redraw(due), Point::ORIGIN);
+    assert!(late.contains(&CanvasEvent::ArrowGroupDue { at: due }), "{late:?}");
+}
+
+/// While the group is released, every event asks for a redraw at its
+/// deadline, not only the first, so the deadline is never lost on an idle
+/// patch: the runtime drops a pending one when a later frame is asked for.
+/// Within one event the earlier request wins, so the events here ask for no
+/// frame of their own.
+#[test]
+fn every_event_asks_for_a_redraw_at_the_deadline() {
+    let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
+    let none = BTreeSet::new();
+    let due = Instant::now() + Duration::from_millis(400);
+    let canvas = PatchCanvas::new(&scene, &none, |e| e).arrow_group(ArrowGroupView::Released { due });
+    let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+    // Already framed and reported, so a redraw asks for nothing itself.
+    let mut state = State::default();
+    let at = Point::new(100.0, 100.0);
+    let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
+    canvas.on_event(
+        &mut state,
+        &redraw,
+        bounds,
+        mouse::Cursor::Available(at),
+        &mut Shell::new(&mut Vec::new()),
+    );
+    for event in [
+        redraw,
+        Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)),
+    ] {
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        canvas.on_event(&mut state, &event, bounds, mouse::Cursor::Available(at), &mut shell);
+        assert_eq!(shell.redraw_request(), window::RedrawRequest::At(due), "{event:?}");
+    }
+    let closed = PatchCanvas::new(&scene, &none, |e| e);
+    let mut messages = Vec::new();
+    let mut shell = Shell::new(&mut messages);
+    let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT));
+    closed.on_event(&mut state, &shift, bounds, mouse::Cursor::Available(at), &mut shell);
+    assert_ne!(
+        shell.redraw_request(),
+        window::RedrawRequest::At(due),
+        "no group, no wake"
+    );
 }
 
 /// The lines are built once for a given pin, pointer, and selection,
@@ -3063,8 +3215,11 @@ fn matrix_escape_clears_canvas_pin() {
     let none = BTreeSet::new();
     let canvas = PatchCanvas::new(&scene, &none, |e| e)
         .values(&values)
-        .matrix_keyboard(true)
-        .matrix_escape(true);
+        .focus_policy(CanvasFocusPolicy {
+            matrix_keyboard: true,
+            matrix_escape: true,
+            ..CanvasFocusPolicy::default()
+        });
     let mut state = State {
         pinned: Some(OUT),
         ..State::default()
@@ -3079,7 +3234,10 @@ fn matrix_keyboard_focus_keeps_canvas_pointer_active() {
     let scene = chain();
     let selected = BTreeSet::from([1]);
     let tile = scene.module(2).unwrap().bounds().center();
-    let canvas = PatchCanvas::new(&scene, &selected, |e| e).matrix_keyboard(true);
+    let canvas = PatchCanvas::new(&scene, &selected, |e| e).focus_policy(CanvasFocusPolicy {
+        matrix_keyboard: true,
+        ..CanvasFocusPolicy::default()
+    });
     let mut state = State::default();
 
     assert!(drive(&canvas, &mut state, &key_event(keyboard::key::Named::Space, true), tile).is_empty());
@@ -3248,7 +3406,8 @@ fn losing_the_window_ends_a_drag_gesture() {
     let mut state = State::default();
     drive(&canvas, &mut state, &click(mouse::Button::Left), knob);
     let lost = drive(&canvas, &mut state, &Event::Window(window::Event::Unfocused), knob);
-    assert_eq!(lost, vec![CanvasEvent::GestureEnd]);
+    // The arrow group ends too: losing the window always sends its end.
+    assert_eq!(lost, vec![CanvasEvent::GestureEnd, CanvasEvent::ArrowGroupEnd]);
     let later = drive(&canvas, &mut state, &released(), knob);
     assert!(later.is_empty(), "{later:?}");
 }
@@ -3266,19 +3425,27 @@ fn another_button_during_a_drag_ends_the_gesture() {
     assert_eq!(events, vec![CanvasEvent::GestureEnd]);
 }
 
-/// A held arrow key repeats. The whole hold, key down to key up, is one
-/// gesture.
+/// A held arrow key repeats. Each press reports a step, and the app keeps
+/// them in one group; key up reports the release (`docs/design/undo.md`).
 #[test]
-fn a_held_arrow_key_is_one_gesture() {
+fn a_held_arrow_key_reports_each_step_and_the_release() {
     let (scene, knob) = knob_scene();
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |e| e);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
-    let first = drive(&canvas, &mut state, &arrow_up(), knob);
-    assert_eq!(first.first(), Some(&CanvasEvent::GestureStart), "{first:?}");
+    let first = untimed(drive(&canvas, &mut state, &arrow_up(), knob));
+    assert_eq!(
+        first.first(),
+        Some(&CanvasEvent::ArrowStep { at: epoch() }),
+        "{first:?}"
+    );
+    assert!(
+        !first.iter().any(|e| matches!(e, CanvasEvent::GestureStart)),
+        "an arrow sends no drag gesture: {first:?}"
+    );
     let Event::Keyboard(keyboard::Event::KeyPressed {
         key,
         modified_key,
@@ -3300,9 +3467,10 @@ fn a_held_arrow_key_is_one_gesture() {
         text,
         repeat: true,
     });
-    let repeat = drive(&canvas, &mut state, &again, knob);
-    assert!(
-        repeat.iter().all(|e| !matches!(e, CanvasEvent::GestureStart)),
+    let repeat = untimed(drive(&canvas, &mut state, &again, knob));
+    assert_eq!(
+        repeat.first(),
+        Some(&CanvasEvent::ArrowStep { at: epoch() }),
         "{repeat:?}"
     );
     let up = Event::Keyboard(keyboard::Event::KeyReleased {
@@ -3312,26 +3480,10 @@ fn a_held_arrow_key_is_one_gesture() {
         location: keyboard::Location::Standard,
         modifiers,
     });
-    let end = drive(&canvas, &mut state, &up, knob);
-    assert_eq!(end, vec![CanvasEvent::ArrowGroupPending]);
-    let quick = drive(&canvas, &mut state, &arrow_up(), knob);
-    assert!(
-        quick.iter().all(|e| !matches!(e, CanvasEvent::GestureStart)),
-        "{quick:?}"
-    );
-    assert_eq!(quick.first(), Some(&CanvasEvent::ArrowGroupResumed));
     assert_eq!(
-        drive(&canvas, &mut state, &up, knob),
-        vec![CanvasEvent::ArrowGroupPending]
+        untimed(drive(&canvas, &mut state, &up, knob)),
+        vec![CanvasEvent::ArrowReleased { at: epoch() }]
     );
-    let due = state.arrow_deadline.expect("a release schedules the end");
-    let end = drive(
-        &canvas,
-        &mut state,
-        &Event::Window(window::Event::RedrawRequested(due)),
-        knob,
-    );
-    assert!(end.contains(&CanvasEvent::ArrowGroupEnd), "{end:?}");
 }
 
 /// A right press and release at `at`, with no move in between.
@@ -3604,23 +3756,25 @@ fn hiding_a_range_ends_the_inside() {
     let at = shown.module(1).unwrap().bounds().center();
     let moved = Event::Mouse(mouse::Event::CursorMoved { position: at });
     let mut state = State {
-        focus: Some((1, 0)),
-        inside: Some(Inside {
-            module: 1,
-            widget: 0,
-            part: 0,
-            grab: Some(RangeGrab::Band),
-        }),
+        focus: FocusState::at(
+            1,
+            0,
+            false,
+            FocusMode::RangePart(RangePart {
+                part: 0,
+                grab: Some(RangeGrab::Band),
+            }),
+        ),
         ..State::default()
     };
 
     let canvas = PatchCanvas::new(&shown, &selected, |event| event);
     drive(&canvas, &mut state, &moved, at);
-    assert!(state.inside.is_some(), "a shown range keeps its grab");
+    assert!(state.focus.range_part().is_some(), "a shown range keeps its grab");
 
     let canvas = PatchCanvas::new(&hidden, &selected, |event| event);
     drive(&canvas, &mut state, &moved, at);
-    assert!(state.inside.is_none(), "hiding ends it");
+    assert!(state.focus.range_part().is_none(), "hiding ends it");
 
     let canvas = PatchCanvas::new(&shown, &selected, |event| event);
     let events = drive(
@@ -3651,7 +3805,7 @@ fn a_focused_xy_pad_does_not_use_space() {
     let selected = BTreeSet::from([1]);
     let canvas = PatchCanvas::new(&scene, &selected, |event| event);
     let mut state = State {
-        focus: Some((1, 0)),
+        focus: FocusState::at(1, 0, false, FocusMode::Browse),
         ..State::default()
     };
     let at = scene.module(1).unwrap().bounds().center();
