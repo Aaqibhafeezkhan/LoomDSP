@@ -1,5 +1,5 @@
 use super::*;
-use loom_core::{EngineConfig, create_engine};
+use loom_core::{EngineConfig, ParamRange, create_engine};
 
 const SIMPLE: &str = r#"
 // Comments are allowed.
@@ -26,8 +26,12 @@ Patch(
 fn load_text(text: &str) -> (Controller, Vec<String>) {
     let patch = Patch::from_ron(text).unwrap();
     let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
-    let mut notes = patch.load_into(&mut parts.controller).unwrap();
-    notes.retain(|note| !note.contains("no Transport"));
+    let notes = patch.load_into(&mut parts.controller).unwrap();
+    let notes = notes
+        .iter()
+        .filter(|note| !matches!(note, LoadWarning::TransportAdded { .. }))
+        .map(ToString::to_string)
+        .collect();
     (parts.controller, notes)
 }
 
@@ -40,11 +44,7 @@ fn every_patch_loads_with_exactly_one_transport() {
     let patch = Patch::from_ron(r#"Patch(version: 1, modules: [(id: 3, kind: "loom.math.mul@1")])"#).unwrap();
     let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
     let notes = patch.load_into(&mut parts.controller).unwrap();
-    assert_eq!(notes.len(), 1, "{notes:?}");
-    assert!(
-        notes[0].contains("no Transport") && notes[0].contains("module 4"),
-        "{notes:?}"
-    );
+    assert_eq!(notes, [LoadWarning::TransportAdded { module: 4 }]);
     assert_eq!(parts.controller.transport_module(), Some(ModuleId(4)));
 
     let two = Patch::from_ron(
@@ -205,7 +205,7 @@ fn example_patches_keep_their_values() {
         if path.extension().is_none_or(|e| e != "ron") {
             continue;
         }
-        let patch = Patch::load(&path).unwrap();
+        let patch = Patch::from_ron(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
         let notes = patch.load_into(&mut parts.controller).unwrap();
         assert!(notes.is_empty(), "{}: {notes:?}", path.display());
@@ -280,7 +280,9 @@ fn unknown_module_preserves_named_links_and_settings() {
     let patch = Patch::from_ron(text).unwrap();
     let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
     let notes = patch.load_into(&mut parts.controller).unwrap();
-    assert!(notes.iter().any(|note| note.contains("future.effect@3")));
+    assert!(notes.iter().any(
+        |note| matches!(note, LoadWarning::UnknownModules { kinds } if kinds.iter().any(|k| k.contains("future.effect@3")))
+    ));
     let node = parts.controller.graph().node(ModuleId(1)).unwrap();
     let unknown = node.unknown.as_ref().unwrap();
     assert_eq!(unknown.inputs, ["input"]);
@@ -392,46 +394,6 @@ fn modulation_round_trips_and_old_patches_load() {
 
 /// The engine adds assignments on one parameter in id order. Float sums
 /// depend on order, so a reloaded patch must keep it (review on #133).
-#[test]
-fn save_replaces_the_file_and_leaves_no_temporary() {
-    let dir = std::env::temp_dir().join(format!("loom-patch-save-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("p.ron");
-    std::fs::write(&path, "old").unwrap();
-    let patch = Patch::new("Saved");
-    patch.save(&path).unwrap();
-    assert_eq!(Patch::load(&path).unwrap().name, "Saved");
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left");
-    // A target that cannot be written reports the error and keeps the old file.
-    let missing = dir.join("no-such-folder").join("p.ron");
-    assert!(matches!(patch.save(&missing), Err(PatchError::Io { .. })));
-    // A read-only target is refused and keeps its content.
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&path, perms.clone()).unwrap();
-    assert!(matches!(Patch::new("Other").save(&path), Err(PatchError::Io { .. })));
-    assert_eq!(Patch::load(&path).unwrap().name, "Saved");
-    #[allow(clippy::permissions_set_readonly_false)]
-    perms.set_readonly(false);
-    std::fs::set_permissions(&path, perms).unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn save_through_a_symlink_updates_the_target() {
-    let dir = std::env::temp_dir().join(format!("loom-patch-link-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let real = dir.join("real.ron");
-    let link = dir.join("link.ron");
-    Patch::new("First").save(&real).unwrap();
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    Patch::new("Second").save(&link).unwrap();
-    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
-    assert_eq!(Patch::load(&real).unwrap().name, "Second");
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
 #[test]
 fn assignment_order_survives_save_and_load() {
     let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
@@ -626,4 +588,56 @@ fn bad_mapping_options_do_not_load() {
         );
         assert!(error.to_string().contains("cutoff"), "{error}");
     }
+}
+
+/// A label on a known module or a placeholder loads onto the node and saves
+/// back exactly as written, spaces included (clipboard.md, rule 9).
+#[test]
+fn labels_survive_load_and_save_exactly() {
+    let text = r#"Patch(version: 1, modules: [
+        (id: 1, kind: "loom.math.mul@1", label: Some("Bass filter")),
+        (id: 2, kind: "loom.osc.sine@1", label: Some(" ")),
+        (id: 3, kind: "future.effect@9", label: Some("Shimmer")),
+        (id: 4, kind: "loom.osc.sine@1"),
+        (id: 5, kind: "loom.clock.transport@1"),
+    ])"#;
+    let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
+    Patch::from_ron(text).unwrap().load_into(&mut parts.controller).unwrap();
+    let label = |id| parts.controller.graph().node(ModuleId(id)).unwrap().label.clone();
+    assert_eq!(label(1).as_deref(), Some("Bass filter"));
+    assert_eq!(
+        label(3).as_deref(),
+        Some("Shimmer"),
+        "a placeholder's label is on its node"
+    );
+    let saved = Patch::from_graph("", parts.controller.graph());
+    let labels: Vec<(u32, Option<&str>)> = saved.modules.iter().map(|m| (m.id, m.label.as_deref())).collect();
+    assert_eq!(
+        labels,
+        [
+            (1, Some("Bass filter")),
+            (2, Some(" ")),
+            (3, Some("Shimmer")),
+            (4, None),
+            (5, None)
+        ]
+    );
+}
+
+/// An empty label is no label: it loads as none and saves with no label
+/// (clipboard.md, rule 9). A label of spaces is kept.
+#[test]
+fn an_empty_label_loads_as_no_label() {
+    let text = r#"Patch(version: 1, modules: [
+        (id: 1, kind: "loom.osc.sine@1", label: Some("")),
+        (id: 2, kind: "future.effect@9", label: Some("")),
+        (id: 3, kind: "loom.clock.transport@1"),
+    ])"#;
+    let mut parts = create_engine(loom_modules::registry(), EngineConfig::default());
+    Patch::from_ron(text).unwrap().load_into(&mut parts.controller).unwrap();
+    for id in [1, 2] {
+        assert_eq!(parts.controller.graph().node(ModuleId(id)).unwrap().label, None);
+    }
+    let saved = Patch::from_graph("", parts.controller.graph()).to_ron().unwrap();
+    assert!(!saved.contains("label"), "{saved}");
 }

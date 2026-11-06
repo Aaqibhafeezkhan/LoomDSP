@@ -166,7 +166,7 @@ impl App {
             _ => format!("Restored unsaved changes from {when}."),
         });
         for note in self.session.document.load_notes() {
-            if note.contains("not in this version:") {
+            if matches!(note, loom_patch::LoadWarning::UnknownModules { .. }) {
                 self.alerts.append_warning(&format!(" {note}"));
             }
         }
@@ -290,7 +290,7 @@ impl App {
 impl Loaded {
     /// What the status line says about this load, if anything.
     pub(crate) fn status(&self) -> String {
-        self.notes.join("; ")
+        crate::file_commands::join_notes(&self.notes)
     }
 
     /// Builds an engine and loads a patch into it. On failure nothing else
@@ -339,7 +339,7 @@ impl Loaded {
             Source::File(path) => {
                 // Stamped before reading: a change after this shows as a change.
                 let stamp = recovery::Stamp::of(path);
-                let patch = Patch::load(path).map_err(|e| e.to_string())?;
+                let patch = crate::patch_file::load(path).map_err(|e| e.to_string())?;
                 let info = load(&patch, &mut controller)?;
                 (info, Some(path.to_path_buf()), stamp)
             }

@@ -10,11 +10,11 @@
 //! from the controller and remaps the cables and assignments to it.
 
 use loom_canvas::GRID;
-use loom_core::{
-    Controller, Graph, InputRef, LoomError, ModuleDescriptor, ModuleId, ModuleRole, OutputRef, ParamRange, Polarity,
-    Registry,
+use loom_core::ModuleNames;
+use loom_core::{Controller, Graph, InputRef, LoomError, ModuleId, ModuleRole, OutputRef, Polarity, Registry};
+use loom_patch::{
+    Layout, Patch, PatchCable, PatchError, PatchModulation, PatchPolarity, ResolveError, ResolveOptions, ResolvedModule,
 };
-use loom_patch::{Patch, PatchCable, PatchError, PatchModulation, PatchModule, PatchPolarity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,22 +36,9 @@ struct PlaceholderPorts {
     parameters: Vec<String>,
 }
 
-/// One module in a group.
-#[derive(Clone, Debug)]
-struct Member {
-    /// Its id in the graph or in the clipboard text.
-    id: u32,
-    descriptor: &'static ModuleDescriptor,
-    /// Original data if this member is an unknown placeholder.
-    unknown: Option<loom_core::UnknownModule>,
-    /// One value per parameter of the descriptor.
-    params: Vec<f32>,
-    /// The selected control range of each parameter, if it offers ranges.
-    ranges: Vec<Option<ParamRange>>,
-    position: Option<(f32, f32)>,
-    /// Optional saved tile dimensions in grid units.
-    size: Option<(u8, u8)>,
-}
+/// One module in a group: the same resolved form a patch loads with, so
+/// the clipboard holds no name lookups of its own (#651).
+type Member = ResolvedModule;
 
 /// Where a cable or an assignment starts.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,7 +83,7 @@ impl Group {
     /// Includes the selected tiles' saved dimensions in a copied group.
     pub fn with_sizes(mut self, sizes: &BTreeMap<u32, (u8, u8)>) -> Self {
         for member in &mut self.modules {
-            member.size = sizes.get(&member.id).copied();
+            member.layout.size = sizes.get(&member.id).copied();
         }
         self
     }
@@ -104,7 +91,7 @@ impl Group {
     /// Stores copied dimensions under the newly assigned module IDs.
     pub fn apply_sizes(&self, added: &[u32], sizes: &mut BTreeMap<u32, (u8, u8)>) {
         for (member, &id) in self.modules.iter().zip(added) {
-            if let Some(size) = member.size {
+            if let Some(size) = member.layout.size {
                 sizes.insert(id, size);
             }
         }
@@ -134,14 +121,12 @@ impl Group {
         let modules: Vec<Member> = graph
             .nodes()
             .filter(|(id, _)| selection.contains(&id.0))
-            .map(|(id, node)| Member {
-                id: id.0,
-                descriptor: node.descriptor,
-                unknown: node.unknown.clone(),
-                params: node.descriptor.saved_values(&node.params),
-                ranges: (0..node.params.len()).map(|index| node.range(index)).collect(),
-                position: positions.get(&id.0).copied(),
-                size: None,
+            .map(|(id, node)| {
+                let layout = Layout {
+                    position: positions.get(&id.0).copied(),
+                    size: None,
+                };
+                ResolvedModule::from_node(id, node, layout)
             })
             .collect();
         let source = |from: OutputRef| {
@@ -205,17 +190,17 @@ impl Group {
     }
 
     fn from_patch(patch: &Patch, registry: &Registry, ports: &BTreeMap<u32, PlaceholderPorts>) -> Result<Self, String> {
-        let mut modules = Vec::with_capacity(patch.modules.len());
+        let (mut modules, _) = patch
+            .resolve(registry, ResolveOptions::CLIPBOARD)
+            .map_err(|error| match error {
+                ResolveError::UnknownParam { module_name, param, .. } => {
+                    format!("{module_name} has no parameter `{param}`")
+                }
+                ResolveError::Patch(error) => error.to_string(),
+            })?;
         let mut ids = BTreeSet::new();
-        for module in &patch.modules {
-            let mut unknown = if !module.kind.contains('@') && registry.resolve(&module.kind).is_ok() {
-                None
-            } else {
-                patch
-                    .unknown_module(module, registry)
-                    .map_err(|error| error.to_string())?
-            };
-            if let (Some(unknown), Some(saved)) = (&mut unknown, ports.get(&module.id)) {
+        for member in &mut modules {
+            if let (Some(unknown), Some(saved)) = (&mut member.unknown, ports.get(&member.id)) {
                 for (items, preserved) in [
                     (&mut unknown.inputs, &saved.inputs),
                     (&mut unknown.outputs, &saved.outputs),
@@ -230,52 +215,12 @@ impl Group {
                     *items = merged;
                 }
             }
-            if unknown.as_ref().is_some_and(|unknown| unknown.inputs.len() > 64) {
+            if member.unknown.as_ref().is_some_and(|unknown| unknown.inputs.len() > 64) {
                 return Err("a placeholder cannot have more than 64 inputs".into());
             }
-            let descriptor = if unknown.is_some() {
-                loom_core::UnknownModule::descriptor()
-            } else {
-                registry.resolve(&module.kind).map_err(|error| error.to_string())?
-            };
-            if !ids.insert(module.id) {
-                return Err(format!("two modules have id {}", module.id));
+            if !ids.insert(member.id) {
+                return Err(format!("two modules have id {}", member.id));
             }
-            let mut params: Vec<f32> = descriptor.params.iter().map(|p| p.default).collect();
-            for (name, &value) in module.params.iter().filter(|_| unknown.is_none()) {
-                let index = descriptor
-                    .param_index(name)
-                    .ok_or_else(|| format!("{} has no parameter `{name}`", descriptor.name))?;
-                params[index] = value;
-            }
-            // A pasted module starts released (transient-params.md).
-            let params = descriptor.saved_values(&params);
-            // As a patch loads: the range never changes the value
-            // (control-ranges.md, rule 7).
-            let ranges = (0..descriptor.params.len())
-                .map(|index| {
-                    let saved = |spec: &loom_core::ParamSpec| {
-                        module
-                            .ranges
-                            .get(spec.name)
-                            .map(|&(min, max)| ParamRange::new(min, max))
-                    };
-                    let value = |spec: &loom_core::ParamSpec| {
-                        let at = descriptor.params.iter().position(|p| p.name == spec.name);
-                        at.map_or(spec.default, |at| spec.clamp(params[at]))
-                    };
-                    descriptor.load_range(index, saved, value).map(|(range, _)| range)
-                })
-                .collect();
-            modules.push(Member {
-                id: module.id,
-                descriptor,
-                unknown,
-                params,
-                ranges,
-                position: module.position,
-                size: module.size,
-            });
         }
         modules.sort_by_key(|m| m.id);
         let module = |id: u32| {
@@ -287,12 +232,7 @@ impl Group {
         let output = |(id, name): &(u32, String)| {
             let member = module(*id)?;
             let port = member
-                .unknown
-                .as_ref()
-                .map_or_else(
-                    || member.descriptor.output_index(name),
-                    |unknown| unknown.outputs.iter().position(|port| port == name),
-                )
+                .output_index(name)
                 .ok_or_else(|| format!("{} has no output `{name}`", member.descriptor.name))?;
             Ok::<_, String>(Source::Inside(*id, port))
         };
@@ -302,12 +242,7 @@ impl Group {
             .map(|cable| {
                 let member = module(cable.to.0)?;
                 let port = member
-                    .unknown
-                    .as_ref()
-                    .map_or_else(
-                        || member.descriptor.input_index(&cable.to.1),
-                        |unknown| unknown.inputs.iter().position(|port| port == &cable.to.1),
-                    )
+                    .input_index(&cable.to.1)
                     .ok_or_else(|| format!("{} has no input `{}`", member.descriptor.name, cable.to.1))?;
                 Ok(Cable {
                     from: output(&cable.from)?,
@@ -321,17 +256,7 @@ impl Group {
             .map(|assignment| {
                 let member = module(assignment.target.0)?;
                 let param = member
-                    .unknown
-                    .as_ref()
-                    .map_or_else(
-                        || member.descriptor.param_index(&assignment.target.1),
-                        |unknown| {
-                            unknown
-                                .parameters
-                                .iter()
-                                .position(|param| param == &assignment.target.1)
-                        },
-                    )
+                    .parameter_index(&assignment.target.1)
                     .ok_or_else(|| format!("{} has no parameter `{}`", member.descriptor.name, assignment.target.1))?;
                 Ok(Modulation {
                     source: output(&assignment.source)?,
@@ -354,51 +279,15 @@ impl Group {
     pub fn to_text(&self) -> String {
         let mut patch = Patch::new("");
         for member in &self.modules {
-            let d = member.descriptor;
-            if let Some(unknown) = &member.unknown {
-                patch.modules.push(PatchModule {
-                    id: member.id,
-                    kind: unknown.kind.clone(),
-                    label: unknown.label.clone(),
-                    params: unknown.params.clone(),
-                    position: member.position.map(|(x, y)| (x.round(), y.round())),
-                    size: member.size,
-                    ranges: unknown.ranges.clone(),
-                });
-                continue;
-            }
-            patch.modules.push(PatchModule {
-                id: member.id,
-                kind: d.kind(),
-                label: None,
-                params: d
-                    .params
-                    .iter()
-                    .zip(&member.params)
-                    .filter(|(spec, value)| **value != spec.default)
-                    .map(|(spec, value)| (spec.name.to_string(), *value))
-                    .collect(),
-                position: member.position.map(|(x, y)| (x.round(), y.round())),
-                size: member.size,
-                ranges: d
-                    .params
-                    .iter()
-                    .zip(&member.ranges)
-                    .filter_map(|(spec, range)| {
-                        let range = (*range)?;
-                        (Some(range) != spec.default_range()).then(|| (spec.name.to_string(), (range.min, range.max)))
-                    })
-                    .collect(),
-            });
+            let mut module = member.write();
+            module.position = module.position.map(|(x, y)| (x.round(), y.round()));
+            patch.modules.push(module);
         }
         let output_name = |id: u32, port: usize| {
             let member = self.member(id).expect("a group's cables stay inside it");
             (
                 id,
-                member.unknown.as_ref().map_or_else(
-                    || member.descriptor.outputs[port].name.to_string(),
-                    |unknown| unknown.outputs[port].clone(),
-                ),
+                member.output_name(port).expect("a group's outputs exist").to_string(),
             )
         };
         for cable in &self.cables {
@@ -409,10 +298,10 @@ impl Group {
                     from: output_name(id, port),
                     to: (
                         cable.to.0,
-                        member.unknown.as_ref().map_or_else(
-                            || member.descriptor.inputs[cable.to.1].name.to_string(),
-                            |unknown| unknown.inputs[cable.to.1].clone(),
-                        ),
+                        member
+                            .input_name(cable.to.1)
+                            .expect("a group's inputs exist")
+                            .to_string(),
                     ),
                 });
             }
@@ -425,10 +314,10 @@ impl Group {
                     source: output_name(id, port),
                     target: (
                         assignment.target.0,
-                        member.unknown.as_ref().map_or_else(
-                            || member.descriptor.params[assignment.target.1].name.to_string(),
-                            |unknown| unknown.parameters[assignment.target.1].clone(),
-                        ),
+                        member
+                            .parameter_name(assignment.target.1)
+                            .expect("a group's parameters exist")
+                            .to_string(),
                     ),
                     depth: assignment.depth,
                     polarity: assignment.polarity.map(PatchPolarity::from),
@@ -484,7 +373,7 @@ impl Group {
     pub fn top_left(&self) -> Option<(f32, f32)> {
         self.modules
             .iter()
-            .filter_map(|m| m.position)
+            .filter_map(|m| m.layout.position)
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
     }
 
@@ -542,7 +431,7 @@ impl Group {
         let below = self
             .modules
             .iter()
-            .filter_map(|m| m.position)
+            .filter_map(|m| m.layout.position)
             .map(|p| p.1 - top_left.1 + 10.0 * GRID)
             .fold(0.0, f32::max);
         let mut unplaced = 0.0;
@@ -555,28 +444,9 @@ impl Group {
             };
             added.push(id.0);
             ids.insert(member.id, id);
-            // Ranges first, so they never clamp a pasted value.
-            for (index, range) in member.ranges.iter().enumerate() {
-                let current = controller.graph().node(id).and_then(|n| n.range(index));
-                if let Some(range) = *range
-                    && current != Some(range)
-                {
-                    controller.set_range(id, index, range)?;
-                }
-            }
-            let changes: Vec<(usize, f32)> = member
-                .descriptor
-                .params
-                .iter()
-                .zip(&member.params)
-                .enumerate()
-                .filter(|(_, (spec, value))| **value != spec.default)
-                .map(|(index, (_, value))| (index, *value))
-                .collect();
-            if !changes.is_empty() {
-                controller.set_params(id, &changes)?;
-            }
-            let place = match member.position {
+            // Label, ranges, then values, as a patch loads.
+            member.apply_to(controller, id)?;
+            let place = match member.layout.position {
                 Some(p) => (origin.0 + p.0 - top_left.0, origin.1 + p.1 - top_left.1),
                 None => {
                     let place = (origin.0 + unplaced, origin.1 + below);

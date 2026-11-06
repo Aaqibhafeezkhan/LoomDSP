@@ -11,6 +11,7 @@ mod help_pages;
 mod midi_port;
 
 use clap::{Parser, Subcommand};
+use loom_core::ModuleNames;
 use loom_core::{Controller, EngineConfig, EngineParts, MidiEvent, ModuleId, OutputSafety, Registry, create_engine};
 use loom_host_desktop::{AudioOptions, AudioOutput, StatsSnapshot};
 use loom_patch::Patch;
@@ -210,15 +211,17 @@ fn main() -> ExitCode {
 }
 
 fn load_engine(path: &Path, config: EngineConfig) -> Result<(Patch, EngineParts)> {
-    let patch = Patch::load(path)?;
+    // The CLI only reads patches; saving lives in the app (`loom-app`'s
+    // `patch_file`). The error names the path, then the system's reason.
+    let text = std::fs::read_to_string(path).map_err(|source| format!("{}: {source}", path.display()))?;
+    let patch = Patch::from_ron(&text)?;
     let mut parts = create_engine(loom_modules::registry(), config);
     // What loaded differently from the file, such as a saved control range
     // that was not kept (control-ranges.md, rule 7). The patch still plays.
     for note in patch.load_into(&mut parts.controller)? {
-        let level = if note.contains("not in this version:") {
-            "warning"
-        } else {
-            "note"
+        let level = match note.level() {
+            loom_patch::LoadLevel::Warning => "warning",
+            loom_patch::LoadLevel::Note => "note",
         };
         eprintln!("{level}: {note}");
     }

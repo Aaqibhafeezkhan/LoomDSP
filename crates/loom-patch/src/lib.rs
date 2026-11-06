@@ -31,14 +31,17 @@
 
 use loom_core::{
     Controller, Graph, InputRef, LoomError, MidiControl, MidiEncoding, MidiMappingOptions, MidiMode, ModuleId,
-    OutputRef, ParamRange, Polarity, Registry, TRANSPORT_MODULE,
+    ModuleNames, OutputRef, Polarity, Registry, TRANSPORT_MODULE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
 
 pub mod metadata;
 pub use metadata::Metadata;
+pub mod resolve;
+pub use resolve::{Layout, ResolveError, ResolveOptions, ResolvedModule};
+pub mod warning;
+pub use warning::{LoadLevel, LoadWarning, RangeReason};
 
 /// The patch format version this build writes.
 pub const CURRENT_VERSION: u32 = 1;
@@ -306,14 +309,6 @@ impl From<PatchPolarity> for Polarity {
 /// Patch loading and saving errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PatchError {
-    /// The file could not be read or written.
-    #[error("{path}: {source}")]
-    Io {
-        /// File path.
-        path: String,
-        /// Underlying error.
-        source: std::io::Error,
-    },
     /// The text is not a valid patch.
     #[error("invalid patch: {0}")]
     Parse(#[from] ron::error::SpannedError),
@@ -418,16 +413,6 @@ impl Patch {
         patch.migrate()
     }
 
-    /// Reads a patch file.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, PatchError> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| PatchError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::from_ron(&text)
-    }
-
     /// Canonical RON text.
     pub fn to_ron(&self) -> Result<String, PatchError> {
         let mut canonical = self.clone();
@@ -440,52 +425,6 @@ impl Patch {
         let mut text = ron::ser::to_string_pretty(&canonical, config)?;
         text.push('\n');
         Ok(text)
-    }
-
-    /// Writes a patch file.
-    ///
-    /// The text goes to a new temporary file in the same folder first, then
-    /// replaces the target by a rename. A full disk or a failed write cannot
-    /// leave a half-written patch where a good one was. It does not promise
-    /// the data survives a power loss. The temporary name is
-    /// unique to this process and is never an existing file, so another
-    /// save or a backup is never overwritten. A read-only target is refused,
-    /// and the target keeps its permissions.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PatchError> {
-        use std::io::Write;
-        let path = path.as_ref();
-        let text = self.to_ron()?;
-        // Write through a symlink to its target, as a plain write would. A
-        // rename over the link would replace the link itself.
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let target = resolved.as_path();
-        let io = |source| PatchError::Io {
-            path: path.display().to_string(),
-            source,
-        };
-        let existing = std::fs::metadata(target).ok();
-        if existing.as_ref().is_some_and(|m| m.permissions().readonly()) {
-            return Err(io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "the file is read-only",
-            )));
-        }
-        let name = target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        let temp = target.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .and_then(|mut file| file.write_all(text.as_bytes()))
-            .and_then(|()| match &existing {
-                Some(meta) => std::fs::set_permissions(&temp, meta.permissions()),
-                None => Ok(()),
-            })
-            .and_then(|()| std::fs::rename(&temp, target));
-        written.map_err(|source| {
-            let _ = std::fs::remove_file(&temp);
-            io(source)
-        })
     }
 
     /// Sorts modules, cables, and parameters into canonical order.
@@ -566,7 +505,6 @@ impl Patch {
         }
         Ok(Some(loom_core::UnknownModule {
             kind: module.kind.clone(),
-            label: module.label.clone(),
             params: module.params.clone(),
             ranges: module.ranges.clone(),
             inputs,
@@ -578,14 +516,15 @@ impl Patch {
     /// Adds every module and cable to a controller and commits.
     ///
     /// The controller should be empty. Module IDs from the file are kept.
-    /// Returns notes about what loaded differently from the file: a saved
+    /// Returns a [`LoadWarning`] for each thing that loaded differently from
+    /// the file: an unknown module, an added Transport, or a saved
     /// control range that the parameter does not offer, or that does not
     /// hold the saved value. Values never change (control-ranges.md, rule 7).
     ///
     /// Every patch has exactly one Transport (`docs/design/clock.md`). Two
     /// fail with an error that names both. A patch without one gets one,
     /// with a note, when the registry has the Transport module.
-    pub fn load_into(&self, controller: &mut Controller) -> Result<Vec<String>, PatchError> {
+    pub fn load_into(&self, controller: &mut Controller) -> Result<Vec<LoadWarning>, PatchError> {
         let mut notes = Vec::new();
         let mut unknown_kinds = Vec::new();
         let transports: Vec<u32> = self
@@ -603,69 +542,20 @@ impl Patch {
         if let [first, second, ..] = transports[..] {
             return Err(PatchError::TwoTransports { first, second });
         }
-        for module in &self.modules {
-            let id = ModuleId(module.id);
-            if let Some(unknown) = self.unknown_module(module, controller.registry())? {
-                controller.add_unknown_with_id(id, unknown)?;
-                unknown_kinds.push(module.kind.clone());
-                continue;
-            }
-            controller.add_module_with_id(id, &module.kind)?;
-            notes.extend(Self::load_ranges(module, controller)?);
-            let descriptor = controller.graph().node(id).map(|node| node.descriptor);
-            for (name, &value) in &module.params {
-                // A saved value for a transient parameter is ignored: the
-                // module starts released (transient-params.md).
-                // `transient_values` lists them for `loom check`.
-                if descriptor
-                    .and_then(|d| d.param_index(name).map(|i| d.params[i]))
-                    .is_some_and(|spec| spec.is_transient())
-                {
-                    continue;
-                }
-                controller
-                    .set_param_named(id, name, value)
-                    .map_err(|error| match error {
-                        LoomError::NoSuchParam { .. } => PatchError::UnknownParam {
-                            module: module.id,
-                            param: name.clone(),
-                        },
-                        other => PatchError::Engine(other),
-                    })?;
+        let (modules, warnings) = self.resolve(controller.registry(), ResolveOptions::FILE)?;
+        notes.extend(warnings);
+        for module in &modules {
+            module.add_to(controller, ModuleId(module.id))?;
+            if let Some(unknown) = &module.unknown {
+                unknown_kinds.push(unknown.kind.clone());
             }
         }
         if !unknown_kinds.is_empty() {
-            let mut distinct = Vec::new();
-            for kind in &unknown_kinds {
-                if !distinct.contains(&kind) {
-                    distinct.push(kind);
-                }
-            }
-            let names = distinct
-                .iter()
-                .take(3)
-                .map(|kind| format!("`{kind}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let more = distinct.len().saturating_sub(3);
-            let extra = if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            };
-            let noun = if unknown_kinds.len() == 1 {
-                "module is"
-            } else {
-                "modules are"
-            };
-            notes.push(format!("{} {noun} not in this version: {names}{extra}. They make no sound. Their settings are kept when you save. Open the patch in a newer LoomDSP to play them.", unknown_kinds.len()));
+            notes.push(LoadWarning::UnknownModules { kinds: unknown_kinds });
         }
         if transports.is_empty() && controller.registry().resolve(TRANSPORT_MODULE).is_ok() {
             let id = controller.add_module(TRANSPORT_MODULE)?;
-            notes.push(format!(
-                "the patch had no Transport, so one was added as module {} (120 BPM, 4/4, running)",
-                id.0
-            ));
+            notes.push(LoadWarning::TransportAdded { module: id.0 });
         }
         for cable in &self.cables {
             controller.connect_named(ModuleId(cable.from.0), &cable.from.1, ModuleId(cable.to.0), &cable.to.1)?;
@@ -712,73 +602,6 @@ impl Patch {
                 })?;
         }
         controller.commit()?;
-        Ok(notes)
-    }
-
-    /// Selects each parameter's control range before its value is set, so
-    /// the range never clamps a saved value (rule 7). Returns a note for
-    /// each saved range that was not kept.
-    fn load_ranges(module: &PatchModule, controller: &mut Controller) -> Result<Vec<String>, PatchError> {
-        let id = ModuleId(module.id);
-        let descriptor = controller
-            .graph()
-            .node(id)
-            .map(|n| n.descriptor)
-            .ok_or(LoomError::UnknownModule(id))?;
-        let unknown = |name: &str| PatchError::UnknownParam {
-            module: module.id,
-            param: name.to_string(),
-        };
-        let mut notes = Vec::new();
-        for name in module.ranges.keys() {
-            let index = descriptor.param_index(name).ok_or_else(|| unknown(name))?;
-            if descriptor.params[index].options.ranges.is_empty() {
-                notes.push(format!(
-                    "module {}: parameter `{name}` offers no ranges, so its saved range is ignored",
-                    module.id
-                ));
-            }
-        }
-        for (index, spec) in descriptor.params.iter().enumerate() {
-            let value = spec.clamp(module.params.get(spec.name).copied().unwrap_or(spec.default));
-            let saved_of = |spec: &loom_core::ParamSpec| {
-                module
-                    .ranges
-                    .get(spec.name)
-                    .map(|&(min, max)| ParamRange::new(min, max))
-            };
-            let saved = saved_of(spec);
-            let value_of =
-                |spec: &loom_core::ParamSpec| spec.clamp(module.params.get(spec.name).copied().unwrap_or(spec.default));
-            let Some((range, reported)) = descriptor.load_range(index, saved_of, value_of) else {
-                continue;
-            };
-            let partner = descriptor.range_partner(index);
-            if reported && let Some(partner) = partner {
-                // Said once for the pair (control-ranges.md, Ranges on a range
-                // widget).
-                if index < partner {
-                    notes.push(format!(
-                        "module {}: parameters `{}` and `{}` share a range, and the saved ranges do not hold both values; they load with {range}",
-                        module.id, spec.name, descriptor.params[partner].name
-                    ));
-                }
-            } else if reported && let Some(saved) = saved {
-                notes.push(format!(
-                    "module {}: parameter `{}` was saved with range {saved}, which {}; it loads with {range}",
-                    module.id,
-                    spec.name,
-                    if spec.options.ranges.contains(&saved) {
-                        format!("does not hold its value {value}")
-                    } else {
-                        "it does not offer".to_string()
-                    }
-                ));
-            }
-            if controller.graph().node(id).and_then(|n| n.range(index)) != Some(range) {
-                controller.set_range(id, index, range)?;
-            }
-        }
         Ok(notes)
     }
 
@@ -829,40 +652,19 @@ impl Patch {
     }
 
     /// Builds a patch from a graph. Only non-default parameters are saved.
+    /// Modules have no position or size; see [`Patch::from_graph_with`].
     pub fn from_graph(name: impl Into<String>, graph: &Graph) -> Self {
+        Self::from_graph_with(name, graph, |_| Layout::default())
+    }
+
+    /// Builds a patch from a graph, with each module's layout from
+    /// `layout`. The editor keeps positions and sizes outside the graph.
+    pub fn from_graph_with(name: impl Into<String>, graph: &Graph, layout: impl Fn(ModuleId) -> Layout) -> Self {
         let mut patch = Patch::new(name);
         for (id, node) in graph.nodes() {
-            if let Some(unknown) = &node.unknown {
-                patch.modules.push(PatchModule {
-                    id: id.0,
-                    kind: unknown.kind.clone(),
-                    label: unknown.label.clone(),
-                    params: unknown.params.clone(),
-                    position: None,
-                    size: None,
-                    ranges: unknown.ranges.clone(),
-                });
-                continue;
-            }
-            let params = node
-                .descriptor
-                .params
-                .iter()
-                .zip(&node.params)
-                // A transient value is a live gesture, never saved
-                // (transient-params.md).
-                .filter(|(spec, value)| **value != spec.default && !spec.is_transient())
-                .map(|(spec, value)| (spec.name.to_string(), *value))
-                .collect();
-            patch.modules.push(PatchModule {
-                id: id.0,
-                kind: node.descriptor.kind(),
-                label: None,
-                params,
-                position: None,
-                size: None,
-                ranges: ranges_to_save(node),
-            });
+            patch
+                .modules
+                .push(ResolvedModule::from_node(id, node, layout(id)).write());
         }
         for (from, to) in graph.cables() {
             patch.cables.push(PatchCable {
@@ -905,54 +707,22 @@ impl Patch {
     }
 }
 
-/// The selected control ranges of a module that differ from the default,
-/// by parameter name, for saving.
-pub fn ranges_to_save(node: &loom_core::Node) -> BTreeMap<String, (f32, f32)> {
-    node.descriptor
-        .params
-        .iter()
-        .enumerate()
-        .filter_map(|(index, spec)| {
-            let range = node.range(index)?;
-            (Some(range) != spec.default_range()).then(|| (spec.name.to_string(), (range.min, range.max)))
-        })
-        .collect()
-}
-
 fn port_name(graph: &Graph, output: OutputRef) -> String {
-    graph
-        .node(output.module)
-        .map(|n| {
-            n.unknown.as_ref().map_or_else(
-                || n.descriptor.outputs[output.port].name.to_string(),
-                |unknown| unknown.outputs[output.port].clone(),
-            )
-        })
-        .unwrap_or_default()
+    name_of(graph, output.module, |n| n.output_name(output.port))
 }
 
 fn input_name(graph: &Graph, input: InputRef) -> String {
-    graph
-        .node(input.module)
-        .map(|n| {
-            n.unknown.as_ref().map_or_else(
-                || n.descriptor.inputs[input.port].name.to_string(),
-                |unknown| unknown.inputs[input.port].clone(),
-            )
-        })
-        .unwrap_or_default()
+    name_of(graph, input.module, |n| n.input_name(input.port))
 }
 
 fn param_name(graph: &Graph, module: ModuleId, index: usize) -> String {
-    graph
-        .node(module)
-        .and_then(|n| {
-            n.unknown.as_ref().map_or_else(
-                || n.descriptor.params.get(index).map(|param| param.name.to_string()),
-                |unknown| unknown.parameters.get(index).cloned(),
-            )
-        })
-        .unwrap_or_default()
+    name_of(graph, module, |n| n.parameter_name(index))
+}
+
+/// A saved name from one of the module's [`ModuleNames`] lookups, or an
+/// empty string when the module or the index is gone.
+fn name_of(graph: &Graph, module: ModuleId, name: impl Fn(&loom_core::Node) -> Option<&str>) -> String {
+    graph.node(module).and_then(name).unwrap_or_default().to_string()
 }
 
 #[cfg(test)]
