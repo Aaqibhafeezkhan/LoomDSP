@@ -5,7 +5,7 @@ use crate::{
     App, FileAction, Message, audio_watch, bench, browser, control, devices, input_watch, learn, lights, monitor,
     preferences, recovery,
 };
-use iced::Subscription;
+use iced::{Subscription, Task};
 use loom_core::ModuleId;
 use std::time::Duration;
 
@@ -150,7 +150,8 @@ impl App {
             ]
             .into_iter()
             .chain(control)
-            .chain(input_watch),
+            .chain(input_watch)
+            .chain(self.a11y_subscription()),
         )
     }
 
@@ -265,4 +266,23 @@ pub(crate) fn browser_key(
         _ => return None,
     };
     Some(Message::Browser(browser::Message::Key(nav)))
+}
+
+impl App {
+    /// Spike: the accessibility layer's events, when the feature is on.
+    fn a11y_subscription(&self) -> Option<Subscription<Message>> {
+        #[cfg(all(feature = "a11y-spike", target_os = "macos"))]
+        return Some(crate::a11y::subscription().map(Message::A11y));
+        #[cfg(not(all(feature = "a11y-spike", target_os = "macos")))]
+        None
+    }
+
+    /// The task that runs once the window opens. With the spike feature it
+    /// attaches the accessibility layer; otherwise it does nothing.
+    pub(crate) fn start_task() -> Task<Message> {
+        #[cfg(all(feature = "a11y-spike", target_os = "macos"))]
+        return crate::a11y::attach().map(Message::A11y);
+        #[cfg(not(all(feature = "a11y-spike", target_os = "macos")))]
+        Task::none()
+    }
 }
