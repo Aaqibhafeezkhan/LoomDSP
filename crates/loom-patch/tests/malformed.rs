@@ -147,7 +147,11 @@ fn edge_cases_load_safely() {
     // Deep nesting, which must not overflow the stack.
     let deep = 100_000;
     cases.push((
-        format!("Patch(version: 1, name: {}{})", "[".repeat(deep), "]".repeat(deep)),
+        format!(
+            "Patch(version: 1, metadata: Metadata(name: {}{}))",
+            "[".repeat(deep),
+            "]".repeat(deep)
+        ),
         false,
     ));
     cases.push((
@@ -155,7 +159,13 @@ fn edge_cases_load_safely() {
         false,
     ));
     // A very long string.
-    cases.push((format!("Patch(version: 1, name: \"{}\")", "x".repeat(1_000_000)), true));
+    cases.push((
+        format!(
+            "Patch(version: 1, metadata: Metadata(name: \"{}\"))",
+            "x".repeat(1_000_000)
+        ),
+        true,
+    ));
     // Only a check that the cases mean what they say: what matters is
     // that none of them panics.
     let wrong: Vec<String> = cases
@@ -186,6 +196,10 @@ impl Random {
 /// Tokens a mutation may put in: numbers at their limits, brackets, and
 /// pieces of the format.
 const TOKENS: &[&str] = &[
+    "subpatch: Some(\"voice\"),",
+    "\"loom.struct.subpatch@1\"",
+    "\"loom.struct.input@1\"",
+    "\"loom.struct.output@1\"",
     "0",
     "-1",
     "4294967295",
@@ -253,8 +267,10 @@ fn mutate(text: &[u8], random: &mut Random) -> Vec<u8> {
 /// one place.
 #[test]
 fn changed_example_patches_load_safely() {
-    let patches = ron_files(&crate_path("../../examples/patches"));
+    let mut patches = ron_files(&crate_path("../../examples/patches"));
     assert!(!patches.is_empty(), "examples/patches holds patches");
+    // The nested example lives in examples/dev until the app opens it.
+    patches.push(crate_path("../../examples/dev/nested-subtractive.ron"));
     let mut random = Random(0x5EED_1234_ABCD_0042);
     let mut loaded = 0;
     for patch in &patches {

@@ -7,7 +7,7 @@
 //! ```ron
 //! Patch(
 //!     version: 1,
-//!     name: "Simple sine",
+//!     metadata: Metadata(name: "Simple sine"),
 //!     modules: [
 //!         (id: 1, kind: "loom.midi.note@1"),
 //!         (id: 2, kind: "loom.phase.generator@1"),
@@ -30,16 +30,21 @@
 #![warn(missing_docs)]
 
 use loom_core::{
-    Controller, Graph, InputRef, LoomError, MidiControl, MidiEncoding, MidiMappingOptions, MidiMode, ModuleId,
-    ModuleNames, OutputRef, Polarity, Registry, TRANSPORT_MODULE,
+    Graph, InputRef, LoomError, MidiEncoding, MidiMappingOptions, MidiMode, ModuleId, ModuleNames, OutputRef, Polarity,
+    Registry,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod level;
 pub mod metadata;
 pub use metadata::Metadata;
 pub mod resolve;
 pub use resolve::{Layout, ResolveError, ResolveOptions, ResolvedModule};
+pub mod subpatch;
+pub use subpatch::{Exposed, INPUT_KIND, OUTPUT_KIND, SUBPATCH_KIND, SubPatch};
+pub mod flatten;
+pub use flatten::{Flat, FlatIds, FlatModule, ModulePath};
 pub mod warning;
 pub use warning::{LoadLevel, LoadWarning, RangeReason};
 
@@ -52,29 +57,16 @@ pub const CURRENT_VERSION: u32 = 1;
 pub struct Patch {
     /// Format version. See [`CURRENT_VERSION`].
     pub version: u32,
-    /// Display name.
+    /// Name, description, authors, tags, and licence
+    /// (`docs/design/patch-metadata.md`). Always written, so a file names
+    /// its patch.
     #[serde(default)]
-    pub name: String,
-    /// Free text for the patch author.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub description: String,
-    /// Who made it, in credit order (`docs/design/patch-metadata.md`).
-    /// Omitted when empty, like the other metadata fields.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub authors: Vec<String>,
-    /// Tags for finding the patch again. Kept as written; filters compare
-    /// their tidy form ([`metadata::tidy_tag`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-    /// An SPDX licence expression, kept as written even when it is not
-    /// valid (patch-metadata.md, rule 1). Spelled as SPDX spells it.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "metadata::serialize_licence",
-        deserialize_with = "metadata::deserialize_licence"
-    )]
-    pub license: Option<String>,
+    pub metadata: Metadata,
+    /// Sub-patch definitions by key (`docs/design/sub-patches.md`, Patch
+    /// file). A key is made from the definition's name and is not shown.
+    /// Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subpatches: BTreeMap<String, SubPatch>,
     /// Modules.
     #[serde(default)]
     pub modules: Vec<PatchModule>,
@@ -96,6 +88,11 @@ pub struct PatchModule {
     pub id: u32,
     /// Module type as `"id@version"`.
     pub kind: String,
+    /// For a sub-patch instance ([`SUBPATCH_KIND`]), the key of its
+    /// definition in [`Patch::subpatches`]. Then `params` holds the values
+    /// of the definition's exposed parameters, by exposed name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpatch: Option<String>,
     /// Optional user label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -353,13 +350,103 @@ pub enum PatchError {
         /// The second Transport's module ID.
         second: u32,
     },
-    /// A parameter name does not exist on a module.
+    /// A parameter name does not exist on a module. For a sub-patch
+    /// instance, a name its definition does not expose, or any control
+    /// range.
     #[error("module {module}: unknown parameter `{param}`")]
     UnknownParam {
         /// Module ID in the patch.
         module: u32,
         /// Parameter name.
         param: String,
+    },
+    /// An instance names a definition the `subpatches` table does not have.
+    #[error("module {module}: there is no sub-patch `{key}`")]
+    UnknownSubPatch {
+        /// The instance's module ID.
+        module: u32,
+        /// The key it names.
+        key: String,
+    },
+    /// A `subpatch` on a module that is not an instance, or an instance
+    /// with no `subpatch`.
+    #[error("module {module}: `{kind}` and its `subpatch` field disagree; only `loom.struct.subpatch@1` has one")]
+    NotAnInstance {
+        /// The module's ID.
+        module: u32,
+        /// Its kind.
+        kind: String,
+    },
+    /// Two Patch inputs or two Patch outputs of one definition share a name.
+    #[error("two {direction} ports are called `{port}`; give one another label")]
+    DuplicatePort {
+        /// "input" or "output".
+        direction: &'static str,
+        /// The shared name.
+        port: String,
+    },
+    /// An `exposed` entry that cannot be used.
+    #[error("exposed parameter `{name}`: {reason}")]
+    BadExposed {
+        /// The exposed name.
+        name: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A Transport inside a sub-patch definition. A patch has one, at the
+    /// top level (`docs/design/sub-patches.md`, rule 8).
+    #[error("module {module} is a Transport, and a sub-patch cannot hold one")]
+    TransportInSubPatch {
+        /// The module's ID in the definition.
+        module: u32,
+    },
+    /// A modulation assignment whose source is a Patch input's `out`.
+    /// Collapsing never makes one; expose the parameter instead.
+    #[error("module {module} is a Patch input, and an assignment cannot start at a port")]
+    AssignmentFromPort {
+        /// The Patch input's ID in the definition.
+        module: u32,
+    },
+    /// Two instances name one definition. Every instance has its own
+    /// (`docs/design/sub-patches.md`, rule 3: no action at a distance).
+    #[error("sub-patch `{key}` is used by modules {first} and {second}, and each instance has a definition of its own")]
+    SharedSubPatch {
+        /// The shared key.
+        key: String,
+        /// The first instance's path.
+        first: String,
+        /// The second instance's path.
+        second: String,
+    },
+    /// Two cables into one input inside a definition. A flat patch keeps
+    /// the later one; a sub-patch must not depend on that.
+    #[error("two cables go into input `{port}` of module {module}")]
+    TwoCablesIntoOneInput {
+        /// The module's ID in the definition.
+        module: u32,
+        /// The input's name.
+        port: String,
+    },
+    /// Sub-patches nested deeper than [`flatten::MAX_DEPTH`] levels. A
+    /// bound keeps a hand-made file from exhausting the stack.
+    #[error("sub-patches nest more than {max} levels deep")]
+    TooDeep {
+        /// The most levels allowed.
+        max: usize,
+    },
+    /// A definition that contains itself, directly or through others.
+    #[error("sub-patch {} contains itself", .path.join(" › "))]
+    SubPatchLoop {
+        /// The definitions' names along the loop, first to last.
+        path: Vec<String>,
+    },
+    /// An error inside a sub-patch definition, with the definition's name.
+    #[error("in sub-patch \"{name}\": {source}")]
+    InSubPatch {
+        /// The definition's name.
+        name: String,
+        /// What went wrong inside it. Module IDs are the definition's own.
+        source: Box<PatchError>,
     },
 }
 
@@ -368,43 +455,16 @@ impl Patch {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             version: CURRENT_VERSION,
-            name: name.into(),
-            description: String::new(),
-            authors: Vec::new(),
-            tags: Vec::new(),
-            license: None,
+            metadata: Metadata {
+                name: name.into(),
+                ..Metadata::default()
+            },
+            subpatches: BTreeMap::new(),
             modules: Vec::new(),
             cables: Vec::new(),
             modulation: Vec::new(),
             midi: Vec::new(),
         }
-    }
-
-    /// The patch's metadata: name, description, authors, tags, licence.
-    pub fn metadata(&self) -> Metadata {
-        Metadata {
-            name: self.name.clone(),
-            description: self.description.clone(),
-            authors: self.authors.clone(),
-            tags: self.tags.clone(),
-            license: self.license.clone(),
-        }
-    }
-
-    /// Replaces the patch's metadata, name included.
-    pub fn set_metadata(&mut self, metadata: Metadata) {
-        let Metadata {
-            name,
-            description,
-            authors,
-            tags,
-            license,
-        } = metadata;
-        self.name = name;
-        self.description = description;
-        self.authors = authors;
-        self.tags = tags;
-        self.license = license;
     }
 
     /// Parses RON text and migrates it to the current version.
@@ -414,16 +474,41 @@ impl Patch {
     }
 
     /// Canonical RON text.
+    ///
+    /// Every module, cable, and mapping sits on one line, at the top level
+    /// and inside each definition, so a diff shows one change per line.
+    /// RON has one depth limit for a whole file, so the top level and each
+    /// definition are printed on their own and joined.
     pub fn to_ron(&self) -> Result<String, PatchError> {
         let mut canonical = self.clone();
         canonical.canonicalise();
-        let config = ron::ser::PrettyConfig::new()
-            .struct_names(true)
-            .depth_limit(2)
-            .separate_tuple_members(false)
-            .indentor("    ");
-        let mut text = ron::ser::to_string_pretty(&canonical, config)?;
-        text.push('\n');
+        let definitions = std::mem::take(&mut canonical.subpatches);
+        let mut text = pretty(&canonical)?;
+        if !definitions.is_empty() {
+            let mut table = String::from("    subpatches: {\n");
+            for (key, definition) in &definitions {
+                table.push_str("        ");
+                table.push_str(&ron::to_string(key)?);
+                table.push_str(": ");
+                for (i, line) in pretty(definition)?.lines().enumerate() {
+                    if i > 0 {
+                        table.push_str("        ");
+                    }
+                    table.push_str(line);
+                    table.push('\n');
+                }
+                // The definition ended with ")\n"; it is one entry of the table.
+                table.pop();
+                table.push_str(",\n");
+            }
+            table.push_str("    },\n");
+            // At a line start: a string value cannot hold a raw newline, so
+            // this cannot match inside a name or description.
+            let modules = text
+                .find("\n    modules: [")
+                .expect("a patch always writes its modules");
+            text.insert_str(modules + 1, &table);
+        }
         Ok(text)
     }
 
@@ -433,10 +518,10 @@ impl Patch {
     /// and the engine adds them in id order, so a reloaded patch sums its
     /// assignments the same way as the patch that was saved.
     pub fn canonicalise(&mut self) {
-        self.modules.sort_by_key(|m| m.id);
-        self.cables.sort_by(|a, b| (a.to.0, &a.to.1).cmp(&(b.to.0, &b.to.1)));
-        self.midi
-            .sort_by(|a, b| (a.target.0, &a.target.1).cmp(&(b.target.0, &b.target.1)));
+        canonicalise_lists(&mut self.modules, &mut self.cables, &mut self.midi);
+        for definition in self.subpatches.values_mut() {
+            definition.canonicalise();
+        }
     }
 
     /// Upgrades an older patch to [`CURRENT_VERSION`].
@@ -464,191 +549,14 @@ impl Patch {
         module: &PatchModule,
         registry: &Registry,
     ) -> Result<Option<loom_core::UnknownModule>, PatchError> {
-        if !module.kind.contains('@') {
-            return Err(LoomError::InvalidKind(module.kind.clone()).into());
-        }
-        let kind = loom_core::ModuleKind::parse(&module.kind)?;
-        if registry
-            .get(&kind.id)
-            .is_some_and(|descriptor| descriptor.version == kind.version)
-        {
-            return Ok(None);
-        }
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        let mut parameters: Vec<String> = module.params.keys().cloned().collect();
-        let push = |items: &mut Vec<String>, name: &str| {
-            if !items.iter().any(|existing| existing == name) {
-                items.push(name.to_string());
-            }
-        };
-        for cable in &self.cables {
-            if cable.to.0 == module.id {
-                push(&mut inputs, &cable.to.1);
-            }
-            if cable.from.0 == module.id {
-                push(&mut outputs, &cable.from.1);
-            }
-        }
-        for assignment in &self.modulation {
-            if assignment.source.0 == module.id {
-                push(&mut outputs, &assignment.source.1);
-            }
-            if assignment.target.0 == module.id {
-                push(&mut parameters, &assignment.target.1);
-            }
-        }
-        for mapping in &self.midi {
-            if mapping.target.0 == module.id {
-                push(&mut parameters, &mapping.target.1);
-            }
-        }
-        Ok(Some(loom_core::UnknownModule {
-            kind: module.kind.clone(),
-            params: module.params.clone(),
-            ranges: module.ranges.clone(),
-            inputs,
-            outputs,
-            parameters,
-        }))
-    }
-
-    /// Adds every module and cable to a controller and commits.
-    ///
-    /// The controller should be empty. Module IDs from the file are kept.
-    /// Returns a [`LoadWarning`] for each thing that loaded differently from
-    /// the file: an unknown module, an added Transport, or a saved
-    /// control range that the parameter does not offer, or that does not
-    /// hold the saved value. Values never change (control-ranges.md, rule 7).
-    ///
-    /// Every patch has exactly one Transport (`docs/design/clock.md`). Two
-    /// fail with an error that names both. A patch without one gets one,
-    /// with a note, when the registry has the Transport module.
-    pub fn load_into(&self, controller: &mut Controller) -> Result<Vec<LoadWarning>, PatchError> {
-        let mut notes = Vec::new();
-        let mut unknown_kinds = Vec::new();
-        let transports: Vec<u32> = self
-            .modules
-            .iter()
-            .filter(|m| {
-                loom_core::ModuleKind::parse(&m.kind).ok().is_some_and(|kind| {
-                    controller.registry().get(&kind.id).is_some_and(|descriptor| {
-                        descriptor.id == TRANSPORT_MODULE && descriptor.version == kind.version
-                    })
-                })
-            })
-            .map(|m| m.id)
-            .collect();
-        if let [first, second, ..] = transports[..] {
-            return Err(PatchError::TwoTransports { first, second });
-        }
-        let (modules, warnings) = self.resolve(controller.registry(), ResolveOptions::FILE)?;
-        notes.extend(warnings);
-        for module in &modules {
-            module.add_to(controller, ModuleId(module.id))?;
-            if let Some(unknown) = &module.unknown {
-                unknown_kinds.push(unknown.kind.clone());
-            }
-        }
-        if !unknown_kinds.is_empty() {
-            notes.push(LoadWarning::UnknownModules { kinds: unknown_kinds });
-        }
-        if transports.is_empty() && controller.registry().resolve(TRANSPORT_MODULE).is_ok() {
-            let id = controller.add_module(TRANSPORT_MODULE)?;
-            notes.push(LoadWarning::TransportAdded { module: id.0 });
-        }
-        for cable in &self.cables {
-            controller.connect_named(ModuleId(cable.from.0), &cable.from.1, ModuleId(cable.to.0), &cable.to.1)?;
-        }
-        for assignment in &self.modulation {
-            let id = controller.add_assignment_named(
-                ModuleId(assignment.source.0),
-                &assignment.source.1,
-                ModuleId(assignment.target.0),
-                &assignment.target.1,
-                assignment.depth,
-            )?;
-            if let Some(polarity) = assignment.polarity {
-                controller.set_assignment_polarity(id, Some(polarity.into()))?;
-            }
-            if !assignment.enabled {
-                controller.set_assignment_enabled(id, false)?;
-            }
-        }
-        self.check_midi()?;
-        for mapping in &self.midi {
-            let control = MidiControl {
-                channel: mapping.channel,
-                controller: mapping.controller,
-            };
-            controller
-                .map_midi_named_with(
-                    control,
-                    ModuleId(mapping.target.0),
-                    &mapping.target.1,
-                    mapping.options(),
-                )
-                .map_err(|error| match error {
-                    LoomError::NoSuchParam { .. } => PatchError::UnknownParam {
-                        module: mapping.target.0,
-                        param: mapping.target.1.clone(),
-                    },
-                    LoomError::InvalidMidiOptions(reason) => PatchError::InvalidMidiMapping {
-                        module: mapping.target.0,
-                        param: mapping.target.1.clone(),
-                        reason,
-                    },
-                    other => PatchError::Engine(other),
-                })?;
-        }
-        controller.commit()?;
-        Ok(notes)
+        self.level().unknown_module(module, registry)
     }
 
     /// The saved values that [`Patch::load_into`] ignores because their
     /// parameter is transient, as `(module id, parameter name)`. A module
     /// kind the registry does not know is skipped; loading reports it.
     pub fn transient_values(&self, registry: &Registry) -> Vec<(u32, String)> {
-        self.modules
-            .iter()
-            .filter_map(|module| {
-                let kind = loom_core::ModuleKind::parse(&module.kind).ok()?;
-                let descriptor = registry.get(&kind.id)?;
-                (kind.version == descriptor.version).then_some((module, descriptor))
-            })
-            .flat_map(|(module, descriptor)| {
-                module
-                    .params
-                    .keys()
-                    .filter(|name| {
-                        descriptor
-                            .param_index(name)
-                            .is_some_and(|i| descriptor.params[i].is_transient())
-                    })
-                    .map(|name| (module.id, name.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Refuses two MIDI mappings on one parameter or one control. The
-    /// controller would quietly keep the last one, which hides the mistake.
-    fn check_midi(&self) -> Result<(), PatchError> {
-        let mut targets = std::collections::BTreeSet::new();
-        let mut controls = std::collections::BTreeSet::new();
-        for mapping in &self.midi {
-            if !targets.insert(&mapping.target) {
-                return Err(PatchError::DuplicateMidiMapping {
-                    what: format!("parameter `{}` of module {}", mapping.target.1, mapping.target.0),
-                });
-            }
-            if !controls.insert((mapping.channel, mapping.controller)) {
-                return Err(PatchError::DuplicateMidiMapping {
-                    what: format!("controller {} on channel {}", mapping.controller, mapping.channel),
-                });
-            }
-        }
-        Ok(())
+        self.level().transient_values(registry)
     }
 
     /// Builds a patch from a graph. Only non-default parameters are saved.
@@ -705,6 +613,34 @@ impl Patch {
         patch.canonicalise();
         patch
     }
+}
+
+/// One level as RON text, with each module, cable, and mapping on one
+/// line and a newline at the end.
+fn pretty<T: Serialize>(value: &T) -> Result<String, PatchError> {
+    // One line ending everywhere: RON would write CRLF on Windows, and a
+    // canonical file must not depend on where it was saved.
+    let config = ron::ser::PrettyConfig::new()
+        .struct_names(true)
+        .depth_limit(2)
+        .separate_tuple_members(false)
+        .new_line("\n")
+        .indentor("    ");
+    let mut text = ron::ser::to_string_pretty(value, config)?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// Sorts one level's lists into canonical order: modules by ID, cables by
+/// input, MIDI mappings by target. Modulation is left in file order.
+pub(crate) fn canonicalise_lists(
+    modules: &mut [PatchModule],
+    cables: &mut [PatchCable],
+    midi: &mut [PatchMidiMapping],
+) {
+    modules.sort_by_key(|m| m.id);
+    cables.sort_by(|a, b| (a.to.0, &a.to.1).cmp(&(b.to.0, &b.to.1)));
+    midi.sort_by(|a, b| (a.target.0, &a.target.1).cmp(&(b.target.0, &b.target.1)));
 }
 
 fn port_name(graph: &Graph, output: OutputRef) -> String {
