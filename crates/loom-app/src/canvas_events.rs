@@ -109,6 +109,14 @@ impl App {
                 }
             }
             CanvasEvent::Connect { from, to } => {
+                let graph = self.session.controller.graph();
+                let both_modules =
+                    graph.node(ModuleId(from.module)).is_some() && graph.node(ModuleId(to.module)).is_some();
+                if !both_modules {
+                    // A port or sub-patch tile at one end: a boundary record.
+                    self.connect_through_hierarchy(from, to);
+                    return;
+                }
                 let output = OutputRef {
                     module: ModuleId(from.module),
                     port: from.index,
@@ -117,8 +125,18 @@ impl App {
                     module: ModuleId(to.module),
                     port: to.index,
                 };
+                let through_port = self.link_into_shown(to);
                 match self.session.controller.connect(output, input) {
                     Ok(_) => {
+                        // The record that held the old cable goes with it,
+                        // after the connect, so a refusal changes nothing.
+                        if through_port && let Some(to_end) = self.level_end(to) {
+                            let level = self.session.level.clone();
+                            self.change_hierarchy("connect", |h| {
+                                h.disconnect(&level, &to_end);
+                                Ok(())
+                            });
+                        }
                         self.commit();
                     }
                     Err(e) => self.alerts.warn(e.to_string()),
@@ -150,7 +168,11 @@ impl App {
                     module: ModuleId(port.module),
                     port: port.index,
                 };
-                if self.session.controller.disconnect(input).is_ok() {
+                if self.session.controller.graph().node(input.module).is_none() || self.link_into_shown(port) {
+                    // The cable is a boundary record: on a port or sub-patch
+                    // tile, or into a module from a port.
+                    self.disconnect_through_hierarchy(port);
+                } else if self.session.controller.disconnect(input).is_ok() {
                     self.commit();
                 }
             }
@@ -255,6 +277,11 @@ impl App {
             }
             // The app reads the clipboard first, in `update`.
             CanvasEvent::Paste { .. } => {}
+            CanvasEvent::OpenTile(id) => self.open_tile(id),
+            // Each level keeps its camera for the session.
+            CanvasEvent::Camera(camera) => {
+                self.session.cameras.insert(self.session.level.clone(), camera);
+            }
         }
     }
 }

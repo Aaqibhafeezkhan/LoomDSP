@@ -5,7 +5,7 @@ use crate::{App, Message, RightTab, alerts, browser, clipboard, undo};
 use iced::advanced::widget::operation::{self, Focusable, Outcome};
 use iced::advanced::widget::{Id, Operation};
 use iced::{Point, Task};
-use loom_core::{LoomError, ModuleId};
+use loom_core::{InputRef, LoomError, ModuleId};
 use std::collections::BTreeSet;
 
 /// Why toolbar Undo or Redo is disabled.
@@ -181,9 +181,15 @@ impl App {
     /// if one is already open, so a gesture's first call is the one that
     /// counts.
     pub(crate) fn begin_edit(&mut self) {
-        let (controller, positions, sizes) = (&self.session.controller, &self.session.positions, &self.session.sizes);
+        let (controller, hierarchy, level, positions, sizes) = (
+            &self.session.controller,
+            &self.session.hierarchy,
+            &self.session.level,
+            &self.session.positions,
+            &self.session.sizes,
+        );
         self.session.edits.begin(controller.has_uncommitted_changes(), || {
-            undo::Snapshot::take_with_sizes(controller, positions, sizes)
+            undo::Snapshot::take_full(controller, hierarchy, level, positions, sizes)
         });
     }
 
@@ -191,20 +197,32 @@ impl App {
     pub(crate) fn record(&mut self) {
         // A command's name is for this step only, also when no step is made.
         let step_name = self.session.step_name.take();
-        let (controller, positions, sizes) = (&self.session.controller, &self.session.positions, &self.session.sizes);
+        let (controller, hierarchy, level, positions, sizes) = (
+            &self.session.controller,
+            &self.session.hierarchy,
+            &self.session.level,
+            &self.session.positions,
+            &self.session.sizes,
+        );
         self.session.edits.record(step_name, || {
-            undo::Snapshot::take_with_sizes(controller, positions, sizes)
+            undo::Snapshot::take_full(controller, hierarchy, level, positions, sizes)
         });
     }
 
     /// Closes the open gesture, of either kind, and records it.
     pub(crate) fn end_gesture(&mut self) {
         let step_name = self.session.step_name.take();
-        let (controller, positions, sizes) = (&self.session.controller, &self.session.positions, &self.session.sizes);
+        let (controller, hierarchy, level, positions, sizes) = (
+            &self.session.controller,
+            &self.session.hierarchy,
+            &self.session.level,
+            &self.session.positions,
+            &self.session.sizes,
+        );
         self.session
             .edits
             .end_gesture(controller.has_uncommitted_changes(), step_name, || {
-                undo::Snapshot::take_with_sizes(controller, positions, sizes)
+                undo::Snapshot::take_full(controller, hierarchy, level, positions, sizes)
             });
     }
 
@@ -328,10 +346,11 @@ impl App {
         }
         // An armed parameter is a mode, not an edit: undo disarms it first.
         self.session.learn.disarm();
-        let applied = undo::apply_with_sizes(
+        let applied = undo::apply_full(
             &step,
             forward,
             &mut self.session.controller,
+            &mut self.session.hierarchy,
             &mut self.session.positions,
             &mut self.session.sizes,
         );
@@ -342,17 +361,34 @@ impl App {
                 } else {
                     self.session.edits.history.undone();
                 }
-                // What the step touched, if it still exists, is selected.
+                // The level the edit was made on is shown first, so the
+                // player sees what was undone (sub-patches.md, Undo across
+                // levels). The graph's cables follow the restored hierarchy.
+                self.show_level(&self.session.hierarchy.nearest_level(step.level()));
+                if let Err(e) = self.session.hierarchy.sync(&mut self.session.controller) {
+                    // Both sides of the step were recorded together, so they
+                    // cannot disagree: a failure here is a bug in a record.
+                    debug_assert!(false, "a restored hierarchy must sync: {e}");
+                    self.alerts
+                        .warn(format!("Cannot {} {}: {e}", verb.to_lowercase(), step.name()));
+                }
+                // What the step touched, if it is still on this level, is
+                // selected.
                 let touched: BTreeSet<u32> = step
                     .touched_modules()
-                    .filter(|&id| self.session.controller.graph().node(ModuleId(id)).is_some())
+                    .filter(|&id| on_shown_level(&self.session, id))
                     .collect();
                 if !touched.is_empty() {
                     self.session.selection = touched;
                 }
-                self.session
+                let kept: BTreeSet<u32> = self
+                    .session
                     .selection
-                    .retain(|&id| self.session.controller.graph().node(ModuleId(id)).is_some());
+                    .iter()
+                    .copied()
+                    .filter(|&id| on_shown_level(&self.session, id))
+                    .collect();
+                self.session.selection = kept;
                 if self.commit() {
                     self.alerts.say(format!("{verb}: {}", step.name()));
                 } else {
@@ -425,13 +461,9 @@ impl App {
     /// Removes modules and commits. Returns false if the commit failed; the
     /// status bar then holds the error.
     pub(crate) fn delete_modules(&mut self, ids: &[u32]) -> bool {
-        for id in ids {
-            if self.session.controller.remove_module(ModuleId(*id)).is_ok() {
-                self.session.positions.remove(id);
-                self.session.selection.remove(id);
-            }
-        }
-        self.commit()
+        // Through the hierarchy: a sub-patch tile takes its inside with it,
+        // and a port its cables.
+        self.delete_tiles(ids)
     }
 
     /// The clipboard command a message asks for: `'c'`, `'x'`, or `'d'`
@@ -471,6 +503,12 @@ impl App {
     /// The selected modules, or `None` and a status bar note when nothing
     /// is selected.
     pub(crate) fn selected_group(&mut self, verb: &str, incoming: bool) -> Option<clipboard::Group> {
+        // The clipboard cannot carry a sub-patch or a port yet
+        // (sub-patches.md, Editor model).
+        if self.structural_in_selection() {
+            self.alerts.warn(crate::levels::NO_COPY_YET.replace("copy", verb));
+            return None;
+        }
         let group = clipboard::Group::from_selection(
             self.session.controller.graph(),
             &self.session.positions,
@@ -536,26 +574,94 @@ impl App {
         if self.session.edits.gesture_open() {
             return;
         }
-        let Some(group) = self.selected_group("duplicate", true) else {
+        let Some(mut group) = self.selected_group("duplicate", true) else {
             return;
         };
+        // A cable that comes in through a port is a boundary record, not a
+        // graph cable the copy could take: it is added back as a record
+        // from the same port (sub-patches.md, Editor model).
+        let level = self.session.level.clone();
+        let (graph, hierarchy) = (self.session.controller.graph(), &self.session.hierarchy);
+        group.drop_outside_cables(|from, to| {
+            hierarchy.is_implied(
+                graph,
+                from,
+                InputRef {
+                    module: ModuleId(to.0),
+                    port: to.1,
+                },
+            )
+        });
+        // The group's members, in its order: the selection may also hold the
+        // Transport, which a group leaves out, and the new ids follow the
+        // group.
+        let originals: Vec<u32> = group.ids().collect();
+        let through_ports: Vec<(loom_patch::End, u32, String)> = hierarchy
+            .level_cables(graph, &level)
+            .into_iter()
+            .filter(|cable| cable.link)
+            .filter_map(|cable| {
+                let id = hierarchy.id_at(&level, cable.to.0)?;
+                originals.contains(&id.0).then_some((cable.from, id.0, cable.to.1))
+            })
+            .collect();
         let at = group.top_left().unwrap_or((0.0, 0.0));
         let offset = clipboard::DUPLICATE_OFFSET;
-        self.add_group(&group, (at.0 + offset, at.1 + offset), "duplicate", "Duplicated");
+        self.add_group_then(
+            &group,
+            (at.0 + offset, at.1 + offset),
+            "duplicate",
+            "Duplicated",
+            |app, ids| {
+                if through_ports.is_empty() {
+                    return;
+                }
+                let copies: std::collections::BTreeMap<u32, u32> =
+                    originals.iter().copied().zip(ids.iter().copied()).collect();
+                app.change_hierarchy("duplicate", |h| {
+                    for (from, original, input) in through_ports {
+                        if let Some(copy) = copies.get(&original) {
+                            h.connect(&level, from, (h.path_of(ModuleId(*copy)).last(), input));
+                        }
+                    }
+                    Ok(())
+                });
+            },
+        );
     }
 
     /// Adds a group as one step and selects it, or changes nothing and says
     /// why.
     pub(crate) fn add_group(&mut self, group: &clipboard::Group, origin: (f32, f32), verb: &str, done: &str) {
+        self.add_group_then(group, origin, verb, done, |_, _| {});
+    }
+
+    /// [`App::add_group`], with `finish` run on the new ids inside the same
+    /// step, before the commit.
+    pub(crate) fn add_group_then(
+        &mut self,
+        group: &clipboard::Group,
+        origin: (f32, f32),
+        verb: &str,
+        done: &str,
+        finish: impl FnOnce(&mut Self, &[u32]),
+    ) {
         if let Err(why) = group.check(&self.session.controller) {
             self.alerts.warn(format!("Cannot {verb}: {why}"));
             return;
         }
         self.session.step_name = Some(format!("{verb} {}", group.describe()));
-        self.edit(
-            |app| match group.add(&mut app.session.controller, &mut app.session.positions, origin) {
+        self.edit(|app| {
+            match group.add(
+                &mut app.session.controller,
+                &mut app.session.hierarchy,
+                &app.session.level,
+                &mut app.session.positions,
+                origin,
+            ) {
                 Ok(ids) => {
                     group.apply_sizes(&ids, &mut app.session.sizes);
+                    finish(app, &ids);
                     app.session.selection = ids.into_iter().collect();
                     if app.commit() {
                         app.alerts.say(format!("{done} {}", group.describe()));
@@ -567,9 +673,15 @@ impl App {
                     app.commit();
                     app.alerts.warn(format!("Cannot {verb}: {e}"));
                 }
-            },
-        );
+            }
+        });
         // `record` clears it, but an edit inside a gesture does not record.
         self.session.step_name = None;
     }
+}
+
+/// True when `id` is a tile on the level the canvas shows.
+fn on_shown_level(session: &crate::session::PatchSession, id: u32) -> bool {
+    let id = ModuleId(id);
+    session.hierarchy.tile(session.controller.graph(), id).is_some() && session.hierarchy.level_of(id) == session.level
 }

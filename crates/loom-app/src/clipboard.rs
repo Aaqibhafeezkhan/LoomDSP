@@ -13,7 +13,8 @@ use loom_canvas::GRID;
 use loom_core::ModuleNames;
 use loom_core::{Controller, Graph, InputRef, LoomError, ModuleId, ModuleRole, OutputRef, Polarity, Registry};
 use loom_patch::{
-    Layout, Patch, PatchCable, PatchError, PatchModulation, PatchPolarity, ResolveError, ResolveOptions, ResolvedModule,
+    Hierarchy, Layout, ModulePath, Patch, PatchCable, PatchError, PatchModulation, PatchPolarity, ResolveError,
+    ResolveOptions, ResolvedModule,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -382,6 +383,23 @@ impl Group {
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
     }
 
+    /// The ids of the group's modules in the patch they came from, in the
+    /// order [`Group::add`] gives out new ids: for pairing copies with
+    /// their originals.
+    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.modules.iter().map(|m| m.id)
+    }
+
+    /// Drops the cables from outside the group that `drop` says. A cable a
+    /// port implies is not the graph's to copy: the caller adds it back as
+    /// a boundary record from the same port.
+    pub fn drop_outside_cables(&mut self, drop: impl Fn(OutputRef, (u32, usize)) -> bool) {
+        self.cables.retain(|cable| match cable.from {
+            Source::Outside(from) => !drop(from, cable.to),
+            Source::Inside(..) => true,
+        });
+    }
+
     /// Checks that the group can be added, before anything changes
     /// (rule 5). Module types and names were checked when the group was
     /// read, so what is left is room in the patch. Only normal modules take
@@ -410,11 +428,13 @@ impl Group {
     pub fn add(
         &self,
         controller: &mut Controller,
+        hierarchy: &mut Hierarchy,
+        level: &ModulePath,
         positions: &mut BTreeMap<u32, (f32, f32)>,
         origin: (f32, f32),
     ) -> Result<Vec<u32>, LoomError> {
         let mut added = Vec::with_capacity(self.modules.len());
-        let result = self.add_into(controller, positions, origin, &mut added);
+        let result = self.add_into(controller, hierarchy, level, positions, origin, &mut added);
         if result.is_err() {
             for id in &added {
                 let _ = controller.remove_module(ModuleId(*id));
@@ -427,6 +447,8 @@ impl Group {
     fn add_into(
         &self,
         controller: &mut Controller,
+        hierarchy: &mut Hierarchy,
+        level: &ModulePath,
         positions: &mut BTreeMap<u32, (f32, f32)>,
         origin: (f32, f32),
         added: &mut Vec<u32>,
@@ -441,12 +463,19 @@ impl Group {
             .fold(0.0, f32::max);
         let mut unplaced = 0.0;
         let mut ids = BTreeMap::new();
+        hierarchy.adopt(controller.graph());
         for member in &self.modules {
-            let id = if let Some(unknown) = &member.unknown {
-                controller.add_unknown(unknown.clone())?
+            // Ids come from the hierarchy's table, at the shown level
+            // (ADR-0039, invariant 1).
+            let (_, id) = hierarchy.new_module(level).map_err(|e| match e {
+                PatchError::Engine(e) => e,
+                other => LoomError::InvalidKind(other.to_string()),
+            })?;
+            if let Some(unknown) = &member.unknown {
+                controller.add_unknown_with_id(id, unknown.clone())?;
             } else {
-                controller.add_module(&member.descriptor.kind())?
-            };
+                controller.add_module_with_id(id, &member.descriptor.kind())?;
+            }
             added.push(id.0);
             ids.insert(member.id, id);
             // Label, ranges, then values, as a patch loads.

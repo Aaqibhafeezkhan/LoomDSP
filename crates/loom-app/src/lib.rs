@@ -39,6 +39,7 @@ mod input_watch;
 mod inspector;
 mod layout;
 mod learn;
+mod levels;
 mod licence_chooser;
 mod lights;
 mod live;
@@ -291,6 +292,15 @@ enum Message {
     HelpLink(String),
     /// Close the tile menu.
     CloseTileMenu,
+    /// Show a level of the patch: the top, or the inside of a sub-patch
+    /// (the breadcrumb bar).
+    OpenLevel(loom_patch::ModulePath),
+    /// Open the sub-patch tile with this id.
+    OpenTile(u32),
+    /// Make a sub-patch of the selection and this tile (the tile menu).
+    MakeSubPatch(u32),
+    /// Dissolve this sub-patch tile (the tile menu).
+    DissolveSubPatch(u32),
     /// A message for the open module browser.
     Browser(browser::Message),
     /// A message for the open probe menu.
@@ -534,6 +544,10 @@ impl Message {
             | Self::HelpExample
             | Self::HelpLink(_)
             | Self::CloseTileMenu
+            | Self::OpenLevel(_)
+            | Self::OpenTile(_)
+            | Self::MakeSubPatch(_)
+            | Self::DissolveSubPatch(_)
             | Self::Browser(_)
             | Self::ProbeMenu(_)
             | Self::AddProbe { .. }
@@ -653,6 +667,8 @@ enum Source<'a> {
 /// An engine and the patch loaded into it, before audio is attached.
 struct Loaded {
     controller: Controller,
+    /// The sub-patch hierarchy read with the patch (ADR-0039).
+    hierarchy: loom_patch::Hierarchy,
     engine: loom_core::Engine,
     midi: loom_core::MidiSender,
     telemetry: loom_core::Telemetry,
@@ -676,9 +692,9 @@ impl App {
     /// The patch as it would be saved now.
     fn current_patch(&self) -> Patch {
         let session = &self.session;
-        let layout = |id: loom_core::ModuleId| {
-            let shown = session.positions.get(&id.0);
-            let position = match session.unknown_positions.get(&id.0) {
+        let layout = |id: u32| {
+            let shown = session.positions.get(&id);
+            let position = match session.unknown_positions.get(&id) {
                 // A placeholder nobody moved keeps the position from its
                 // file, exactly (unknown-modules.md, rule 1).
                 Some((original, initial)) if shown == Some(initial) => *original,
@@ -686,10 +702,12 @@ impl App {
             };
             loom_patch::Layout {
                 position,
-                size: session.sizes.get(&id.0).copied(),
+                size: session.sizes.get(&id).copied(),
             }
         };
-        let mut patch = Patch::from_graph_with(session.document.name(), session.controller.graph(), layout);
+        // Through the hierarchy, so the sub-patches are written as the file
+        // holds them (ADR-0039, invariant 5).
+        let mut patch = session.hierarchy.unflatten(session.controller.graph(), layout);
         patch.metadata = session.document.info().clone();
         patch
     }
@@ -765,8 +783,17 @@ impl App {
 
     /// Rebuilds the scene after the graph changed.
     fn refresh(&mut self) {
+        // A module added straight to the controller is a top-level module
+        // the hierarchy must know (ADR-0039, invariant 1).
+        self.session.hierarchy.adopt(self.session.controller.graph());
         layout::auto_layout(&self.session.controller, &mut self.session.positions);
-        self.session.scene = scene::build(&self.session.controller, &self.session.positions, &self.session.sizes);
+        self.session.scene = scene::build(
+            &self.session.controller,
+            &self.session.hierarchy,
+            &self.session.level,
+            &self.session.positions,
+            &self.session.sizes,
+        );
         self.session.mode_key = scene::mode_key(&self.session.controller);
         self.refresh_values();
         self.refresh_learn();
@@ -780,7 +807,13 @@ impl App {
         // (ADR-0030). Rare: a mode click, never a knob turn.
         let mode_key = scene::mode_key(&self.session.controller);
         if mode_key != self.session.mode_key {
-            self.session.scene = scene::build(&self.session.controller, &self.session.positions, &self.session.sizes);
+            self.session.scene = scene::build(
+                &self.session.controller,
+                &self.session.hierarchy,
+                &self.session.level,
+                &self.session.positions,
+                &self.session.sizes,
+            );
             self.session.mode_key = mode_key;
         }
         let mut shown: scene::ShownValues = self
@@ -1344,7 +1377,15 @@ impl App {
     /// it, as one undo step.
     fn add_module(&mut self, descriptor: &'static ModuleDescriptor, world: Point) {
         self.close_slider_gesture();
-        self.edit(|app| match app.session.controller.add_module(descriptor.id) {
+        if let Some(why) = self.refuses_kind(descriptor.id) {
+            self.alerts.warn(why.to_string());
+            return;
+        }
+        // Inside a sub-patch, a Patch input or output is a port of it.
+        if self.add_port_tile(&descriptor.kind(), world) {
+            return;
+        }
+        self.edit(|app| match app.session.new_module(descriptor.id) {
             Ok(id) => {
                 app.session.positions.insert(id.0, (world.x, world.y));
                 app.session.selection = BTreeSet::from([id.0]);
@@ -1383,7 +1424,7 @@ impl App {
         self.close_slider_gesture();
         self.session.step_name = Some(probe.verb().to_string());
         self.edit(|app| {
-            let id = match app.session.controller.add_module(descriptor.id) {
+            let id = match app.session.new_module(descriptor.id) {
                 Ok(id) => id,
                 Err(e) => {
                     app.alerts.warn(format!("Cannot {}: {e}", probe.verb()));
@@ -1456,6 +1497,21 @@ impl App {
                 for (meter, _) in meters {
                     self.reset_clip(meter, true);
                 }
+            }
+            Message::OpenLevel(level) => self.show_level(&level),
+            Message::OpenTile(id) => {
+                self.overlays.close_tile_menu();
+                self.open_tile(id);
+            }
+            Message::MakeSubPatch(id) => {
+                self.overlays.close_tile_menu();
+                self.session.selection.insert(id);
+                self.make_subpatch();
+            }
+            Message::DissolveSubPatch(id) => {
+                self.overlays.close_tile_menu();
+                self.session.selection = BTreeSet::from([id]);
+                self.dissolve_subpatch();
             }
             Message::ShowModuleHelp(id) => {
                 self.overlays.close_tile_menu();
@@ -1653,6 +1709,13 @@ impl App {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
             }) if self.session.learn.is_on() => self.stop_learning(),
+            // Escape with nothing else using it goes up one level
+            // (sub-patches.md, Make, open, and dissolve): the canvas took it
+            // first for a drag, pinned lines, control focus, or a selection.
+            Message::Key(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) if self.no_overlay() && !self.session.level.is_root() => self.go_up(),
             Message::Key(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) if modifiers.command() => {
                 // Ctrl+Z or Cmd+Z undoes; adding Shift redoes. Ctrl+Y also
                 // redoes, except on macOS.
@@ -1679,6 +1742,13 @@ impl App {
                         self.history_key = Some(true)
                     }
                     iced::keyboard::Key::Character(",") => self.toggle_preferences(),
+                    // Ctrl+G makes a sub-patch; with Shift it dissolves one.
+                    iced::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("g") && modifiers.shift() => {
+                        self.dissolve_subpatch()
+                    }
+                    iced::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("g") => self.make_subpatch(),
+                    // Ctrl+Enter or Cmd+Enter opens the selected sub-patch.
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => self.open_selected(),
                     _ => {}
                 }
             }
@@ -1758,6 +1828,8 @@ Right-click an output or a cable to add a scope or a meter fed by it.\n\
 Click a modulation badge to pin its lines; click again or press Escape to hide them.\n\
 Cmd/Ctrl+C copies, X cuts, V pastes at the pointer, and D duplicates the selection.\n\
 Cmd/Ctrl+Z undoes, and Cmd/Ctrl+Shift+Z redoes.\n\
+Cmd/Ctrl+G makes a sub-patch of the selection; Cmd/Ctrl+Shift+G dissolves the selected one.\n\
+Double-click a sub-patch's header, or press Cmd/Ctrl+Enter with it selected, to open it. Escape with nothing selected goes back up; so does a name in the breadcrumb bar.\n\
 MIDI learn: click a control, then move a knob on your controller. Escape ends it.";
 
 #[cfg(test)]

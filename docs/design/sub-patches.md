@@ -3,14 +3,14 @@
 How a player collapses part of a patch into one module with its own ports and panel, opens it to edit, saves it to a library, and builds abstractions with swappable slots and modes.
 
 - **Kind:** living specification.
-- **Status:** Agreed, M2. The choices marked "Settled" were made with the maintainer on 2026-11-01. The [patch file](#patch-file) and [flattening](#flattening) are Implemented (slice 1 of [#51](https://github.com/brylie/LoomDSP/issues/51), 2026-11-06), without `library`, `roles`, `panel`, and the mode fields, which their slices add. Until the editor keeps the hierarchy (slice 2), the app refuses to open a patch that has sub-patches, with a message that `loom render` plays it; the command line flattens and plays them.
-- **Decision behind it:** [ADR-0031](../adr/0031-sub-patches-stored-as-definitions-and-flattened.md) (definitions, flattening, library items as patch files). [ADR-0017](../adr/0017-primitives-traits-and-abstractions.md) for roles and slots. [ADR-0013](../adr/0013-modules-carry-their-own-panel.md) and [ADR-0025](../adr/0025-one-design-language-and-derived-panels.md) for the sub-patch's panel.
+- **Status:** Agreed, M2. The choices marked "Settled" were made with the maintainer on 2026-11-01. The [patch file](#patch-file) and [flattening](#flattening) are Implemented (slice 1 of [#51](https://github.com/brylie/LoomDSP/issues/51), 2026-11-06), without `library`, `roles`, `panel`, and the mode fields, which their slices add. Collapse, dissolve, open, the breadcrumb, and undo across levels are Implemented (slice 2 of [#51](https://github.com/brylie/LoomDSP/issues/51), 2026-11-07); see [Editor model](#editor-model).
+- **Decision behind it:** [ADR-0031](../adr/0031-sub-patches-stored-as-definitions-and-flattened.md) (definitions, flattening, library items as patch files). [ADR-0039](../adr/0039-editor-keeps-the-hierarchy-as-an-overlay.md) (the editor keeps the hierarchy as an overlay on the flat graph). [ADR-0017](../adr/0017-primitives-traits-and-abstractions.md) for roles and slots. [ADR-0013](../adr/0013-modules-carry-their-own-panel.md) and [ADR-0025](../adr/0025-one-design-language-and-derived-panels.md) for the sub-patch's panel.
 - **Use case and requirements:** FR-ENCAP-01 to FR-ENCAP-10, FR-SDK-08, FR-PANEL-10, FR-PANEL-11, FR-LIB-24, FR-MOD-06. Settles OQ-20 and OQ-21.
 - **Builds on:** [Panels: exposed controls in a sub-patch](panels.md#exposed-controls-in-a-sub-patch) (what the surface shows), [Module data](module-data.md) (data in slots and copies), [Undo](undo.md), [Copy, paste, and duplicate](clipboard.md), [Changing a running patch](live-patching.md).
 - **Background:** [Flattening](../learn/flattening.md): how a sub-patch becomes plain modules, why a hierarchical engine was rejected, and why flat ids come from a table keyed by path. An explainer on "abstraction" belongs with roles and slots.
 - **Prior art:** Max has both private sub-patchers and shared file abstractions. Reaktor and Bitwig Grid nest containers. Design tools have "instances" of a shared component. Named only to explain the trade-offs; the rules below are our own.
 - **Issues:** [#51](https://github.com/brylie/LoomDSP/issues/51) (umbrella), [#76](https://github.com/brylie/LoomDSP/issues/76) (panel editor).
-- **Code:** `crates/loom-patch/src/subpatch.rs` (the definition types), `flatten.rs` (flattening and the id table), `level.rs` (what the top patch and a definition share), and `crates/loom-modules/src/structure.rs` (the Patch input and output modules). Flattening lives in `crates/loom-patch`, next to the patch file types and the code that applies a patch to a `Controller`. `loom-core`'s `Graph` stays the flat engine graph with no file types (ADR-0002, ADR-0034). ADR-0031 left the crate open; settled with the maintainer on 2026-11-06 ([#651](https://github.com/brylie/LoomDSP/issues/651)).
+- **Code:** `crates/loom-patch/src/subpatch.rs` (the definition types), `flatten.rs` (flattening and the id table), `level.rs` (what the top patch and a definition share), `hierarchy.rs` (the editor's overlay: paths, definitions, ports, instances, boundary cables, `unflatten`, `collapse`, `dissolve`), and `crates/loom-modules/src/structure.rs` (the Patch input and output modules). Flattening lives in `crates/loom-patch`, next to the patch file types and the code that applies a patch to a `Controller`. `loom-core`'s `Graph` stays the flat engine graph with no file types (ADR-0002, ADR-0034). ADR-0031 left the crate open; settled with the maintainer on 2026-11-06 ([#651](https://github.com/brylie/LoomDSP/issues/651)).
 
 ## Goal
 
@@ -105,6 +105,25 @@ Exposing follows [Panels: exposed controls](panels.md#exposed-controls-in-a-sub-
 
 - Edits at every level share one history ([undo](undo.md)).
 - Undo and redo show the level the step changed. If it is not on screen, the canvas moves there first. *Why:* the player must see what was undone.
+
+### Editor model
+
+**Settled** (2026-11-07, with the maintainer on approval of the slice 2 plan).
+
+The engine's flat graph is the only thing that plays and the only home of parameters, cables, assignments, and MIDI mappings. The editor keeps the sub-patch hierarchy beside it as an overlay: where each flat module sits, the definitions with their metadata and exposed items, the instance and port tiles, and the cables that cross a boundary, recorded in the ids of their level. Collapse and dissolve change only the overlay, and the file is written from the overlay and the graph together. [ADR-0039](../adr/0039-editor-keeps-the-hierarchy-as-an-overlay.md) holds the decision, the options, and the invariants the overlay keeps.
+
+- **What a level shows.** Its modules, its nested sub-patches as tiles with a name and ports, its Patch inputs and outputs as port tiles, and the cables between them. A modulation line is drawn only between two modules of the same level. A line that crosses a boundary waits for the surface panel (slice 3). *Why:* until the tile has a surface, there is nothing on it for the line to end at.
+- **The breadcrumb bar appears only while a sub-patch is open.** A flat patch looks as before. *Why:* a player who never collapses anything should see nothing new.
+- **Each level keeps its camera for the session,** as [Make, open, and dissolve](#make-open-and-dissolve) says. The camera of a level that is collapsed into a new sub-patch moves with it. *Why:* going in and back out should land where the player left.
+- **A new sub-patch is named "Sub-patch"** ("Sub-patch 2", ...), and its definition key is made from the name. Renaming is not in this slice. *Why:* collapsing should not stop to ask a question, and the name is easy to change later.
+- **Patch input and output modules at the top level count as outside when collapsing,** like the Transport (collapsing point 6). Their cables into the selection become ports. *Why:* at the top level they are the ports of a library file opened on its own (flattening rule 15), and moving one inside would take a port off that file.
+- **Adding the Transport inside a sub-patch is refused** with `A sub-patch cannot hold the Transport: it lives at the top level`. *Why:* rule 8.
+- **Adding a Patch input or output inside a sub-patch makes a port** on the instance's tile, named by the module's label. *Why:* inside a definition that is what the module is (flattening rule 2), and the tile should show it at once.
+- **A modulation whose source and target are on different levels, or whose source is a port tile, is refused** with `Modulation cannot cross a sub-patch boundary; expose the parameter instead`, from the canvas and from the inspector, whose **Add modulation** list offers only the level's own modules. *Why:* rule 4, and until slice 3 the tile has no exposed parameter to drop onto.
+- **Copy, cut, and duplicate of a selection that holds a sub-patch tile are refused** with `Cannot copy a sub-patch yet`, until the clipboard carries definitions (listed under [Copies, library, and linking](#acceptance-criteria) with the library slice). Paste of text that holds sub-patches stays refused too. *Why:* the clipboard text holds modules and cables, not definitions, so a copy would lose the inside.
+- **Deleting a module takes the exposed items on it with it,** in the same undo step, at every level that re-exposed them, as Unexpose would. Deleting a port takes the cables through it on both sides. *Why:* an exposed item with nothing behind it has no value to show, and a file that named it would not load.
+- **A MIDI mapping on an inner parameter is written inside the definition.** A mapping on an instance's exposed name in a file flattens to the same thing; the inside form is the one the editor writes. *Why:* one canonical form, so a file saves back to the text it loaded from.
+- **Known gap: assignment order after save.** The file orders assignments inner first (flattening rule 11), while the live graph sums them in id order. A top-level assignment added before an inner one can therefore sum in a different order after save and reload. Collapse and dissolve do not create the gap, since they add no assignment. It is left to slice 3, which owns exposed parameters. *Why named here:* a player who modulates one parameter from two levels should know the save can reorder them.
 
 ### Roles
 
@@ -222,17 +241,17 @@ These rules are for implementers. The player never sees the flat graph.
 
 Collapse and navigation:
 
-- [ ] Collapsing three modules with two cables in and one out gives a tile with two inputs and one output, and the rendered output is bit-identical before and after (test).
-- [ ] Dissolving that tile gives back the same modules and cables (test).
-- [ ] An outside assignment to an inner parameter becomes an assignment to the exposed parameter (test).
-- [ ] Opening a sub-patch shows its inside and the breadcrumb; the breadcrumb and Escape go back; each level keeps its camera (`Ui` harness).
-- [ ] Undo of an edit made inside a sub-patch, while the canvas shows the top level, moves the canvas inside and reverts it (`Ui` harness).
+- [x] Collapsing three modules with two cables in and one out gives a tile with two inputs and one output, and the rendered output is bit-identical before and after (tests: `crates/loom-patch/src/hierarchy/tests.rs`, `crates/loom-modules/tests/subpatches.rs`).
+- [x] Dissolving that tile gives back the same modules and cables (test: `crates/loom-patch/src/hierarchy/tests.rs`, `crates/loom-app/src/levels/tests.rs`).
+- [x] An outside assignment to an inner parameter becomes an assignment to the exposed parameter (test: `crates/loom-patch/src/hierarchy/tests.rs`).
+- [x] Opening a sub-patch shows its inside and the breadcrumb; the breadcrumb and Escape go back; each level keeps its camera (`Ui` harness: `crates/loom-app/src/levels/tests.rs`).
+- [x] Undo of an edit made inside a sub-patch, while the canvas shows the top level, moves the canvas inside and reverts it (test: `crates/loom-app/src/levels/tests.rs`).
 
 Copies, library, and linking:
 
 - [ ] Pasting a sub-patch tile and editing inside the copy does not change the original (test).
 - [ ] Saving a sub-patch to the library writes a patch file that opens on its own and plays the same (test).
-- [ ] Collapsing a selection that includes the Transport leaves it outside, and its cables into the selection become input ports (test).
+- [x] Collapsing a selection that includes the Transport leaves it outside, and its cables into the selection become input ports (test: `crates/loom-patch/src/hierarchy/tests.rs`).
 - [ ] Inserting a patch file that has a Transport and a Scale and tuning module drops both, turns their cables into ports on the tile, and says so in the status bar; the patch still has one of each (test).
 - [ ] Two linked instances of one library file have separate definitions in the saved patch (test).
 - [ ] Editing inside one of them unlinks it and leaves the other unchanged and linked (test).
@@ -245,7 +264,7 @@ Engine:
 
 - [x] A patch with three levels of nesting renders bit-identical to the same patch built flat, at block sizes 1, 77, and 512 (test: `crates/loom-modules/tests/subpatches.rs`).
 - [x] A feedback loop that crosses a sub-patch boundary gets a unit delay, as a flat one does (test: `crates/loom-modules/tests/subpatches.rs`).
-- [ ] Editing inside a sub-patch keeps the state of the other inner modules (test: a running oscillator's phase continues).
+- [x] Editing inside a sub-patch keeps the state of the other inner modules (test: `crates/loom-modules/tests/subpatches.rs`, a module added inside while a note plays leaves the render unchanged).
 - [ ] No allocation on the audio thread during a slot swap or a select change (`no_alloc` test).
 
 Roles, slots, and modes:

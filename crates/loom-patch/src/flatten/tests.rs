@@ -735,7 +735,7 @@ fn ports_at_the_top_level_are_ordinary_modules() {
 /// order, depth first.
 #[test]
 fn the_nested_example_has_the_documented_id_table() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/dev/nested-subtractive.ron");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches/nested-subtractive.ron");
     let text = std::fs::read_to_string(path).unwrap();
     let (_, ids) = flatten(&text);
     let table: Vec<(String, u32)> = ids.paths().map(|(path, id)| (path.to_string(), id.0)).collect();
@@ -786,4 +786,38 @@ fn nesting_deeper_than_the_bound_is_refused() {
     assert_eq!(flat.modules[0].path.0.len(), MAX_DEPTH + 1);
     let error = refuse(&chain(MAX_DEPTH + 1)).to_string();
     assert!(error.ends_with("sub-patches nest more than 64 levels deep"), "{error}");
+}
+
+/// A file with no Transport whose top-level instance owns the next id: the
+/// Transport the loader adds takes its id from the table, above the
+/// instance's, never the instance's own.
+#[test]
+fn an_added_transport_never_takes_an_instances_id() {
+    let text = r#"Patch(
+        version: 1,
+        subpatches: {
+            "voice": SubPatch(
+                metadata: Metadata(name: "Voice"),
+                modules: [PatchModule(id: 1, kind: "loom.osc.sine@1")],
+            ),
+        },
+        modules: [
+            PatchModule(id: 1, kind: "loom.io.audio-out@1"),
+            PatchModule(id: 2, kind: "loom.struct.subpatch@1", subpatch: Some("voice")),
+        ],
+    )"#;
+    let patch = Patch::from_ron(text).unwrap();
+    let parts = create_engine(loom_modules::registry(), EngineConfig::default());
+    let mut controller = parts.controller;
+    let mut ids = FlatIds::new();
+    let notes = patch.load_with_ids(&mut controller, &mut ids).unwrap();
+    let transport = controller.transport_module().expect("a Transport was added");
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, LoadWarning::TransportAdded { module } if *module == transport.0))
+    );
+    assert_ne!(transport, ModuleId(2), "the instance keeps its id");
+    assert_eq!(ids.path_of(transport), Some(&ModulePath::top(transport.0)));
+    assert_eq!(ids.path_of(ModuleId(2)), Some(&ModulePath::top(2)));
 }
