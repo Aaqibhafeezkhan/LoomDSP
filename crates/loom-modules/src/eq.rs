@@ -8,6 +8,7 @@ use loom_core::{
     Channels, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, PortDefault, PortIo,
     PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_core::{FillsRole, roles};
 use loom_dsp::filter::eq::{BUTTERWORTH_Q, Coefficients, Cut, CutCoefficients, CutSide, CutSlope, Section, Shape};
 use loom_rt::Smoothed;
 
@@ -174,6 +175,7 @@ pub static EQ: ModuleDescriptor = ModuleDescriptor {
         ],
     ),
     displays: &[],
+    roles: &[FillsRole::of(&roles::EFFECT)],
 };
 
 /// The slope for a parameter value, or `None` for Off.

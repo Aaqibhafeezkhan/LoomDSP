@@ -226,10 +226,11 @@ impl App {
             alerts: alerts::Alerts::with_notes(status),
             // The app's tests load the test modules but never list them.
             modules: if args.test_modules {
-                registry(true).iter().collect()
+                registry(true).browsable().collect()
             } else {
-                loom_modules::registry().iter().collect()
+                loom_modules::registry().browsable().collect()
             },
+            library: Vec::new(),
             overlays: Default::default(),
             drops: Vec::new(),
             patches_open: 0,
@@ -266,6 +267,7 @@ impl App {
         // A stream that failed to start took the engine with it.
         self.keep_engine_idle();
         self.sync_audio_input();
+        self.refresh_library_items();
         self.send_panic_trigger();
         if let Some(error) = self.connect_midi(first_midi, connect_midi) {
             self.alerts.warn(error);
@@ -352,7 +354,8 @@ impl Loaded {
                 Err(error) => return Err(error.to_string()),
             };
             notes.extend(flat.apply_to(controller, &mut ids).map_err(|e| e.to_string())?);
-            hierarchy = Hierarchy::from_patch(&patch, controller.graph(), ids).map_err(|e| e.to_string())?;
+            hierarchy = Hierarchy::from_patch(&patch, controller.graph(), ids, controller.registry())
+                .map_err(|e| e.to_string())?;
             for (id, layout) in hierarchy.layouts(&patch) {
                 if controller.graph().node(id).is_some_and(|node| node.unknown.is_some()) {
                     original_unknown_positions.insert(id.0, layout.position);

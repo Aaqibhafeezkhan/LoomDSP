@@ -185,7 +185,7 @@ impl Group {
                     !loom_patch::library::is_patch_wide(&kind)
                 }),
                 Some(Tile::Instance(_)) => true,
-                Some(Tile::Port(..)) | None => false,
+                Some(Tile::Port(..) | Tile::Slot(_)) | None => false,
             })
             .collect();
         let selected = &selected;
@@ -482,6 +482,7 @@ impl Group {
                     id: instance.id,
                     kind: SUBPATCH_KIND.to_string(),
                     subpatch: Some(instance.key.clone()),
+                    slot: None,
                     label: instance.label.clone(),
                     params: instance.params.clone(),
                     position: instance.layout.position,

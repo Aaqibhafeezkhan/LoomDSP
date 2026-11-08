@@ -7,6 +7,7 @@ use loom_core::{
     Channels, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, PortDefault, PortIo,
     PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_core::{FillsRole, roles};
 use loom_dsp::oscillator::SlowWave;
 use loom_dsp::phase::Phasor;
 use loom_rt::Smoothed;
@@ -123,6 +124,7 @@ pub static LFO: ModuleDescriptor = ModuleDescriptor {
         ],
     ),
     displays: &[],
+    roles: &[FillsRole::of(&roles::MODULATOR)],
 };
 
 /// One cycle of the selected wave for the read-only tile preview.

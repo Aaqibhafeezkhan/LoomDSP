@@ -79,6 +79,7 @@ static FOLLOWER: crate::ModuleDescriptor = crate::ModuleDescriptor {
     role: ModuleRole::Dsp(|_| Box::new(Silent)),
     panel: crate::Panel::EMPTY,
     displays: &[],
+    roles: &[],
 };
 
 fn followers(count: u32) -> Graph {
@@ -204,6 +205,7 @@ fn mono_cable_into_stereo_input_reuses_its_buffer() {
         role: ModuleRole::Dsp(|_| Box::new(Silent)),
         panel: crate::Panel::EMPTY,
         displays: &[],
+        roles: &[],
     };
     let mut graph = followers(2);
     graph.nodes.get_mut(&ModuleId(2)).unwrap().descriptor = &STEREO_INPUT;
@@ -299,6 +301,7 @@ static LIT: crate::ModuleDescriptor = crate::ModuleDescriptor {
         kind: crate::DisplayKind::Level,
         range: crate::descriptor::DisplayRange::UNIT,
     }],
+    roles: &[],
     ..FOLLOWER
 };
 

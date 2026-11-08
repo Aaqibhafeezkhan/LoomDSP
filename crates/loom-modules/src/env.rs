@@ -7,6 +7,7 @@ use loom_core::{
     Channels, DisplayKind, DisplayRange, DisplaySpec, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel,
     ParamOptions, ParamSpec, PortDefault, PortIo, PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_core::{FillsRole, roles};
 use loom_dsp::envelope::{self, Settings, fall, power};
 
 /// `loom.env.envelope`: an envelope with an ADSR mode that follows a gate
@@ -127,6 +128,7 @@ pub static ENVELOPE: ModuleDescriptor = ModuleDescriptor {
         kind: DisplayKind::Level,
         range: DisplayRange::UNIT,
     }],
+    roles: &[FillsRole::of(&roles::ENVELOPE)],
 };
 
 /// The envelope's schematic result for the tile preview. Each timed stage

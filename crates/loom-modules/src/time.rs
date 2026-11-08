@@ -10,6 +10,7 @@ use loom_core::{
     Channels, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel, ParamOptions, ParamSpec, PortDefault, PortIo,
     PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_core::{FillsRole, roles};
 use loom_dsp::delay;
 use loom_rt::Smoothed;
 
@@ -65,6 +66,7 @@ pub static DELAY: ModuleDescriptor = ModuleDescriptor {
     role: ModuleRole::Dsp(|config| Box::new(Delay::new(config))),
     panel: Panel::new(3, 3, &[Widget::knob(0, 0, "time")]),
     displays: &[],
+    roles: &[FillsRole::of(&roles::EFFECT)],
 };
 
 /// `loom.time.allpass`: Schroeder delay-line all-pass filter (`MT-DELAY-03`).
@@ -132,6 +134,7 @@ pub static ALLPASS: ModuleDescriptor = ModuleDescriptor {
     role: ModuleRole::Dsp(|config| Box::new(Allpass::new(config))),
     panel: Panel::new(6, 3, &[Widget::knob(0, 0, "time"), Widget::knob(3, 0, "gain")]),
     displays: &[],
+    roles: &[FillsRole::of(&roles::EFFECT)],
 };
 
 /// Runtime state for `loom.time.delay`.

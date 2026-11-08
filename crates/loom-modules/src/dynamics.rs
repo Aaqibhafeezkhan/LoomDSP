@@ -9,6 +9,7 @@ use loom_core::{
     Channels, DisplayKind, DisplayRange, DisplaySpec, Module, ModuleConfig, ModuleDescriptor, ModuleRole, Panel,
     ParamOptions, ParamSpec, PortDefault, PortIo, PortSpec, ProcessContext, SignalType, Widget,
 };
+use loom_core::{FillsRole, roles};
 use loom_dsp::dynamics::{Coefficients, Curve, Detection, Dynamics as Algorithm, Mode, Settings};
 use loom_dsp::loudness::LevelMatch;
 use loom_rt::Smoothed;
@@ -225,6 +226,7 @@ pub static DYNAMICS: ModuleDescriptor = ModuleDescriptor {
             unit: "dB",
         },
     }],
+    roles: &[FillsRole::of(&roles::EFFECT)],
 };
 
 /// The mode for a parameter value.

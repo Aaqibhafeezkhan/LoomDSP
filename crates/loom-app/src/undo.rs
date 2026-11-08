@@ -110,12 +110,19 @@ impl Snapshot {
             .filter(|id| graph.node(ModuleId(**id)).is_none())
             .map(|&id| (id, (positions.get(&id).copied(), sizes.get(&id).copied())))
             .collect();
+        // What exists only while a slot fades is no part of the patch
+        // (sub-patches.md, How a swap crossfades), so a step never adds or
+        // removes it; the hierarchy is kept without the fade.
+        let transient = hierarchy.transient_ids();
+        let mut without_fades = hierarchy.clone();
+        without_fades.carry_fading_from(&Hierarchy::flat());
         Self {
-            hierarchy: hierarchy.clone(),
+            hierarchy: without_fades,
             layouts,
             level: level.clone(),
             modules: graph
                 .nodes()
+                .filter(|(id, _)| !transient.contains(id))
                 .map(|(id, node)| {
                     (
                         id.0,
@@ -134,10 +141,27 @@ impl Snapshot {
                     )
                 })
                 .collect(),
-            cables: graph.cables().map(|(from, to)| (to, from)).collect(),
-            assignments: graph.assignments().map(|(id, a)| (id, *a)).collect(),
+            cables: graph
+                .cables()
+                .filter(|(from, to)| !transient.contains(&from.module) && !transient.contains(&to.module))
+                .map(|(from, to)| (to, from))
+                .collect(),
+            // One from a swap fade is recorded from the new part's output
+            // behind it, as the file writes it.
+            assignments: graph
+                .assignments()
+                .map(|(id, a)| {
+                    let mut a = *a;
+                    if let Some(source) = hierarchy.output_behind_fade(graph, a.source) {
+                        a.source = source;
+                    }
+                    (id, a)
+                })
+                .filter(|(_, a)| !transient.contains(&a.source.module) && !transient.contains(&a.target))
+                .collect(),
             midi: graph
                 .midi_mappings()
+                .filter(|(_, m)| !transient.contains(&m.target))
                 .map(|(_, m)| ((m.target.0, m.param), (m.control, m.options)))
                 .collect(),
         }
@@ -503,12 +527,17 @@ pub fn apply(
         &mut hierarchy,
         positions,
         &mut BTreeMap::new(),
+        &|_| loom_patch::Layout::default(),
     )
+    .map_err(LoomError::InvalidKind)
 }
 
 /// Applies a step: the hierarchy side first, then the graph, then where
-/// the instance and port tiles sit. The caller syncs the hierarchy and
-/// commits afterwards.
+/// the instance and port tiles sit. A slot whose part the step changes is
+/// swapped, with its crossfade, rather than having one part removed and
+/// the other added (sub-patches.md, Slots: undo of a swap fades too);
+/// `layout` gives tile layouts for a sub-patch part that is stored. The
+/// caller syncs the hierarchy and commits afterwards.
 pub fn apply_full(
     step: &Step,
     forward: bool,
@@ -516,6 +545,97 @@ pub fn apply_full(
     hierarchy: &mut Hierarchy,
     positions: &mut BTreeMap<u32, (f32, f32)>,
     sizes: &mut BTreeMap<u32, (u8, u8)>,
+    layout: &dyn Fn(u32) -> loom_patch::Layout,
+) -> Result<(), String> {
+    let swapped = apply_swaps(step, forward, controller, hierarchy, layout)?;
+    apply_rest(step, forward, controller, hierarchy, positions, sizes, &swapped).map_err(|e| e.to_string())
+}
+
+/// Swaps every slot whose part differs between the step's two sides, at
+/// the id the target side had, and returns the ids of both parts, which
+/// the rest of the step leaves alone.
+fn apply_swaps(
+    step: &Step,
+    forward: bool,
+    controller: &mut Controller,
+    hierarchy: &mut Hierarchy,
+    layout: &dyn Fn(u32) -> loom_patch::Layout,
+) -> Result<BTreeSet<u32>, String> {
+    let mut parts = BTreeSet::new();
+    let Some((before, after)) = &step.hierarchy else {
+        return Ok(parts);
+    };
+    let (from, to) = if forward { (before, after) } else { (after, before) };
+    // Every flat id at or under a part's path: a sub-patch part brings its
+    // inner modules.
+    let under = |side: &Hierarchy, path: &loom_patch::ModulePath| -> Vec<u32> {
+        side.ids()
+            .paths()
+            .filter(|(p, _)| p.starts_with(path))
+            .map(|(_, id)| id.0)
+            .collect()
+    };
+    for slot in to.slots_differing_from(from) {
+        let Some(target) = to.slot(slot) else { continue };
+        // A slot that appears or goes (Make slot, Dissolve slot) is a plain
+        // hierarchy change, not a swap.
+        let Some(source) = from.slot(slot) else { continue };
+        let level = to.level_of(slot);
+        if let Some(lid) = source.part {
+            parts.extend(under(from, &level.child(lid)));
+        }
+        let Some(lid) = target.part else {
+            // The slot empties: the leaving part goes with the rest of the
+            // step, as a plain removal.
+            continue;
+        };
+        let Some(id) = to.ids().get(&level.child(lid)) else {
+            continue;
+        };
+        parts.extend(under(to, &level.child(lid)));
+        let state = step
+            .modules
+            .get(&id.0)
+            .and_then(|pair| if forward { pair.1.as_ref() } else { pair.0.as_ref() });
+        match state {
+            Some(state) => {
+                hierarchy.swap_to_module_at(controller, layout, slot, &state.descriptor.kind(), Some(lid))?;
+                // Its values and ranges, as the step's side had them.
+                controller.set_label(id, state.label.clone());
+                for (index, range) in state.ranges.iter().enumerate() {
+                    if let Some(range) = *range {
+                        controller.set_range(id, index, range).map_err(|e| e.to_string())?;
+                    }
+                }
+                let changes: Vec<(usize, f32)> = state.params.iter().copied().enumerate().collect();
+                controller.set_params(id, &changes).map_err(|e| e.to_string())?;
+            }
+            None => {
+                // A sub-patch part: held whole in the live hierarchy, put
+                // back at the level id it had, so its inner modules take
+                // their old flat ids.
+                let key = to
+                    .key_at(&level.child(lid))
+                    .ok_or_else(|| "the step's part is neither a module nor a sub-patch".to_string())?
+                    .to_string();
+                hierarchy.swap_to_held_subpatch_at(controller, layout, slot, &key, Some(lid))?;
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// The step's graph side, with `swapped` (the parts of swapped slots)
+/// left alone, and the hierarchy restored to the step's side with the
+/// swaps' fades carried over.
+fn apply_rest(
+    step: &Step,
+    forward: bool,
+    controller: &mut Controller,
+    hierarchy: &mut Hierarchy,
+    positions: &mut BTreeMap<u32, (f32, f32)>,
+    sizes: &mut BTreeMap<u32, (u8, u8)>,
+    swapped: &BTreeSet<u32>,
 ) -> Result<(), LoomError> {
     fn sides<T>(pair: &Pair<T>, forward: bool) -> (&Option<T>, &Option<T>) {
         if forward {
@@ -524,9 +644,14 @@ pub fn apply_full(
             (&pair.1, &pair.0)
         }
     }
+    let touches_swapped = |assignment: &Assignment| {
+        swapped.contains(&assignment.source.module.0) || swapped.contains(&assignment.target.0)
+    };
 
     if let Some((before, after)) = &step.hierarchy {
-        hierarchy.restore(if forward { after } else { before });
+        let mut target = if forward { after.clone() } else { before.clone() };
+        target.carry_fading_from(hierarchy);
+        hierarchy.restore(&target);
     }
     for (&id, pair) in &step.layouts {
         let (_, want) = sides(pair, forward);
@@ -550,24 +675,39 @@ pub fn apply_full(
 
     // Take away what must not exist afterwards, then add what must.
     for (&(module, param), pair) in &step.midi {
+        if swapped.contains(&module) {
+            continue;
+        }
         let (have, want) = sides(pair, forward);
         if have.is_some() && have != want {
             controller.unmap_midi(ModuleId(module), param)?;
         }
     }
     for (&id, pair) in &step.assignments {
+        if pair.0.as_ref().is_some_and(touches_swapped) || pair.1.as_ref().is_some_and(touches_swapped) {
+            continue;
+        }
         let (have, want) = sides(pair, forward);
         if have.is_some() && have != want {
             controller.remove_assignment(id)?;
         }
     }
     for (&input, pair) in &step.cables {
+        if swapped.contains(&input.module.0)
+            || pair.0.is_some_and(|o| swapped.contains(&o.module.0))
+            || pair.1.is_some_and(|o| swapped.contains(&o.module.0))
+        {
+            continue;
+        }
         let (have, want) = sides(pair, forward);
         if have.is_some() && have != want {
             controller.disconnect(input)?;
         }
     }
     for (&id, pair) in &step.modules {
+        if swapped.contains(&id) {
+            continue;
+        }
         if let (Some(_), None) = sides(pair, forward) {
             controller.remove_module(ModuleId(id))?;
             positions.remove(&id);
@@ -575,6 +715,9 @@ pub fn apply_full(
         }
     }
     for (&id, pair) in &step.modules {
+        if swapped.contains(&id) {
+            continue;
+        }
         let (have, want) = sides(pair, forward);
         let Some(state) = want else { continue };
         if have.is_none() {
@@ -624,6 +767,12 @@ pub fn apply_full(
         };
     }
     for (&input, pair) in &step.cables {
+        if swapped.contains(&input.module.0)
+            || pair.0.is_some_and(|o| swapped.contains(&o.module.0))
+            || pair.1.is_some_and(|o| swapped.contains(&o.module.0))
+        {
+            continue;
+        }
         let (have, want) = sides(pair, forward);
         if let Some(output) = want
             && have != want
@@ -633,6 +782,19 @@ pub fn apply_full(
     }
     for (&id, pair) in &step.assignments {
         let (have, want) = sides(pair, forward);
+        let on_swapped = pair.0.as_ref().is_some_and(touches_swapped) || pair.1.as_ref().is_some_and(touches_swapped);
+        if on_swapped {
+            // The swap moved what it could by role name, keeping the id;
+            // what it removed, because only the leaving part had the
+            // parameter, comes back here with the part (sub-patches.md,
+            // Slots: undo brings it back).
+            if let Some(assignment) = want
+                && controller.graph().assignment(id).is_none()
+            {
+                controller.restore_assignment(id, *assignment)?;
+            }
+            continue;
+        }
         if let Some(assignment) = want
             && have != want
         {
@@ -641,6 +803,14 @@ pub fn apply_full(
     }
     for (&(module, param), pair) in &step.midi {
         let (have, want) = sides(pair, forward);
+        if swapped.contains(&module) {
+            if let Some((control, options)) = want
+                && controller.graph().midi_mapping_of(ModuleId(module), param).is_none()
+            {
+                controller.map_midi_with(*control, ModuleId(module), param, *options)?;
+            }
+            continue;
+        }
         if let Some((control, options)) = want
             && have != want
         {
