@@ -3,8 +3,8 @@
 use crate::clip::ClipHolds;
 use iced::{Color, Point};
 use loom_canvas::{
-    CableView, ControlPart, HoverText, ModulationView, ModuleView, PanelValues, PanelView, PartText, PartValue,
-    PortShape, PortView, Scene, TransportSignal, WidgetValue, WidgetView, WidgetViewKind,
+    CableView, HoverText, ModulationView, ModuleView, PanelValues, PanelView, PartText, PartValue, PortShape, PortView,
+    Scene, TransportSignal, WidgetValue, WidgetView, WidgetViewKind,
 };
 use loom_core::ModuleNames;
 use loom_core::{
@@ -205,6 +205,7 @@ fn panel_view(d: &ModuleDescriptor) -> PanelView {
                 },
                 hover,
                 hidden: false,
+                exposed: false,
             }
         })
         .collect();
@@ -388,14 +389,20 @@ pub fn control_value(kind: WidgetKind, spec: &ParamSpec, position: f32) -> f32 {
 /// modulation marks for controls, and `shown` (position and peak, by module
 /// and widget) for lights and meters. Values that did not change keep the generation, so the
 /// canvas uploads nothing new.
-pub fn update_panel_values(values: &mut PanelValues, controller: &Controller, shown: &ShownValues) {
-    update_panel_values_dragging(values, controller, shown, &ClipHolds::default(), None);
+pub fn update_panel_values(
+    values: &mut PanelValues,
+    controller: &Controller,
+    hierarchy: &Hierarchy,
+    shown: &ShownValues,
+) {
+    update_panel_values_dragging(values, controller, hierarchy, shown, &ClipHolds::default(), None);
 }
 
 /// Updates only the live dots, for the refresh on every frame: the knobs
-/// bound to a parameter with an enabled assignment. Values that did not
+/// bound to a parameter with an enabled assignment, on module tiles and on
+/// the sub-patch surfaces that expose the parameter. Values that did not
 /// change leave the panel generation alone, so the canvas rebuilds nothing.
-pub fn update_live_values(values: &mut PanelValues, controller: &Controller) {
+pub fn update_live_values(values: &mut PanelValues, controller: &Controller, hierarchy: &Hierarchy) {
     let graph = controller.graph();
     let mut done = BTreeSet::new();
     for (_, a) in graph.assignments().filter(|(_, a)| a.enabled) {
@@ -407,6 +414,7 @@ pub fn update_live_values(values: &mut PanelValues, controller: &Controller) {
         };
         let name = d.params[a.param].name;
         let live = controller.modulated(a.target, a.param);
+        crate::surface::surface_live_values(values, hierarchy, (a.target, name), live);
         for (index, w) in d.panel.widgets.iter().enumerate() {
             if !w.kind.has_range() || !w.binds(name) {
                 continue;
@@ -458,6 +466,7 @@ pub fn set_ghosts(values: &mut PanelValues, controller: &Controller, ghosts: &BT
 pub fn update_panel_values_dragging(
     values: &mut PanelValues,
     controller: &Controller,
+    hierarchy: &Hierarchy,
     shown: &ShownValues,
     holds: &ClipHolds,
     dragging: Option<loom_core::AssignmentId>,
@@ -567,6 +576,7 @@ pub fn update_panel_values_dragging(
             values.set(id.0, index, value);
         }
     }
+    crate::surface::surface_values(values, controller, hierarchy, &reaches, dragged.as_ref());
 }
 
 /// A control's value as text. A widget that binds two says both, as a screen
@@ -881,41 +891,6 @@ pub fn scope_outputs(controller: &Controller, modules: &[u32]) -> Vec<ScopeOutpu
     scopes
 }
 
-/// The parameter a control is bound to, limited to its selected range, if
-/// the module and widget exist.
-///
-/// A button in momentary mode is bound to its hold, and otherwise to its
-/// latch (clock.md, Button details).
-pub fn control_param(controller: &Controller, module: u32, widget: usize) -> Option<(usize, WidgetKind, ParamSpec)> {
-    let node = controller.graph().node(ModuleId(module))?;
-    let d = node.descriptor;
-    let w = d.panel.widgets.get(widget)?;
-    let index = d.control_param(w, &node.params)?;
-    // The control spans the selected range (control-ranges.md, rule 4).
-    Some((index, w.kind, node.spec(index)?))
-}
-
-/// As [`control_param`], for one value of a control. [`ControlPart::Main`] is
-/// the control's parameter, and [`ControlPart::Second`] the second parameter
-/// of an XY pad or a range. [`ControlPart::Both`] names no one parameter.
-pub fn control_part(
-    controller: &Controller,
-    module: u32,
-    widget: usize,
-    part: ControlPart,
-) -> Option<(usize, WidgetKind, ParamSpec)> {
-    match part {
-        ControlPart::Main => control_param(controller, module, widget),
-        ControlPart::Both => None,
-        ControlPart::Second => {
-            let node = controller.graph().node(ModuleId(module))?;
-            let w = node.descriptor.panel.widgets.get(widget)?;
-            let index = node.descriptor.param_index(w.second()?)?;
-            Some((index, w.kind, node.spec(index)?))
-        }
-    }
-}
-
 /// Builds the scene of a flat patch at its top level, for tests.
 #[cfg(test)]
 pub fn build_flat(
@@ -1020,6 +995,7 @@ pub fn build(
                 hover: loom_canvas::HoverText {
                     description: format!("{}. {}", d.family.label(), d.description),
                     name: Some(d.id.to_string()),
+                    note: None,
                 },
                 position: positions.get(&id.0).map_or(Point::ORIGIN, |&(x, y)| Point::new(x, y)),
                 inputs,
@@ -1031,7 +1007,19 @@ pub fn build(
                         widgets: Vec::new(),
                     }
                 } else {
-                    panel_for(d, &node.params)
+                    let mut panel = panel_for(d, &node.params);
+                    // A control exposed on the sub-patch's surface gets its
+                    // mark and says so in its hover text (sub-patches.md,
+                    // Exposing).
+                    for (w, view) in d.panel.widgets.iter().zip(panel.widgets.iter_mut()) {
+                        if w.is_control()
+                            && let Some((_, surface_name)) = hierarchy.exposure_of(id, w.bind())
+                        {
+                            view.exposed = true;
+                            view.hover.note = Some(format!("Exposed as {surface_name}"));
+                        }
+                    }
+                    panel
                 },
             }
         })
@@ -1080,6 +1068,7 @@ pub fn build(
                     hover: HoverText {
                         description: format!("Sub-patch. {name} is a patch inside this one. Double-click to open it."),
                         name: Some(loom_patch::SUBPATCH_KIND.to_string()),
+                        note: None,
                     },
                     accent: structure,
                     position: place(id),
@@ -1097,11 +1086,7 @@ pub fn build(
                             tile_port(port, signal_from(&(lid, port.clone())), "An output of the sub-patch.")
                         })
                         .collect(),
-                    panel: PanelView {
-                        width: 10,
-                        height: 2,
-                        widgets: Vec::new(),
-                    },
+                    panel: crate::surface::surface_panel(graph, hierarchy, id),
                 }
             }
             Tile::Port(direction, name) => {
@@ -1129,6 +1114,7 @@ pub fn build(
                             |d| format!("{}. {}", d.family.label(), d.description),
                         ),
                         name: Some(direction.kind().to_string()),
+                        note: None,
                     },
                     accent: d.map_or(structure, |d| family_colour(d.family)),
                     position: place(id),
@@ -1229,20 +1215,30 @@ pub fn build(
         })
         .collect();
 
-    // One line per assignment between two modules of the level, to the
-    // control bound to its parameter. A line that crosses a boundary
-    // waits for the surface panel (sub-patches.md, Editor model).
+    // One line per assignment from a module of the level: to the control
+    // bound to its parameter on a module of the level, or to the surface
+    // control of the sub-patch tile that exposes an inner parameter
+    // (sub-patches.md, Editor model).
     let modulations = graph
         .assignments()
-        .filter(|(_, a)| on_level(a.source.module) && on_level(a.target))
+        .filter(|(_, a)| on_level(a.source.module))
         .filter_map(|(id, a)| {
             let d = graph.node(a.target)?.descriptor;
             let name = d.params.get(a.param)?.name;
+            let (to, widget) = if on_level(a.target) {
+                (
+                    a.target.0,
+                    d.panel.widgets.iter().position(|w| w.is_control() && w.binds(name)),
+                )
+            } else {
+                let (tile, index) = hierarchy.surface_for(level, &(a.target, name.to_string()))?;
+                (tile.0, Some(index))
+            };
             Some(ModulationView {
                 id: id.0,
                 from: (a.source.module.0, a.source.port),
-                to: a.target.0,
-                widget: d.panel.widgets.iter().position(|w| w.is_control() && w.binds(name)),
+                to,
+                widget,
                 enabled: a.enabled,
             })
         })

@@ -814,3 +814,677 @@ fn a_direct_cable_replaces_a_record_from_an_unfed_port() {
         app.session.controller.graph().cables().count()
     );
 }
+
+/// The nested example open in the harness, with the filter's flat id and
+/// its cutoff index: the one parameter the Voice tile's surface shows.
+fn nested_example_ui() -> (Ui, ModuleId, usize) {
+    use loom_core::ModuleNames;
+    let ui = Ui::open("nested-subtractive.ron");
+    let graph = ui.app.session.controller.graph();
+    let (svf, node) = graph
+        .nodes()
+        .find(|(_, n)| n.descriptor.id == "loom.filter.svf")
+        .expect("the filter two levels down");
+    let cutoff = node.parameter_index("cutoff").unwrap();
+    (ui, svf, cutoff)
+}
+
+/// The filter's live cutoff.
+fn cutoff_of(ui: &Ui, svf: ModuleId, cutoff: usize) -> f32 {
+    ui.app.session.controller.graph().node(svf).unwrap().params[cutoff]
+}
+
+/// Turning the Voice tile's surface control moves the filter's cutoff two
+/// levels down, as one undo step, and the surface and inner controls show
+/// one value. Inside, turning the filter's own knob moves the surface
+/// control, and one undo step reverts that too (panels.md, Exposed
+/// controls, acceptance criteria).
+#[test]
+fn surface_and_inner_controls_move_together_and_undo_as_one() {
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    assert_eq!(cutoff_of(&ui, svf, cutoff), 300.0);
+    let steps_before = ui.app.session.edits.history.len();
+
+    // Outside: the Voice tile (id 2) shows "cutoff" as its one control.
+    let knob = ui.control(2, "cutoff");
+    ui.drag(knob, Point::new(knob.x, knob.y - 40.0), 8);
+    let turned = cutoff_of(&ui, svf, cutoff);
+    assert!(turned > 300.0, "the surface knob moved the inner cutoff: {turned}");
+    assert_eq!(
+        ui.app.session.edits.history.len(),
+        steps_before + 1,
+        "one step for the drag"
+    );
+    let surface = ui.app.session.values.get(2, 0).unwrap().clone();
+    ui.app.undo();
+    assert_eq!(
+        cutoff_of(&ui, svf, cutoff),
+        300.0,
+        "one undo step reverts the surface drag"
+    );
+    ui.app.redo();
+    assert_eq!(cutoff_of(&ui, svf, cutoff), turned);
+
+    // Inside the Filter: the knob itself shows the same value and moves it.
+    let filter = ModulePath::top(2).child(5);
+    ui.app.show_level(&filter);
+    ui.redraw();
+    let inner_widget = crate::surface::find_control(
+        ui.app.session.controller.graph(),
+        &ui.app.session.hierarchy,
+        svf.0,
+        "cutoff",
+    )
+    .unwrap();
+    assert_eq!(
+        ui.app.session.values.get(svf.0, inner_widget).unwrap().text,
+        surface.text,
+        "both controls say the same value"
+    );
+    let inner = ui.control(svf.0, "cutoff");
+    ui.drag(inner, Point::new(inner.x, inner.y - 40.0), 8);
+    let turned_inside = cutoff_of(&ui, svf, cutoff);
+    assert!(turned_inside > turned);
+    ui.app.show_level(&ModulePath::root());
+    ui.redraw();
+    assert_eq!(
+        ui.app.session.values.get(2, 0).unwrap().text,
+        crate::param::format(
+            &ui.app
+                .control_target(2, 0, loom_canvas::ControlPart::Main)
+                .unwrap()
+                .spec,
+            turned_inside
+        ),
+        "the surface follows the inner knob"
+    );
+    ui.app.undo();
+    assert_eq!(
+        cutoff_of(&ui, svf, cutoff),
+        turned,
+        "one undo step reverts the inner drag"
+    );
+}
+
+/// The nested example with the Filter's exposed cutoff range narrowed to
+/// 200 to 2000 Hz, inside the SVF's own 20 to 20000 Hz.
+fn narrowed_nested() -> App {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches");
+    let text = std::fs::read_to_string(root.join("nested-subtractive.ron")).unwrap();
+    app_with(&text.replace("range: Some((20.0, 20000.0))", "range: Some((200.0, 2000.0))"))
+}
+
+/// A range from the file narrows the surface control and clamps every
+/// write to the parameter: typed on the surface or on the inner knob,
+/// dragged inside, set from an inspector row, or reset. The file then
+/// saves what was heard (sub-patches.md, Exposing).
+#[test]
+fn an_exposed_range_clamps_writes_from_both_sides() {
+    use loom_core::ModuleNames;
+    let mut ui = Ui::with_app(narrowed_nested());
+    let graph = ui.app.session.controller.graph();
+    let (svf, node) = graph
+        .nodes()
+        .find(|(_, n)| n.descriptor.id == "loom.filter.svf")
+        .unwrap();
+    let cutoff = node.parameter_index("cutoff").unwrap();
+    let default = node.descriptor.params[cutoff].default;
+    let target = ui.app.control_target(2, 0, loom_canvas::ControlPart::Main).unwrap();
+    assert_eq!(
+        (target.spec.min, target.spec.max),
+        (200.0, 2000.0),
+        "the surface spans the range"
+    );
+    let inner_widget = crate::surface::find_control(
+        ui.app.session.controller.graph(),
+        &ui.app.session.hierarchy,
+        svf.0,
+        "cutoff",
+    )
+    .unwrap();
+
+    // Typed on the surface, past the range.
+    ui.send(Message::Canvas(loom_canvas::CanvasEvent::TypedValue {
+        module: 2,
+        widget: 0,
+        text: "30000".to_string(),
+    }));
+    assert_eq!(cutoff_of(&ui, svf, cutoff), 2000.0);
+    // Typed on the inner knob, below it.
+    ui.send(Message::Canvas(loom_canvas::CanvasEvent::TypedValue {
+        module: svf.0,
+        widget: inner_widget,
+        text: "5".to_string(),
+    }));
+    assert_eq!(cutoff_of(&ui, svf, cutoff), 200.0);
+    assert_eq!(
+        ui.app
+            .session
+            .controller
+            .graph()
+            .node(svf)
+            .unwrap()
+            .spec(cutoff)
+            .map(|s| (s.min, s.max)),
+        Some((20.0, 20000.0)),
+        "the inner control range is not widened for a clamped value"
+    );
+    // Dragged inside, far past the top.
+    let filter = ModulePath::top(2).child(5);
+    ui.app.show_level(&filter);
+    ui.redraw();
+    let inner = ui.control(svf.0, "cutoff");
+    ui.drag(inner, Point::new(inner.x, inner.y - 400.0), 20);
+    let dragged = cutoff_of(&ui, svf, cutoff);
+    assert!(dragged > 200.0 && dragged <= 2000.0, "{dragged}");
+    // Set from the inspector row.
+    let _ = ui.app.inspector_message(crate::inspector::Message::ParamValue {
+        module: svf.0,
+        index: cutoff,
+        value: 10000.0,
+    });
+    assert_eq!(cutoff_of(&ui, svf, cutoff), 2000.0);
+    // Reset on the surface: the default, kept inside the range.
+    ui.app.show_level(&ModulePath::root());
+    ui.redraw();
+    ui.send(Message::Canvas(loom_canvas::CanvasEvent::ResetControl {
+        module: 2,
+        widget: 0,
+        part: loom_canvas::ControlPart::Main,
+    }));
+    assert_eq!(cutoff_of(&ui, svf, cutoff), default.clamp(200.0, 2000.0));
+    // The file saves what plays.
+    let saved = ui.app.current_patch();
+    let instance = saved.modules.iter().find(|m| m.id == 2).unwrap();
+    assert_eq!(instance.params.get("cutoff"), Some(&cutoff_of(&ui, svf, cutoff)));
+}
+
+/// A sub-patch holding a Mixer, whose levels are faders inside.
+const MIXED: &str = r#"Patch(
+    version: 1,
+    metadata: Metadata(name: "Mixed"),
+    subpatches: {
+        "mix": SubPatch(
+            metadata: Metadata(name: "Mix"),
+            modules: [
+                PatchModule(id: 1, kind: "loom.mix.mixer@1", position: Some((0.0, 0.0))),
+                PatchModule(id: 2, kind: "loom.struct.output@1", label: Some("out"), position: Some((400.0, 0.0))),
+            ],
+            cables: [PatchCable(from: (1, "out"), to: (2, "in"))],
+        ),
+    },
+    modules: [
+        PatchModule(id: 1, kind: "loom.struct.subpatch@1", subpatch: Some("mix"), position: Some((200.0, 0.0))),
+        PatchModule(id: 2, kind: "loom.io.audio-out@1", position: Some((500.0, 0.0))),
+        PatchModule(id: 3, kind: "loom.clock.transport@1", position: Some((0.0, 300.0))),
+    ],
+    cables: [PatchCable(from: (1, "out"), to: (2, "in"))],
+)"#;
+
+/// Inside the Mix sub-patch, the Mixer's first level row offers Expose;
+/// pressing it puts a fader, the widget the level has inside, on the Mix
+/// tile's surface, named by the parameter's label, as one undo step
+/// (panels.md, Exposed controls, acceptance criteria).
+#[test]
+fn exposing_a_fader_puts_a_fader_on_the_surface() {
+    let mut ui = Ui::with_app(app_with(MIXED));
+    let inside = ModulePath::top(1);
+    let mixer = ui.app.session.hierarchy.id_at(&inside, 1).unwrap();
+    ui.app.show_level(&inside);
+    ui.app.session.selection = [mixer.0].into_iter().collect();
+    ui.redraw();
+    // The first row is the first level, and its button is the first Expose.
+    ui.click_text("Expose on Mix");
+    assert_eq!(ui.app.ui_snapshot().status, "Level 1 is exposed on Mix");
+    assert_eq!(ui.app.ui_snapshot().undo.as_deref(), Some("expose Level 1"));
+    let definition = ui.app.session.hierarchy.definition_of(ModuleId(1)).unwrap();
+    assert_eq!(definition.exposed.len(), 1);
+    assert_eq!(definition.exposed[0].name, "Level 1");
+    // The inner fader now carries the mark and the row offers Unexpose.
+    let level1 = crate::surface::find_control(
+        ui.app.session.controller.graph(),
+        &ui.app.session.hierarchy,
+        mixer.0,
+        "level1",
+    )
+    .unwrap();
+    let snapshot = ui.app.ui_snapshot();
+    let tile = snapshot.tiles.iter().find(|t| t.id == mixer.0).unwrap();
+    assert!(tile.widgets[level1].exposed);
+    assert!(ui.text("Unexpose on Mix").is_some());
+
+    ui.app.show_level(&ModulePath::root());
+    ui.redraw();
+    let snapshot = ui.app.ui_snapshot();
+    let mix = snapshot.tiles.iter().find(|t| t.id == 1).expect("the Mix tile");
+    assert_eq!(mix.widgets.len(), 1);
+    assert_eq!(
+        (mix.widgets[0].kind, mix.widgets[0].label.as_str()),
+        ("fader", "Level 1")
+    );
+
+    ui.app.undo();
+    assert_eq!(
+        ui.app.session.level, inside,
+        "undo shows the level the step was made on"
+    );
+    assert!(
+        ui.app
+            .session
+            .hierarchy
+            .definition_of(ModuleId(1))
+            .unwrap()
+            .exposed
+            .is_empty()
+    );
+    ui.app.show_level(&ModulePath::root());
+    ui.redraw();
+    let snapshot = ui.app.ui_snapshot();
+    let mix = snapshot.tiles.iter().find(|t| t.id == 1).unwrap();
+    assert!(mix.widgets.is_empty(), "undo takes the fader off the surface");
+    ui.app.redo();
+    assert_eq!(
+        ui.app
+            .session
+            .hierarchy
+            .definition_of(ModuleId(1))
+            .unwrap()
+            .exposed
+            .len(),
+        1
+    );
+}
+
+/// A modulation from the top level reaches the filter's cutoff two levels
+/// down through the Voice tile's surface; one onto a parameter no tile
+/// exposes, or from a port tile, is still refused, and so is a matrix
+/// retarget onto one (sub-patches.md, Editor model).
+#[test]
+fn a_modulation_reaches_inside_only_through_a_surface() {
+    use loom_core::ModuleNames;
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    let app = &mut ui.app;
+    let note_pitch = loom_core::OutputRef {
+        module: ModuleId(1),
+        port: 0,
+    };
+    let resonance = app
+        .session
+        .controller
+        .graph()
+        .node(svf)
+        .unwrap()
+        .parameter_index("resonance")
+        .unwrap();
+    app.assign(note_pitch, svf, resonance);
+    assert_eq!(app.ui_snapshot().status, super::NO_MODULATION_ACROSS);
+    assert_eq!(app.session.controller.graph().assignments().count(), 0);
+
+    app.assign(note_pitch, svf, cutoff);
+    assert_eq!(
+        app.session.controller.graph().assignments().count(),
+        1,
+        "through the exposed cutoff"
+    );
+    assert!(
+        app.ui_snapshot().status.contains("modulates"),
+        "{}",
+        app.ui_snapshot().status
+    );
+    let id = app.session.controller.graph().assignments().next().unwrap().0;
+    // The line ends at the Voice tile's surface control.
+    let lines = app.session.scene.modulations();
+    assert_eq!((lines[0].to, lines[0].widget), (2, Some(0)));
+    // The file writes it through the exposed name.
+    let saved = app.current_patch();
+    assert_eq!(saved.modulation.len(), 1);
+    assert_eq!(saved.modulation[0].target, (2, "cutoff".to_string()));
+
+    // A retarget onto the resonance is refused and changes nothing.
+    app.matrix_retarget(id, None, Some((svf, resonance)));
+    assert_eq!(app.ui_snapshot().status, super::NO_MODULATION_ACROSS);
+    assert_eq!(app.session.controller.graph().assignment(id).unwrap().param, cutoff);
+
+    // A port tile is never a source.
+    let voice = ModulePath::top(2);
+    let port = app.session.hierarchy.id_at(&voice, 1).unwrap();
+    app.assign(loom_core::OutputRef { module: port, port: 0 }, svf, cutoff);
+    assert_eq!(app.session.controller.graph().assignments().count(), 1);
+}
+
+/// Unexpose on the Voice tile's row takes the cutoff off its surface and
+/// removes the assignment from the top level in the same step; the Filter's
+/// own exposure stays. Undo brings both the exposure and the assignment
+/// back.
+#[test]
+fn unexposing_removes_the_assignment_from_outside_in_one_step() {
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    let app = &mut ui.app;
+    let note_pitch = loom_core::OutputRef {
+        module: ModuleId(1),
+        port: 0,
+    };
+    app.assign(note_pitch, svf, cutoff);
+    assert_eq!(app.session.controller.graph().assignments().count(), 1);
+    let steps = app.session.edits.history.len();
+
+    app.unexpose(2, 0);
+    assert_eq!(app.ui_snapshot().undo.as_deref(), Some("unexpose cutoff"));
+    assert_eq!(app.session.edits.history.len(), steps + 1);
+    assert!(
+        app.session
+            .hierarchy
+            .definition_of(ModuleId(2))
+            .unwrap()
+            .exposed
+            .is_empty()
+    );
+    let filter = app.session.hierarchy.id_at(&ModulePath::top(2), 5).unwrap();
+    assert_eq!(app.session.hierarchy.definition_of(filter).unwrap().exposed.len(), 1);
+    assert_eq!(
+        app.session.controller.graph().assignments().count(),
+        0,
+        "the outer assignment went with it"
+    );
+    assert!(
+        app.ui_snapshot()
+            .tiles
+            .iter()
+            .find(|t| t.id == 2)
+            .unwrap()
+            .widgets
+            .is_empty()
+    );
+
+    app.undo();
+    assert_eq!(
+        app.session.hierarchy.definition_of(ModuleId(2)).unwrap().exposed.len(),
+        1
+    );
+    assert_eq!(app.session.controller.graph().assignments().count(), 1);
+}
+
+/// MIDI learn on the Voice tile's surface control arms the filter's cutoff
+/// inside; the mapping lands on the inner parameter, is written inside the
+/// Filter's definition, and covers the exposed range, so hardware cannot
+/// leave it (sub-patches.md, Exposing).
+#[test]
+fn midi_learn_on_a_surface_control_maps_the_inner_parameter_within_its_range() {
+    use loom_core::ModuleNames;
+    let mut app = narrowed_nested();
+    let graph = app.session.controller.graph();
+    let (svf, node) = graph
+        .nodes()
+        .find(|(_, n)| n.descriptor.id == "loom.filter.svf")
+        .unwrap();
+    let cutoff = node.parameter_index("cutoff").unwrap();
+    let spec = node.spec(cutoff).unwrap();
+
+    app.learn_message(crate::learn::Message::Toggle);
+    app.canvas_event(loom_canvas::CanvasEvent::Learn { module: 2, widget: 0 });
+    assert_eq!(app.session.learn.armed().map(|a| a.param), Some((svf.0, cutoff)));
+    let view = crate::learn::view(
+        &app.session.controller,
+        &app.session.hierarchy,
+        &app.session.level,
+        app.session.learn.armed(),
+    );
+    assert_eq!(view.armed, Some((2, 0)), "the surface control shows as armed");
+
+    let midi = app.rig.midi_in.clone().expect("the idle engine's MIDI input");
+    assert!(loom_host_desktop::send_midi(
+        &midi,
+        loom_core::MidiEvent::from_bytes(0, &[0xB0, 74, 64])
+    ));
+    app.process(128);
+    let _ = app.update(Message::Midi);
+    let (_, mapping) = app
+        .session
+        .controller
+        .graph()
+        .midi_mapping_of(svf, cutoff)
+        .expect("mapped inside");
+    assert_eq!(mapping.control.controller, 74);
+    assert_eq!(mapping.options.low, spec.normalize(200.0));
+    assert_eq!(mapping.options.high, spec.normalize(2000.0));
+    let view = crate::learn::view(
+        &app.session.controller,
+        &app.session.hierarchy,
+        &app.session.level,
+        None,
+    );
+    assert_eq!(view.labels.get(&(2, 0)).map(String::as_str), Some("CC 74"));
+    let saved = app.current_patch();
+    assert!(saved.midi.is_empty() && saved.subpatches["voice"].midi.is_empty());
+    assert_eq!(saved.subpatches["filter"].midi[0].target, (3, "cutoff".to_string()));
+}
+
+/// The name typed in the sub-patch's inspector renames it as one undo
+/// step: the tile and the breadcrumb follow, and the key stays.
+#[test]
+fn renaming_a_sub_patch_in_the_inspector() {
+    let mut app = nested_app();
+    app.session.selection = [2].into_iter().collect();
+    let _ = app.inspector_message(crate::inspector::Message::SubPatchNameDraft {
+        module: 2,
+        value: "Lead".to_string(),
+    });
+    match app.inspector_model() {
+        Inspector::SubPatch(rows) => assert_eq!(rows.name, "Lead", "the draft shows while typing"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(app.session.hierarchy.tile_name(ModuleId(2)), Some("Voice".to_string()));
+    let _ = app.inspector_message(crate::inspector::Message::SubPatchNameApply { module: 2 });
+    assert_eq!(app.ui_snapshot().undo.as_deref(), Some("rename sub-patch"));
+    assert!(titles(&app).iter().any(|t| t == "Lead"));
+    assert_eq!(app.session.hierarchy.path_names(&voice()), ["Lead"]);
+    assert!(app.current_patch().subpatches.contains_key("voice"), "the key stays");
+    app.undo();
+    assert!(titles(&app).iter().any(|t| t == "Voice"));
+}
+
+/// The sub-patch tile's inspector lists its exposed parameters as rows of
+/// the inner parameter, named by the surface name, each with Unexpose on
+/// that tile; inside, an exposed parameter's row offers Unexpose on the
+/// enclosing sub-patch and hides its Range selector, and the others offer
+/// Expose on it. At the top level there is nothing to expose onto.
+#[test]
+fn the_inspector_offers_expose_and_shows_surface_rows() {
+    use loom_core::ModuleNames;
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    let app = &mut ui.app;
+    let filter_tile = app.session.hierarchy.id_at(&ModulePath::top(2), 5).unwrap();
+    let parts = |e: &crate::inspector::ExposureRow| (e.module, e.index, e.name.clone(), e.surface.clone());
+    app.session.selection = [2].into_iter().collect();
+    match app.inspector_model() {
+        Inspector::SubPatch(rows) => {
+            assert_eq!(rows.params.len(), 1);
+            assert_eq!(rows.params[0].label, "cutoff");
+            assert_eq!((rows.params[0].module, rows.params[0].row.index), (svf.0, cutoff));
+            assert_eq!(
+                rows.params[0].row.exposure, None,
+                "the top level has nothing to expose onto"
+            );
+            assert_eq!(rows.params[0].row.range, None);
+            assert_eq!(
+                parts(&rows.params[0].own),
+                (2, 0, Some("cutoff".to_string()), "Voice".to_string()),
+                "the tile's own surface offers Unexpose"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    app.session.selection = [1].into_iter().collect();
+    match app.inspector_model() {
+        Inspector::Module(rows) => assert!(rows.params.iter().all(|p| p.exposure.is_none())),
+        other => panic!("{other:?}"),
+    }
+    let filter = ModulePath::top(2).child(5);
+    app.show_level(&filter);
+    app.session.selection = [svf.0].into_iter().collect();
+    let resonance = app
+        .session
+        .controller
+        .graph()
+        .node(svf)
+        .unwrap()
+        .parameter_index("resonance")
+        .unwrap();
+    match app.inspector_model() {
+        Inspector::Module(rows) => {
+            let row = |index: usize| rows.params.iter().find(|p| p.index == index).unwrap().clone();
+            assert_eq!(
+                parts(&row(cutoff).exposure.unwrap()),
+                (filter_tile.0, 0, Some("cutoff".to_string()), "Filter".to_string()),
+                "Unexpose names the Filter's surface item"
+            );
+            assert_eq!(
+                row(cutoff).range,
+                None,
+                "the surface's range stands in for the selector"
+            );
+            assert_eq!(
+                parts(&row(resonance).exposure.unwrap()),
+                (svf.0, resonance, None, "Filter".to_string())
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Inside the Voice, the Filter tile's surface row is exposed on the
+    // Voice too, and can be taken off either surface.
+    app.show_level(&ModulePath::top(2));
+    app.session.selection = [filter_tile.0].into_iter().collect();
+    match app.inspector_model() {
+        Inspector::SubPatch(rows) => {
+            assert_eq!(
+                parts(&rows.params[0].row.exposure.clone().unwrap()),
+                (2, 0, Some("cutoff".to_string()), "Voice".to_string()),
+                "Unexpose on Voice names the Voice's surface item"
+            );
+            assert_eq!(
+                parts(&rows.params[0].own),
+                (filter_tile.0, 0, Some("cutoff".to_string()), "Filter".to_string())
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `--select` takes a sub-patch tile, so `--dump-ui --select 2` on the
+/// nested example shows the Voice tile's inspector; an id no tile has is
+/// still refused.
+#[test]
+fn select_takes_a_sub_patch_tile() {
+    let mut args = crate::tests::app_args();
+    args.patch = Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/patches/nested-subtractive.ron"),
+    );
+    args.no_audio = true;
+    args.select = vec![2];
+    let app = crate::snapshot::headless(&args).unwrap();
+    assert!(matches!(app.inspector_model(), Inspector::SubPatch(_)));
+    args.select = vec![999];
+    assert_eq!(
+        crate::snapshot::headless(&args).err().as_deref(),
+        Some("no module 999 in the patch")
+    );
+}
+
+/// Adds an LFO inside the Voice and assigns it to the filter's cutoff
+/// through the Filter tile's surface. Returns the LFO's id.
+fn lfo_inside_voice(app: &mut App, svf: ModuleId, cutoff: usize) -> ModuleId {
+    app.show_level(&voice());
+    let lfo = app.modules.iter().copied().find(|d| d.id == "loom.mod.lfo").unwrap();
+    app.add_module(lfo, Point::new(100.0, 300.0));
+    let id = ModuleId(*app.session.selection.iter().next().expect("the new module is selected"));
+    app.assign(loom_core::OutputRef { module: id, port: 0 }, svf, cutoff);
+    id
+}
+
+/// Unexpose on the Voice's surface removes the top-level assignment that
+/// reached the cutoff through it, and keeps the one from an LFO inside the
+/// Voice, which still reaches the cutoff through the Filter's surface.
+#[test]
+fn unexposing_on_an_outer_surface_keeps_assignments_still_exposed_below() {
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    let app = &mut ui.app;
+    app.assign(
+        loom_core::OutputRef {
+            module: ModuleId(1),
+            port: 0,
+        },
+        svf,
+        cutoff,
+    );
+    let lfo = lfo_inside_voice(app, svf, cutoff);
+    assert_eq!(app.session.controller.graph().assignments().count(), 2);
+
+    app.unexpose(2, 0);
+    let sources: Vec<ModuleId> = app
+        .session
+        .controller
+        .graph()
+        .assignments()
+        .map(|(_, a)| a.source.module)
+        .collect();
+    assert_eq!(sources, [lfo], "only the assignment with no surface left goes");
+    assert!(
+        app.session
+            .hierarchy
+            .definition_of(ModuleId(2))
+            .unwrap()
+            .exposed
+            .is_empty()
+    );
+    let filter = app.session.hierarchy.id_at(&voice(), 5).unwrap();
+    assert_eq!(app.session.hierarchy.definition_of(filter).unwrap().exposed.len(), 1);
+    app.undo();
+    assert_eq!(app.session.controller.graph().assignments().count(), 2);
+}
+
+/// A retarget onto an inner parameter puts the assignment behind the inner
+/// ones in the file's order, which gives it a new id; the matrix selection
+/// follows it, and the old id is gone.
+#[test]
+fn a_retarget_onto_an_inner_parameter_keeps_the_matrix_selection() {
+    use loom_core::ModuleNames;
+    let (mut ui, svf, cutoff) = nested_example_ui();
+    let app = &mut ui.app;
+    let note_pitch = loom_core::OutputRef {
+        module: ModuleId(1),
+        port: 0,
+    };
+    // First an outer assignment onto a top-level parameter, then an inner
+    // one onto the cutoff, so the inner one has the higher id.
+    let scope = ModuleId(11);
+    let window = app
+        .session
+        .controller
+        .graph()
+        .node(scope)
+        .unwrap()
+        .parameter_index("window")
+        .unwrap();
+    app.assign(note_pitch, scope, window);
+    let outer = app.session.controller.graph().assignments().next().unwrap().0;
+    let lfo = lfo_inside_voice(app, svf, cutoff);
+    app.show_level(&ModulePath::root());
+    assert_eq!(app.session.controller.graph().assignments().count(), 2);
+    app.session.matrix.selected = Some(outer);
+
+    app.matrix_retarget(outer, None, Some((svf, cutoff)));
+    let graph = app.session.controller.graph();
+    assert!(graph.assignment(outer).is_none(), "the moved assignment got a new id");
+    let (moved, _) = graph
+        .assignments()
+        .find(|(_, a)| a.source == note_pitch && a.target == svf && a.param == cutoff)
+        .expect("retargeted onto the cutoff");
+    assert!(moved > outer);
+    assert_eq!(
+        app.session.matrix.selected,
+        Some(moved),
+        "the matrix follows the new id"
+    );
+    let order: Vec<ModuleId> = graph.assignments().map(|(_, a)| a.source.module).collect();
+    assert_eq!(order, [lfo, ModuleId(1)], "inner first, as the file loads them");
+}

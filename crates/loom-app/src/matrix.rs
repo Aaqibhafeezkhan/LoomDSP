@@ -749,12 +749,23 @@ impl App {
     }
 
     /// Applies a source or target change as a single undoable graph edit.
-    fn matrix_retarget(&mut self, id: AssignmentId, source: Option<OutputRef>, target: Option<(ModuleId, usize)>) {
+    /// The new pair must be one a drop could make: nothing crosses a
+    /// sub-patch boundary except through an exposed parameter (rule 4).
+    pub(crate) fn matrix_retarget(
+        &mut self,
+        id: AssignmentId,
+        source: Option<OutputRef>,
+        target: Option<(ModuleId, usize)>,
+    ) {
         let Some(old) = self.session.controller.graph().assignment(id).copied() else {
             return;
         };
         let source = source.unwrap_or(old.source);
         let (module, param) = target.unwrap_or((old.target, old.param));
+        if self.refuses_assignment(source, module, param) {
+            self.session.matrix.edit = None;
+            return;
+        }
         if self
             .session
             .controller
@@ -773,13 +784,43 @@ impl App {
         self.edit(
             |app| match app.session.controller.retarget_assignment(id, source, module, param) {
                 Ok(()) => {
-                    app.commit();
+                    // The moved assignment takes its place in the file's
+                    // order (sub-patches.md, Editor model), which can give
+                    // it a new id. A hierarchy that cannot be written puts
+                    // the assignment back.
+                    if app.sync_hierarchy("retarget") {
+                        app.commit();
+                    } else {
+                        // The sync may have renamed the assignment before it
+                        // failed, so the moved one is found by its pair,
+                        // which is unique (checked above).
+                        let moved = app
+                            .session
+                            .controller
+                            .graph()
+                            .assignments()
+                            .find(|(_, a)| a.source == source && a.target == module && a.param == param)
+                            .map_or(id, |(id, _)| id);
+                        let _ = app
+                            .session
+                            .controller
+                            .retarget_assignment(moved, old.source, old.target, old.param);
+                    }
                 }
                 Err(e) => app.alerts.warn(e.to_string()),
             },
         );
         self.session.matrix.edit = None;
-        self.matrix_select(id, self.session.matrix.cell);
+        // The moved assignment, under whatever id it has now: the pair is
+        // unique, as checked above.
+        let moved = self
+            .session
+            .controller
+            .graph()
+            .assignments()
+            .find(|(_, a)| a.source == source && a.target == module && a.param == param)
+            .map_or(id, |(id, _)| id);
+        self.matrix_select(moved, self.session.matrix.cell);
     }
 
     /// Creates the two picked endpoints with the normal app assignment path.

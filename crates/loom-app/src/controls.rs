@@ -3,7 +3,7 @@
 //! control for MIDI learn (`docs/design/midi-learn.md`,
 //! `docs/design/modulation.md`).
 
-use crate::{App, Message, learn, modulation, scene};
+use crate::{App, Message, learn, modulation};
 use loom_core::{MidiMappingOptions, ModuleId, OutputRef};
 use std::time::Instant;
 
@@ -11,7 +11,9 @@ impl App {
     /// Rebuilds what learn mode shows, after mappings or the armed
     /// parameter changed. A removed module disarms its parameter.
     pub(crate) fn refresh_learn(&mut self) {
-        self.session.learn.refresh(&self.session.controller);
+        self.session
+            .learn
+            .refresh(&self.session.controller, &self.session.hierarchy, &self.session.level);
     }
 
     /// Turns learn mode on or off, or arms a parameter.
@@ -124,6 +126,7 @@ impl App {
                     .midi_mappings()
                     .find(|(i, _)| *i == id)
                     .map(|(_, m)| *m);
+                self.cover_exposed_range(ModuleId(module), index);
                 self.session.learn.disarm();
                 self.commit();
                 if let Some(mapping) = mapping {
@@ -139,6 +142,69 @@ impl App {
         }
         if !self.session.edits.gesture_open() {
             self.record();
+        }
+    }
+
+    /// `value` clamped to the range a sub-patch surface gives parameter
+    /// `index` of `module`, when a surface exposes it with a narrower range
+    /// (sub-patches.md, Exposing); the value itself otherwise.
+    pub(crate) fn exposure_clamp(&self, module: u32, index: usize, value: f32) -> f32 {
+        let hierarchy = &self.session.hierarchy;
+        let graph = self.session.controller.graph();
+        let Some(spec) = graph
+            .node(ModuleId(module))
+            .and_then(|n| n.descriptor.params.get(index))
+        else {
+            return value;
+        };
+        let Some((tile, item)) = hierarchy.outermost_surface(ModuleId(module), spec.name) else {
+            return value;
+        };
+        match hierarchy.exposed_target(tile, item).and_then(|t| t.range) {
+            Some((min, max)) => value.clamp(min, max),
+            None => value,
+        }
+    }
+
+    /// A mapping learned on a parameter that a sub-patch surface exposes
+    /// with a narrower range covers that range, so hardware stays in it
+    /// (sub-patches.md, Exposing). A Relative mapping has no span to set,
+    /// and a parameter with no exposed range keeps the defaults. A stopgap:
+    /// the engine will clamp what every mapping sets to the exposed range
+    /// (the spec's "MIDI stays in the range too"), and this goes then.
+    fn cover_exposed_range(&mut self, module: ModuleId, index: usize) {
+        let graph = self.session.controller.graph();
+        let Some(node) = graph.node(module) else { return };
+        let Some(spec) = node.descriptor.params.get(index) else {
+            return;
+        };
+        let Some((tile, item)) = self.session.hierarchy.outermost_surface(module, spec.name) else {
+            return;
+        };
+        let Some((min, max)) = self.session.hierarchy.exposed_target(tile, item).and_then(|t| t.range) else {
+            return;
+        };
+        let Some((_, mapping)) = graph.midi_mapping_of(module, index) else {
+            return;
+        };
+        if matches!(mapping.options.mode, loom_core::MidiMode::Relative(_)) {
+            return;
+        }
+        let Some(control) = node.spec(index) else { return };
+        let (low, high) = (
+            control.normalize(min).clamp(0.0, 1.0),
+            control.normalize(max).clamp(0.0, 1.0),
+        );
+        if low >= high {
+            return;
+        }
+        let options = loom_core::MidiMappingOptions {
+            low,
+            high,
+            ..mapping.options
+        };
+        if let Err(e) = self.session.controller.set_midi_options(module, index, options) {
+            self.alerts.warn(e.to_string());
         }
     }
 
@@ -266,6 +332,10 @@ impl App {
         let node = self.session.controller.graph().node(id).ok_or("no such module")?;
         let spec = node.descriptor.params.get(index).ok_or("no such parameter")?;
         let value = spec.parse_value_text(text).map_err(|why| why.to_string())?;
+        // Clamped to an exposed range first, so the range selector is not
+        // widened for a value the parameter cannot take.
+        let value = self.exposure_clamp(module, index, value);
+        let node = self.session.controller.graph().node(id).ok_or("no such module")?;
         let outside = node
             .spec(index)
             .is_some_and(|selected| !(selected.min..=selected.max).contains(&value));
@@ -294,15 +364,16 @@ impl App {
 
     /// Why text typed on a canvas control is not a value, if it is not.
     pub(crate) fn typed_check(&self, module: u32, widget: usize, text: &str) -> Result<(), String> {
-        let (index, _, _) =
-            crate::scene::control_param(&self.session.controller, module, widget).ok_or("no such control")?;
+        let target = self
+            .control_target(module, widget, loom_canvas::ControlPart::Main)
+            .ok_or("no such control")?;
         let node = self
             .session
             .controller
             .graph()
-            .node(ModuleId(module))
+            .node(target.module)
             .ok_or("no such module")?;
-        let spec = node.descriptor.params.get(index).ok_or("no such parameter")?;
+        let spec = node.descriptor.params.get(target.index).ok_or("no such parameter")?;
         spec.parse_value_text(text).map(|_| ()).map_err(|why| why.to_string())
     }
 
@@ -418,6 +489,10 @@ impl App {
 
     /// Sets a parameter from a control on a tile or in the inspector.
     pub(crate) fn set_param(&mut self, module: u32, index: usize, value: f32) {
+        // A parameter a sub-patch surface exposes with a narrower range
+        // stays in it, whichever control, field, or row wrote it
+        // (sub-patches.md, Exposing).
+        let value = self.exposure_clamp(module, index, value);
         if let Err(e) = self.session.controller.set_param(ModuleId(module), index, value) {
             self.alerts.warn(e.to_string());
         }
@@ -472,7 +547,7 @@ impl App {
     /// assignment).
     pub(crate) fn assign(&mut self, source: OutputRef, target: ModuleId, index: usize) {
         // Nothing crosses a level except through exposed items (rule 4).
-        if self.refuses_assignment(source, target) {
+        if self.refuses_assignment(source, target, index) {
             return;
         }
         let graph = self.session.controller.graph();
@@ -489,7 +564,13 @@ impl App {
         }
         let depth = modulation::default_depth(&spec);
         match self.session.controller.add_assignment(source, target, index, depth) {
-            Ok(_) => {
+            Ok(id) => {
+                // In a nested patch the new assignment takes its place in the
+                // file's order (sub-patches.md, Editor model).
+                if !self.sync_hierarchy("assign") {
+                    let _ = self.session.controller.remove_assignment(id);
+                    return;
+                }
                 if self.commit() {
                     self.alerts
                         .say(format!("{from} modulates {to}, {}", modulation::depth_text(depth)));
@@ -509,9 +590,10 @@ impl App {
         pinned: Option<loom_canvas::PortRef>,
         delta: f32,
     ) {
-        let Some((param, _, _)) = scene::control_part(&self.session.controller, module, widget, part) else {
+        let Some(target) = self.control_target(module, widget, part) else {
             return;
         };
+        let (module, param) = (target.module, target.index);
         let graph = self.session.controller.graph();
         let picked = self.session.gestures.pick_depth(|| {
             let pinned = pinned.map(|p| OutputRef {
@@ -521,7 +603,7 @@ impl App {
             let selected = (self.session.selection.len() == 1)
                 .then(|| self.session.selection.iter().next().map(|&id| ModuleId(id)))
                 .flatten();
-            match modulation::drag_target(graph, ModuleId(module), param, pinned, selected) {
+            match modulation::drag_target(graph, module, param, pinned, selected) {
                 Ok(id) => Some(id),
                 Err(why) => {
                     self.alerts.warn(why.to_string());
