@@ -2105,6 +2105,7 @@ dependencies = [
  "loom-host-desktop",
  "loom-modules",
  "loom-patch",
+ "loom-ui-core",
  "png",
  "rfd",
  "ron",
@@ -2121,6 +2122,7 @@ dependencies = [
  "bytemuck",
  "iced",
  "iced_wgpu",
+ "loom-ui-core",
  "naga",
 ]
 
@@ -2214,6 +2216,10 @@ dependencies = [
  "hound",
  "loom-core",
 ]
+
+[[package]]
+name = "loom-ui-core"
+version = "0.1.0"
 
 [[package]]
 name = "lru"

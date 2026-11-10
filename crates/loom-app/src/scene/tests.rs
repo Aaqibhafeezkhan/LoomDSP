@@ -286,7 +286,7 @@ fn no_built_in_tile_text_is_cut_or_overlaps() {
             outputs: d.outputs.iter().map(|spec| port_view(spec, false)).collect(),
             panel: panel_view(d),
         };
-        let mut boxes: Vec<(String, iced::Rectangle)> = Vec::new();
+        let mut boxes: Vec<(String, loom_ui_core::Rect)> = Vec::new();
         loom_canvas::for_each_tile_text(&module, |item| {
             if item.content.ends_with('…') {
                 problems.push(format!("{}: {} is cut", d.id, item.content));
@@ -294,14 +294,14 @@ fn no_built_in_tile_text_is_cut_or_overlaps() {
             let text = item.bounds();
             // At least one unit apart side by side, so two labels never
             // read as one.
-            let spaced = iced::Rectangle {
+            let spaced = loom_ui_core::Rect {
                 x: text.x - 1.0,
                 width: text.width + 2.0,
                 ..text
             };
             for (other, b) in &boxes {
                 if spaced
-                    .intersection(b)
+                    .intersection(*b)
                     .is_some_and(|i| i.width > 0.01 && i.height > 0.01)
                 {
                     problems.push(format!("{}: {} touches {other}", d.id, item.content));
@@ -574,7 +574,7 @@ fn the_all_modules_patch_has_every_module_without_overlap() {
         .collect();
     for (i, (a, ra)) in tiles.iter().enumerate() {
         for (b, rb) in &tiles[i + 1..] {
-            assert!(ra.intersection(rb).is_none(), "{a} overlaps {b}");
+            assert!(ra.intersection(*rb).is_none(), "{a} overlaps {b}");
         }
     }
 }

@@ -22,6 +22,7 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{Id, Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay};
 use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, window};
+use loom_canvas::iced_convert::{ToCore as _, ToIced as _};
 use loom_canvas::{CanvasPointer, CanvasTyped, CanvasView, Hit, PointerDrag, PortRef};
 use serde::Serialize;
 use std::any::Any;
@@ -35,7 +36,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Aim {
     /// Logical window pixels.
-    At(Point),
+    At(loom_ui_core::Point),
     /// A target as `locate` takes it.
     Target(String),
 }
@@ -177,7 +178,7 @@ impl Pointer {
         while let Some(Queued { serial, step }) = inner.queue.pop_front() {
             let at = inner.at;
             let mut find = |aim: &Aim| match aim {
-                Aim::At(p) => Ok(*p),
+                Aim::At(p) => Ok(p.to_iced()),
                 Aim::Target(target) => resolve(target),
             };
             let event = match step {
@@ -296,7 +297,7 @@ impl Operation for FindNow<'_> {
 
     fn text(&mut self, _id: Option<&Id>, bounds: Rectangle, text: &str) {
         if self.found.text.is_none() && Some(text) == self.text {
-            self.found.text = Some(bounds);
+            self.found.text = Some(bounds.to_core());
         }
     }
 }
@@ -386,10 +387,10 @@ impl<'a, Message> Injector<'a, Message> {
         let (found, _, _) = self.find(tree, layout, renderer, Some(target));
         let rect = crate::control::locate(self.app, target, &found)?;
         let window = layout.bounds();
-        if !window.contains(rect.center()) {
+        if !window.contains(rect.center().to_iced()) {
             return Err(format!("`{target}` is not on screen"));
         }
-        Ok(rect.center())
+        Ok(rect.center().to_iced())
     }
 }
 
