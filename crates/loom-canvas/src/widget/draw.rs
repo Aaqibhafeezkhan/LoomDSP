@@ -1,398 +1,20 @@
-//! Drawing on top of the GPU scene: the overlay, cable highlights, panel text, and choice pop-ups.
+//! Drawing the canvas's text through Iced: tile text, the choice pop-up, the
+//! typed field, and hover text. Text is measured with Iced here, so none of
+//! this is in `crate::input`.
 
 use super::*;
 
-/// The mapping label that replaces a caption in MIDI learn mode, if this text
-/// is the caption of a mapped control (midi-learn.md, Making a mapping).
-pub(super) fn learned_label(learn: Option<&LearnView>, module: u32, kind: TextKind) -> Option<&str> {
-    match kind {
-        TextKind::Caption(widget) => learn
-            .and_then(|learn| learn.labels.get(&(module, widget)))
-            .map(String::as_str),
-        _ => None,
-    }
-}
-
-impl<Message> PatchCanvas<'_, Message> {
-    /// The overlay for a view whose visible world area is `visible`. Learn
-    /// mode outlines only the controls there, so its cost follows what is on
-    /// screen, not the size of the patch.
-    pub(super) fn overlay_in(&self, state: &State, visible: Rect) -> Overlay {
-        let mut overlay = self.overlay(state);
-        let p = &self.palette;
-        // MIDI learn mode outlines every control on screen, and the armed
-        // one more strongly, so the user sees what a click will do.
-        if let Some(learn) = self.learn {
-            let visible_modules = self
-                .scene
-                .modules()
-                .iter()
-                .filter(|module| module.bounds().intersects(visible));
-            for module in visible_modules {
-                for (index, view) in module.panel.widgets.iter().enumerate() {
-                    // A widget with two values is armed in the inspector
-                    // (midi-learn.md, Making a mapping).
-                    if !view.is_control() || view.kind.is_two_numbers() {
-                        continue;
-                    }
-                    let Some(rect) = module.widget_bounds(index) else {
-                        continue;
-                    };
-                    let (ring, radius) = focus_ring(&view.kind, rect);
-                    let (colour, width) = if learn.armed == Some((module.id, index)) {
-                        (p.selection, 2.5)
-                    } else {
-                        (p.focus, 1.0)
-                    };
-                    overlay
-                        .shapes
-                        .push(Shape::new(ring, radius, Color::TRANSPARENT, colour, width));
-                }
-            }
-        }
-        overlay
-    }
-
-    pub(super) fn overlay(&self, state: &State) -> Overlay {
-        let mut overlay = Overlay::default();
-        let p = &self.palette;
-
-        for tile in self.scene.modules().iter().filter(|tile| tile.is_growable()) {
-            let bounds = tile.bounds();
-            let grip = Rect::new(
-                Point::new(
-                    bounds.x + bounds.width - GRID * 0.65,
-                    bounds.y + bounds.height - GRID * 0.65,
-                ),
-                Size::new(GRID * 0.4, GRID * 0.4),
-            );
-            overlay
-                .shapes
-                .push(Shape::new(grip, 1.0, p.focus, Color::TRANSPARENT, 0.0));
-        }
-
-        // Live port markers use the overlay buffer. A state change uploads
-        // only these shapes and never rebuilds tiles or cables (#63).
-        if detail(state.camera.zoom) == Detail::Close {
-            let mut drawn = std::collections::HashSet::new();
-            for cable in self.scene.cables() {
-                if !self.activity.contains(&cable.from) {
-                    continue;
-                }
-                for port in [
-                    PortRef {
-                        module: cable.from.0,
-                        output: true,
-                        index: cable.from.1,
-                    },
-                    PortRef {
-                        module: cable.to.0,
-                        output: false,
-                        index: cable.to.1,
-                    },
-                ] {
-                    if !drawn.insert(port) {
-                        continue;
-                    }
-                    if let (Some(centre), Some(view)) = (self.scene.port_position(port), self.scene.port(port)) {
-                        let r = PORT_RADIUS - 1.0;
-                        let rect = Rect::new(Point::new(centre.x - r, centre.y - r), Size::new(2.0 * r, 2.0 * r));
-                        let corner = if view.shape == crate::scene::PortShape::Round {
-                            r
-                        } else {
-                            r * 0.3
-                        };
-                        overlay
-                            .shapes
-                            .push(Shape::new(rect, corner, view.colour, Color::TRANSPARENT, 0.0));
-                    }
-                }
-            }
-        }
-
-        // Cables in focus come to the front at full opacity: the cable under
-        // the cursor, the cables on the port under the cursor, and the cables
-        // of the module under the cursor and of selected modules. Everything
-        // else stays at the same dim level, so the patch never flickers.
-        let hovered = Self::hovered_module(state);
-        let hovered_port = Self::hovered_port(state);
-        let hovered_cable = Self::hovered_cable(state);
-        let module_in_focus = |id: u32| self.selection.contains(&id) || hovered == Some(id);
-        let on_port = |cable: &crate::scene::CableView| {
-            hovered_port.is_some_and(|p| {
-                if p.output {
-                    cable.from == (p.module, p.index)
-                } else {
-                    cable.to == (p.module, p.index)
-                }
-            })
-        };
-        if !self.selection.is_empty() || hovered.is_some() || hovered_port.is_some() || hovered_cable.is_some() {
-            for (index, cable) in self.scene.cables().iter().enumerate() {
-                let focused = hovered_cable == Some(index)
-                    || on_port(cable)
-                    || module_in_focus(cable.from.0)
-                    || module_in_focus(cable.to.0);
-                if !focused {
-                    continue;
-                }
-                let from = PortRef {
-                    module: cable.from.0,
-                    output: true,
-                    index: cable.from.1,
-                };
-                let to = PortRef {
-                    module: cable.to.0,
-                    output: false,
-                    index: cable.to.1,
-                };
-                if let (Some(a), Some(b)) = (self.scene.port_position(from), self.scene.port_position(to)) {
-                    overlay
-                        .cables
-                        .push(Cable::new(a, b, cable.colour_from, cable.colour_to, cable.delayed).focused());
-                }
-            }
-        }
-
-        self.modulation_lines(state, &mut overlay);
-
-        for id in self.selection {
-            if let Some(module) = self.scene.module(*id) {
-                let b = module.bounds().expand(3.0);
-                overlay
-                    .shapes
-                    .push(Shape::new(b, 7.0, Color::TRANSPARENT, p.selection, 1.5));
-            }
-        }
-        if let Some(Hit::Port(port)) = state.hover
-            && let Some(centre) = self.scene.port_position(port)
-        {
-            let r = PORT_RADIUS + 3.0;
-            let rect = Rect::new(Point::new(centre.x - r, centre.y - r), Size::new(2.0 * r, 2.0 * r));
-            overlay
-                .shapes
-                .push(Shape::new(rect, r, Color::TRANSPARENT, p.hover, 1.2));
-        }
-        // The focus ring shows for keyboard focus only. After a click or a
-        // drag the pointer already shows where the user is, and the ring
-        // would only crowd the value text (#92).
-        if let Some((module, widget)) = state.focus.tab_control()
-            && self.selection.contains(&module)
-            && let Some(m) = self.scene.module(module)
-            && let (Some(rect), Some(view)) = (m.widget_bounds(widget), m.panel.widgets.get(widget))
-        {
-            let (ring, radius) = focus_ring(&view.kind, rect);
-            overlay
-                .shapes
-                .push(Shape::new(ring, radius, Color::TRANSPARENT, p.focus, 1.5));
-            // Inside a range, the picked part has its own outline: thicker
-            // while it is grabbed (panel-widgets.md, rule 4).
-            if let (WidgetViewKind::Range { vertical, .. }, Some(inside)) = (&view.kind, state.focus.range_part()) {
-                let at = |part| self.part_position(m.id, widget, part);
-                let ring = match inside.part {
-                    0 => range_handle(rect, *vertical, at(ControlPart::Main)).expand(2.0),
-                    2 => range_handle(rect, *vertical, at(ControlPart::Second)).expand(2.0),
-                    _ => range_track(rect, *vertical).expand(3.0),
-                };
-                let width = if inside.grab.is_some() { 2.5 } else { 1.5 };
-                overlay
-                    .shapes
-                    .push(Shape::new(ring, 2.0, Color::TRANSPARENT, p.selection, width));
-            }
-        }
-        match &state.interaction {
-            Interaction::Wiring { from, pulled } => {
-                // A control that would take this output as an assignment is
-                // highlighted, like an input port for a cable.
-                if let Some(Hit::Widget { module, widget }) = state.hover
-                    && !pulled
-                    && self.takes_assignment(*from, module, widget)
-                    && let Some(m) = self.scene.module(module)
-                    && let (Some(rect), Some(view)) = (m.widget_bounds(widget), m.panel.widgets.get(widget))
-                {
-                    let part = state.cursor.map(|world| self.drop_part(module, widget, world));
-                    let (ring, radius) = match (&view.kind, part) {
-                        (WidgetViewKind::XyPad { .. }, Some(part)) => (xy_edge_ring(xy_area(rect), part), 2.0),
-                        (WidgetViewKind::Range { vertical, .. }, Some(part)) => {
-                            let at = self.part_position(module, widget, part);
-                            (range_handle(rect, *vertical, at).expand(2.0), 2.0)
-                        }
-                        _ => focus_ring(&view.kind, rect),
-                    };
-                    overlay
-                        .shapes
-                        .push(Shape::new(ring, radius, Color::TRANSPARENT, p.hover, 1.5));
-                }
-                if !(self.window_drag_line && from.output && !pulled)
-                    && let (Some(start), Some(port), Some(cursor)) =
-                        (self.scene.port_position(*from), self.scene.port(*from), state.cursor)
-                {
-                    // Snap the loose end onto a port under the cursor.
-                    let end = match state.hover {
-                        Some(Hit::Port(target)) if target.output != from.output => {
-                            self.scene.port_position(target).unwrap_or(cursor)
-                        }
-                        _ => cursor,
-                    };
-                    let cable = if from.output {
-                        Cable::new(start, end, port.colour, port.colour, false)
-                    } else {
-                        Cable::new(end, start, port.colour, port.colour, false)
-                    }
-                    .focused();
-                    overlay.cables.push(cable);
-                }
-            }
-            Interaction::Selecting { start, current, .. } => {
-                let rect = Rect::new(
-                    Point::new(start.x.min(current.x), start.y.min(current.y)),
-                    Size::new((start.x - current.x).abs(), (start.y - current.y).abs()),
-                );
-                overlay
-                    .shapes
-                    .push(Shape::new(rect, 2.0, p.marquee, p.selection, 1.0 / state.camera.zoom));
-            }
-            Interaction::Resizing { module, current, .. } => {
-                if let Some(tile) = self.scene.module(*module) {
-                    overlay.shapes.push(Shape::new(
-                        Rect::new(tile.position, *current),
-                        2.0,
-                        Color::TRANSPARENT,
-                        p.selection,
-                        1.0 / state.camera.zoom,
-                    ));
-                }
-            }
-            _ => {}
-        }
-        overlay
-    }
-
-    /// Modulation lines in focus (modulation.md, Lines): thin dashed lines
-    /// from a source port to its targets, for the pinned output, the output
-    /// or badge under the pointer, the control under the pointer, and the
-    /// modules in focus as for cables. Pointed and pinned sources get a
-    /// double outline; their targets get a single one. A pinned badge gets a ring.
-    pub(super) fn modulation_lines(&self, state: &State, overlay: &mut Overlay) {
-        let key = LinesKey {
-            scene: self.scene.generation(),
-            overlay: self.scene.overlay_generation(),
-            pinned: self.pin(state),
-            hover: state.hover,
-            selection: self.selection.iter().copied().collect(),
-            matrix_line: self.matrix_line.clone(),
-        };
-        let mut cache = state.lines.borrow_mut();
-        if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            let mut lines = Overlay::default();
-            self.build_modulation_lines(state, &mut lines);
-            *cache = Some((key, lines));
-        }
-        if let Some((_, lines)) = cache.as_ref() {
-            overlay.cables.extend_from_slice(&lines.cables);
-            overlay.shapes.extend_from_slice(&lines.shapes);
-        }
-    }
-
-    pub(super) fn build_modulation_lines(&self, state: &State, overlay: &mut Overlay) {
-        let p = &self.palette;
-        if let Some(port) = self.pin(state)
-            && let Some(badge) = self.scene.badge_bounds(port.module, port.index)
-        {
-            let ring = badge.expand(1.5);
-            overlay
-                .shapes
-                .push(Shape::new(ring, ring.height * 0.5, Color::TRANSPARENT, p.text, 1.0));
-        }
-        let pointed = match state.hover {
-            Some(Hit::Port(port) | Hit::Badge(port)) if port.output => Some(port),
-            _ => None,
-        };
-        let sources: Vec<(u32, usize)> = [self.pin(state), pointed]
-            .into_iter()
-            .flatten()
-            .map(|port| (port.module, port.index))
-            .collect();
-        let control = match state.hover {
-            Some(Hit::Widget { module, widget }) => Some((module, widget)),
-            _ => None,
-        };
-        let hovered = Self::hovered_module(state);
-        let module_in_focus = |id: u32| self.selection.contains(&id) || hovered == Some(id);
-        let mut targets: Vec<u32> = Vec::new();
-        let mut sources_outlined: Vec<u32> = Vec::new();
-        for m in self.scene.modulations() {
-            let by_source = sources.contains(&m.from);
-            let by_control = control.is_some_and(|(module, widget)| m.to == module && m.widget == Some(widget));
-            if !(self.matrix_line.as_ref() == Some(m)
-                || by_source
-                || by_control
-                || module_in_focus(m.from.0)
-                || module_in_focus(m.to))
-            {
-                continue;
-            }
-            let from = PortRef {
-                module: m.from.0,
-                output: true,
-                index: m.from.1,
-            };
-            let (Some(start), Some(end)) = (self.scene.port_position(from), self.scene.modulation_end(m)) else {
-                continue;
-            };
-            let colour = if m.enabled {
-                p.modulation
-            } else {
-                Color {
-                    a: p.modulation.a * 0.4,
-                    ..p.modulation
-                }
-            };
-            let mut line = Cable::new(start, end, colour, colour, true).thin().focused();
-            if !m.enabled {
-                line = line.half_width();
-            }
-            overlay.cables.push(line);
-            if by_source || by_control {
-                if !targets.contains(&m.to) {
-                    targets.push(m.to);
-                }
-                if !sources_outlined.contains(&m.from.0) {
-                    sources_outlined.push(m.from.0);
-                }
-            }
-        }
-        for id in targets.into_iter().filter(|id| !sources_outlined.contains(id)) {
-            if let Some(module) = self.scene.module(id) {
-                overlay.shapes.push(Shape::new(
-                    module.bounds().expand(3.0),
-                    7.0,
-                    Color::TRANSPARENT,
-                    p.modulation,
-                    1.2,
-                ));
-            }
-        }
-        for id in sources_outlined {
-            if let Some(module) = self.scene.module(id) {
-                for distance in [3.0, 6.0] {
-                    overlay.shapes.push(Shape::new(
-                        module.bounds().expand(distance),
-                        7.0 + distance - 3.0,
-                        Color::TRANSPARENT,
-                        p.modulation,
-                        1.2,
-                    ));
-                }
-            }
-        }
-    }
-
-    pub(super) fn draw_text<Renderer>(&self, state: &State, values: &PanelValues, renderer: &mut Renderer, bounds: Rect)
-    where
+impl CanvasModel<'_> {
+    pub(super) fn draw_text<Renderer>(
+        &self,
+        state: &CanvasInput,
+        values: &PanelValues,
+        renderer: &mut Renderer,
+        bounds: Rect,
+    ) where
         Renderer: text::Renderer<Font = Font>,
     {
-        let zoom = state.camera.zoom;
+        let zoom = state.camera().zoom;
         // Quantise sizes so zooming does not create a new text layout every
         // frame for every label.
         let quantise = |size: f32| (size * 2.0).round() / 2.0;
@@ -402,10 +24,10 @@ impl<Message> PatchCanvas<'_, Message> {
         }
         let label_px = quantise(LABEL_SIZE * zoom);
         let show_labels = label_px >= LABEL_MIN_PX;
-        let visible = state.camera.visible(bounds.size());
+        let visible = state.camera().visible(bounds.size());
         let font = renderer.default_font();
         let to_screen = |world: Point| {
-            let s = state.camera.to_screen(world);
+            let s = state.camera().to_screen(world);
             Point::new(bounds.x + s.x, bounds.y + s.y)
         };
         let text = |content: &str, size: f32, width: f32, align: text::Alignment| Text {
@@ -420,10 +42,7 @@ impl<Message> PatchCanvas<'_, Message> {
             wrapping: text::Wrapping::None,
         };
         // The control whose value shows instead of its label.
-        let active = match state.interaction {
-            Interaction::Turning { module, widget, .. } => Some((module, widget)),
-            _ => state.focus.control(),
-        };
+        let active = state.value_shown();
 
         for module in self.scene.modules() {
             let tile = module.bounds();
@@ -561,11 +180,11 @@ impl<Message> PatchCanvas<'_, Message> {
     }
 
     /// Draws the open choice list above all tile text, at a fixed screen size.
-    pub(super) fn draw_select_popup<Renderer>(&self, state: &State, renderer: &mut Renderer, bounds: Rect)
+    pub(super) fn draw_select_popup<Renderer>(&self, state: &CanvasInput, renderer: &mut Renderer, bounds: Rect)
     where
         Renderer: text::Renderer<Font = Font>,
     {
-        let (Some(popup), Some((module, widget))) = (state.focus.popup().copied(), state.focus.control()) else {
+        let (Some(popup), Some((module, widget))) = (state.popup().copied(), state.focused_control()) else {
             return;
         };
         let Some(rect) = self.select_popup_bounds(state, Rect::new(Point::ORIGIN, bounds.size())) else {
@@ -653,6 +272,232 @@ impl<Message> PatchCanvas<'_, Message> {
                     },
                     self.palette.text_dim.to_iced(),
                 );
+            }
+        });
+    }
+
+    /// Draws the open field above all tile text. Bad text gets a warning
+    /// outline, and its reason on a line below (rule 8: not colour alone).
+    pub(super) fn draw_typed_field<Renderer>(&self, state: &CanvasInput, renderer: &mut Renderer, bounds: Rect)
+    where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let Some(field) = state.typed_field() else {
+            return;
+        };
+        let Some(rect) = self.typed_field_bounds(state, Rect::new(Point::ORIGIN, bounds.size())) else {
+            return;
+        };
+        let area = Rect::new(Point::new(bounds.x + rect.x, bounds.y + rect.y), rect.size());
+        let font = renderer.default_font();
+        let error = field.draft.error().map(str::to_string);
+        let line = |content: String, width: f32| Text {
+            content,
+            bounds: iced::Size::new(width, FIELD_HEIGHT_PX),
+            size: Pixels(FIELD_TEXT_PX),
+            line_height: text::LineHeight::Relative(1.2),
+            font,
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Center,
+            shaping: text::Shaping::Basic,
+            wrapping: text::Wrapping::None,
+        };
+        let inner = FIELD_WIDTH_PX - 2.0 * FIELD_PADDING_PX;
+        let width_of = |content: &str| {
+            Renderer::Paragraph::with_text(Text {
+                content,
+                bounds: iced::Size::new(f32::INFINITY, FIELD_HEIGHT_PX),
+                size: Pixels(FIELD_TEXT_PX),
+                line_height: text::LineHeight::Relative(1.2),
+                font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::None,
+            })
+            .min_bounds()
+            .width
+        };
+        let text_at = Point::new(area.x + FIELD_PADDING_PX, area.center_y());
+        renderer.with_layer(bounds.to_iced(), |renderer| {
+            let outline = if error.is_some() {
+                (self.palette.warning, 2.0)
+            } else {
+                (self.palette.control_value, 1.0)
+            };
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: area.to_iced(),
+                    border: iced::Border {
+                        color: outline.0.to_iced(),
+                        width: outline.1,
+                        radius: 4.0.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                self.palette.control_body.to_iced(),
+            );
+            if field.selected && !field.draft.text.is_empty() {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rect::new(
+                            Point::new(text_at.x - 1.0, area.y + 3.0),
+                            Size::new(width_of(&field.draft.text).min(inner) + 2.0, FIELD_HEIGHT_PX - 6.0),
+                        )
+                        .to_iced(),
+                        ..renderer::Quad::default()
+                    },
+                    self.palette.control_track.to_iced(),
+                );
+            }
+            renderer.fill_text(
+                line(field.draft.text.clone(), inner),
+                text_at.to_iced(),
+                self.palette.text.to_iced(),
+                area.to_iced(),
+            );
+            if !field.selected {
+                let x = text_at.x + width_of(&field.draft.text[..field.caret]).min(inner);
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rect::new(Point::new(x, area.y + 4.0), Size::new(1.0, FIELD_HEIGHT_PX - 8.0)).to_iced(),
+                        ..renderer::Quad::default()
+                    },
+                    self.palette.text.to_iced(),
+                );
+            }
+            if let Some(reason) = error {
+                let place = typed_reason_bounds(area, width_of(&reason) + 2.0 * FIELD_PADDING_PX, bounds);
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: place.to_iced(),
+                        border: iced::Border {
+                            color: self.palette.tile_border.to_iced(),
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    self.palette.control_body.to_iced(),
+                );
+                renderer.fill_text(
+                    line(reason, place.width),
+                    Point::new(place.x + FIELD_PADDING_PX, place.center_y()).to_iced(),
+                    self.palette.text.to_iced(),
+                    bounds.to_iced(),
+                );
+            }
+        });
+    }
+
+    /// Hover text (panels.md, Labels and hover text): the label, the
+    /// description, and the name when it differs, at a fixed screen size in
+    /// a layer above the tiles. Drawn at any zoom, because hover text is
+    /// what the user needs where tile text is too small to read.
+    pub(super) fn draw_hover_text<Renderer>(&self, state: &CanvasInput, renderer: &mut Renderer, bounds: Rect)
+    where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        if state.has_overlay() {
+            return;
+        }
+        let Some(target) = state.hover_text().shown() else {
+            return;
+        };
+        let Some((label, hover, value, world)) = self.hover_content(target) else {
+            return;
+        };
+        // A port with a clock mark says which transport signal it follows
+        // (panels.md, Clock mark on transport inputs).
+        let follows = match target {
+            HoverTarget::Port(port) => self.scene.port(port).and_then(|p| p.follows_transport),
+            HoverTarget::Control(..) | HoverTarget::Second(..) | HoverTarget::Title(_) => None,
+        };
+        let font = renderer.default_font();
+        let inner = crate::hover::text_width(bounds.width);
+        // Each line is measured as a paragraph, then drawn as text in that
+        // size, wrapped at word boundaries.
+        let line = |content: &str, size: f32, colour: Color, font: Font| {
+            let text = Text {
+                content: content.to_string(),
+                bounds: iced::Size::new(inner, f32::INFINITY),
+                size: Pixels(size),
+                line_height: text::LineHeight::Relative(1.3),
+                font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Top,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::Word,
+            };
+            let measured = Renderer::Paragraph::with_text(text.as_ref()).min_bounds();
+            (
+                Text {
+                    bounds: iced::Size::new(measured.width.ceil() + 1.0, measured.height.ceil()),
+                    ..text
+                },
+                colour,
+            )
+        };
+        // A light's or meter's label is bold, so it stands apart from its
+        // value line (port-and-parameter-text.md, Display values).
+        let bold = Font {
+            weight: iced::font::Weight::Bold,
+            ..font
+        };
+        let title = if value.is_some() { bold } else { font };
+        let mut lines = vec![line(label, HOVER_TEXT_PX, self.palette.text, title)];
+        if !hover.description.is_empty() {
+            lines.push(line(&hover.description, HOVER_TEXT_PX, self.palette.text_dim, font));
+        }
+        // What a control stands for across a sub-patch boundary
+        // (sub-patches.md, Exposing).
+        if let Some(note) = &hover.note {
+            lines.push(line(note, HOVER_TEXT_PX, self.palette.text_dim, font));
+        }
+        if let Some(signal) = follows {
+            lines.push(line(signal.hover_line(), HOVER_TEXT_PX, self.palette.text, font));
+        }
+        if let Some(value) = value {
+            lines.push(line(value, HOVER_TEXT_PX, self.palette.text, font));
+        }
+        if let Some(name) = &hover.name {
+            lines.push(line(name, HOVER_TEXT_PX - 1.0, self.palette.text_dim, font));
+        }
+        const LINE_GAP: f32 = 3.0;
+        let width = lines.iter().map(|(t, _)| t.bounds.width).fold(0.0, f32::max);
+        let height = lines.iter().map(|(t, _)| t.bounds.height).sum::<f32>() + LINE_GAP * (lines.len() - 1) as f32;
+        let size = Size::new(width + 2.0 * HOVER_PADDING, height + 2.0 * HOVER_PADDING);
+
+        let zoom = state.camera().zoom;
+        let corner = state.camera().to_screen(world.position());
+        let anchor = Rect::new(
+            Point::new(bounds.x + corner.x, bounds.y + corner.y),
+            world.size() * zoom,
+        );
+        let at = crate::hover::place(size, anchor, bounds);
+        renderer.with_layer(bounds.to_iced(), |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rect::new(at, size).to_iced(),
+                    border: iced::Border {
+                        color: self.palette.tile_border.to_iced(),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                self.palette.tile.to_iced(),
+            );
+            let mut y = at.y + HOVER_PADDING;
+            for (text, colour) in lines {
+                let height = text.bounds.height;
+                renderer.fill_text(
+                    text,
+                    Point::new(at.x + HOVER_PADDING, y).to_iced(),
+                    colour.to_iced(),
+                    bounds.to_iced(),
+                );
+                y += height + LINE_GAP;
             }
         });
     }

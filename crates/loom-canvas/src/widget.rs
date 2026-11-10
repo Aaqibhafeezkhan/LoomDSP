@@ -1,19 +1,19 @@
-//! The patch canvas widget: input handling and drawing.
+//! The patch canvas as an Iced widget.
+//!
+//! This is the only Iced code in the canvas beside the GPU primitive. It
+//! turns Iced's events into ours, hands them to [`CanvasInput`], applies the
+//! [`Reaction`] to Iced's shell, and draws. The input handling itself is in
+//! `crate::input` and knows nothing of Iced.
 
+use crate::CanvasEvent;
 use crate::camera::Camera;
-use crate::controls::{
-    ControlGeometry, PanelValues, RangeGrab, ValueDrag, focus_ring, knob_step, radio_option, range_bar_at,
-    range_handle, range_nearest, range_track, select_box, xy_area, xy_bar_at, xy_edge_ring, xy_nearest_edge,
-    xy_position, xy_throw,
-};
-use crate::draft::{DraftSubmit, TypedDraft};
-use crate::gpu::{Cable, CanvasPrimitive, Geometry, Overlay, Shape};
-use crate::hover::{HOVER_PADDING, HOVER_TEXT_PX, HoverTarget, HoverTimer};
+use crate::controls::{ControlGeometry, PanelValues};
+use crate::gpu::{CanvasPrimitive, Geometry};
+use crate::hover::{HOVER_PADDING, HOVER_TEXT_PX, HoverTarget};
 use crate::iced_convert::{ToCore as _, ToIced as _};
-use crate::scene::{
-    BADGE_TEXT_SIZE, GRID, HEADER, Hit, HoverText, PORT_HIT_RADIUS, PORT_RADIUS, PortRef, Scene, TILE_WIDTH,
-    WidgetView, WidgetViewKind,
-};
+use crate::input::*;
+use crate::reaction::Reaction;
+use crate::scene::{BADGE_TEXT_SIZE, Scene, WidgetViewKind};
 use crate::theme::Palette;
 use crate::tile_text::{self, Align, LABEL_SIZE, TITLE_SIZE, TextKind};
 use crate::trace::{ScopeTraces, TraceGeometry};
@@ -22,784 +22,176 @@ use iced::advanced::renderer;
 use iced::advanced::text::{self, Paragraph as _, Text};
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Clipboard, Shell, Widget};
-use iced::{Element, Event, Font, Length, Pixels};
-use iced::{alignment, keyboard, mouse, window};
-use loom_ui_core::{Color, Point, Rect, Size, Vector};
+use iced::{Element, Font, Length, Pixels};
+use iced::{alignment, mouse, window};
+use loom_ui_core::{Color, Point, Rect, Size};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 mod draw;
-mod event;
-mod focus;
-mod hover_text;
-mod input;
-mod panel_input;
-mod select_popup;
-mod typed_field;
 
-pub use event::{CanvasEvent, ControlPart};
-
-/// Two presses on the same control within this time reset it.
-const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// How far in screen pixels the pointer may move between the two clicks of
-/// a double-click.
-const DOUBLE_CLICK_SLOP: f32 = 4.0;
-/// How far a right press may move, in screen pixels, and still count as a
-/// click that opens the probe menu rather than a pan.
-const CLICK_SLOP: f32 = 4.0;
-/// Height of a row in the choice popup, in screen pixels.
-const SELECT_ROW_PX: f32 = 23.0;
-/// Minimum popup width in screen pixels, so names stay legible at middle zoom.
-const SELECT_WIDTH_PX: f32 = 124.0;
-/// Titles are drawn when they would be at least this tall on screen.
-const TITLE_MIN_PX: f32 = 6.5;
-/// Port labels are drawn when they would be at least this tall on screen.
-const LABEL_MIN_PX: f32 = 7.5;
-/// The smallest zoom where port labels and captions are drawn. Opening a
-/// patch and framing it (F, Home) never zoom out past it (#455).
-const READABLE_ZOOM: f32 = LABEL_MIN_PX / LABEL_SIZE;
-
-/// Opacity of cables that are not in focus. It never changes with hover or
-/// selection, so moving the pointer only changes the cables it points at,
-/// never the whole patch.
-const CABLE_OPACITY: f32 = 0.4;
-
-/// What MIDI learn mode shows on the canvas. While the canvas has one, a
-/// click on a control arms it instead of changing it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LearnView {
-    /// The armed control: module ID and widget index.
-    pub armed: Option<(u32, usize)>,
-    /// Mapping labels, such as `CC 74`, by module ID and widget index. They
-    /// show in place of the control's caption.
-    pub labels: BTreeMap<(u32, usize), String>,
-    /// Mapping labels of the values of a widget that binds two, by module ID,
-    /// widget index, and part. They show in that part's hover text
-    /// (midi-learn.md, Making a mapping).
-    pub part_labels: BTreeMap<(u32, usize, ControlPart), String>,
-}
-
-/// Says why typed text is not a value of a control: module, widget, text.
-type TypedCheck<'a> = Box<dyn Fn(u32, usize, &str) -> Result<(), String> + 'a>;
-
-/// The patch canvas. Draws a [`Scene`] and reports gestures as
-/// [`CanvasEvent`]s.
+/// The patch canvas as an Iced widget. Draws a [`Scene`] and reports
+/// gestures as [`CanvasEvent`]s, through the message `on_event` makes.
 pub struct PatchCanvas<'a, Message> {
-    scene: &'a Scene,
-    selection: &'a BTreeSet<u32>,
-    values: Option<&'a PanelValues>,
-    traces: Option<&'a ScopeTraces>,
-    /// Outputs that currently carry a signal; their cable inputs follow.
-    activity: Vec<(u32, usize)>,
-    palette: Palette,
+    /// What to show this frame.
+    model: CanvasModel<'a>,
+    /// Turns what the canvas reports into the app's message.
     on_event: Box<dyn Fn(CanvasEvent) -> Message + 'a>,
-    frame_key: u64,
-    browser_key: u64,
-    /// The level shown, and its camera when the app has one. See
-    /// [`PatchCanvas::level`].
-    level_key: u64,
-    level_camera: Option<Camera>,
-    animate: bool,
-    learn: Option<&'a LearnView>,
-    /// The row selected in the modulation matrix, without changing the pin.
-    matrix_line: Option<crate::scene::ModulationView>,
-    /// Who else in the window has the keys. See [`CanvasFocusPolicy`].
-    focus_policy: CanvasFocusPolicy,
-    /// The app's arrow-key undo group, as of this view. See
-    /// [`PatchCanvas::arrow_group`].
-    arrow_group: ArrowGroupView,
-    /// The check for typed values. See [`PatchCanvas::typed_check`].
-    typed_check: Option<TypedCheck<'a>>,
-    still: Option<Still>,
-    window_drag_line: bool,
 }
 
-/// How a still image of the canvas starts: its camera, the control with
-/// keyboard focus, the pointer, the pinned badge, and a drag in progress.
-/// See [`PatchCanvas::still`].
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Still {
-    /// The view. It replaces the framing the canvas does when it first
-    /// appears.
-    pub camera: Camera,
-    /// Module ID and widget index of the control with keyboard focus. It
-    /// draws as after a Tab press: with the focus ring and its value.
-    pub focus: Option<(u32, usize)>,
-    /// Where the pointer is, in world coordinates. What is under it draws
-    /// as hovered: the port ring, the cables and modulation lines in focus,
-    /// and, during a wiring drag, the loose cable end and the drop
-    /// highlight.
-    pub pointer: Option<Point>,
-    /// The output whose badge is pinned, as after a click on the badge.
-    pub pinned: Option<PortRef>,
-    /// A drag in progress.
-    pub drag: Option<StillDrag>,
-    /// Show hover text at once, as if the pointer or the keyboard focus had
-    /// rested for the hover delay. A drag shows none.
-    pub hover_text: bool,
-}
-
-/// A drag that a still image shows in progress. See [`Still::drag`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StillDrag {
-    /// A cable being dragged from a port. Its loose end is at the pointer,
-    /// or on the port under it.
-    Wire {
-        /// The port the cable starts at.
-        from: PortRef,
-        /// True when the cable was pulled off an input: `from` is the
-        /// output it came from, and the scene no longer has the cable. A
-        /// drop on a control then assigns nothing, so no control is
-        /// highlighted.
-        pulled: bool,
-    },
-    /// The range arc of this knob being dragged: module ID and widget
-    /// index. The canvas draws no mark for it. The app shows the arc of
-    /// the assignment being changed through [`PanelValues`].
-    Depth(u32, usize),
-}
-
-/// Where the canvas is in the window and how it looks at the world. The
-/// canvas reports it to widget operations as custom state, so an operation
-/// can turn a world point (a port, a control) into window coordinates, for
-/// example to send pointer events in a headless test.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CanvasView {
-    /// The canvas bounds in the window.
-    pub bounds: Rect,
-    /// The current camera.
-    pub camera: Camera,
-}
-
-/// What the pointer is on and what it does, as the canvas sees it. The
-/// canvas reports it to widget operations as custom state, next to
-/// [`CanvasView`], so the app can show it in its UI snapshot.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanvasPointer {
-    /// What is under the pointer, while it is over the canvas.
-    pub hover: Option<Hit>,
-    /// The output whose badge is pinned, while its badge shows.
-    pub pinned: Option<PortRef>,
-    /// The drag in progress, if any.
-    pub drag: Option<PointerDrag>,
-}
-
-/// The text field the canvas draws for a typed value, while one is open. The
-/// canvas reports it to widget operations as custom state, as it does
-/// [`CanvasPointer`], so a script can see it. The app works out the reason for
-/// bad text itself, so it cannot differ from what the field shows.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanvasTyped {
-    /// The module the field is over.
-    pub module: u32,
-    /// The widget the field is over, as an index into the panel.
-    pub widget: usize,
-    /// The text in the field.
-    pub text: String,
-}
-
-/// A drag in progress on the canvas. See [`CanvasPointer::drag`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum PointerDrag {
-    /// The view is panned.
-    Pan,
-    /// Tiles are moved.
-    Move(Vec<u32>),
-    /// A growable tile is being resized.
-    Resize(u32),
-    /// A knob or a fader is dragged: module ID and widget index.
-    Knob(u32, usize),
-    /// A button is held: module ID and widget index.
-    Button(u32, usize),
-    /// A cable is pulled from a port.
-    Wire {
-        /// The port the cable starts at.
-        from: PortRef,
-        /// True when the cable was pulled off an input.
-        pulled: bool,
-    },
-    /// A knob's range arc or a fader's bar is dragged: module ID and widget
-    /// index.
-    Depth(u32, usize),
-    /// A selection box is drawn.
-    Select,
-}
-
-impl PointerDrag {
-    /// The drag an interaction is, or `None` when idle.
-    fn of(interaction: &Interaction) -> Option<Self> {
-        Some(match interaction {
-            Interaction::Idle => return None,
-            Interaction::Panning { .. } => Self::Pan,
-            Interaction::Moving { ids, .. } => Self::Move(ids.clone()),
-            Interaction::Resizing { module, .. } => Self::Resize(*module),
-            Interaction::Turning { module, widget, .. }
-            | Interaction::Pad { module, widget, .. }
-            | Interaction::Range { module, widget, .. } => Self::Knob(*module, *widget),
-            Interaction::Holding { module, widget } => Self::Button(*module, *widget),
-            Interaction::Wiring { from, pulled } => Self::Wire {
-                from: *from,
-                pulled: *pulled,
-            },
-            Interaction::Depth { module, widget, .. } => Self::Depth(*module, *widget),
-            Interaction::Selecting { .. } => Self::Select,
-        })
-    }
-}
-
-impl CanvasView {
-    /// A world point in window coordinates.
-    pub fn to_window(&self, world: Point) -> Point {
-        let s = self.camera.to_screen(world);
-        Point::new(self.bounds.x + s.x, self.bounds.y + s.y)
-    }
+/// What the widget keeps between frames: the canvas's input state, and the
+/// drawing data built from the scene, rebuilt only when the scene changes
+/// (ADR-0010).
+#[derive(Default)]
+struct State {
+    input: CanvasInput,
+    geometry: RefCell<Option<Arc<Geometry>>>,
+    controls: RefCell<Option<Arc<ControlGeometry>>>,
+    traces: RefCell<Option<Arc<TraceGeometry>>>,
+    lines: LinesCache,
 }
 
 impl<'a, Message> PatchCanvas<'a, Message> {
     /// Creates a canvas for a scene and the current selection.
     pub fn new(scene: &'a Scene, selection: &'a BTreeSet<u32>, on_event: impl Fn(CanvasEvent) -> Message + 'a) -> Self {
         Self {
-            scene,
-            selection,
-            values: None,
-            traces: None,
-            activity: Vec::new(),
-            palette: Palette::default(),
+            model: CanvasModel::new(scene, selection),
             on_event: Box::new(on_event),
-            frame_key: 0,
-            browser_key: 0,
-            level_key: 0,
-            level_camera: None,
-            animate: false,
-            learn: None,
-            matrix_line: None,
-            focus_policy: CanvasFocusPolicy::default(),
-            arrow_group: ArrowGroupView::Closed,
-            typed_check: None,
-            still: None,
-            window_drag_line: false,
         }
     }
 
-    /// Starts the canvas with this camera and focus instead of framing the
-    /// scene, so one drawn frame shows a chosen state. For saving the
-    /// canvas as an image without a window (`loom-app --screenshot`).
-    /// Only the first appearance uses it: later frames keep the state as
-    /// usual.
+    /// Starts the canvas with this camera and focus, for one still image.
+    /// See [`CanvasModel::still`].
     pub fn still(mut self, still: Still) -> Self {
-        self.still = Some(still);
+        self.model = self.model.still(still);
         self
     }
 
     /// Turns on MIDI learn mode, with what it shows.
+    /// See [`CanvasModel::learn`].
     pub fn learn(mut self, learn: Option<&'a LearnView>) -> Self {
-        self.learn = learn;
+        self.model = self.model.learn(learn);
         self
     }
 
     /// Shows one matrix-selected assignment line without pinning its source.
+    /// See [`CanvasModel::matrix_line`].
     pub fn matrix_line(mut self, line: Option<crate::scene::ModulationView>) -> Self {
-        self.matrix_line = line;
+        self.model = self.model.matrix_line(line);
         self
     }
 
-    /// Says who else in the window has the keyboard, so the canvas leaves
-    /// them alone (panels.md, Keyboard without a mouse). The app builds it
-    /// from who has the input.
+    /// Says who else in the window has the keyboard.
+    /// See [`CanvasModel::focus_policy`].
     pub fn focus_policy(mut self, policy: CanvasFocusPolicy) -> Self {
-        self.focus_policy = policy;
+        self.model = self.model.focus_policy(policy);
         self
     }
 
     /// Says where the app's arrow-key undo group is (`docs/design/undo.md`).
-    /// The app owns the group; the canvas only reads it, to know when an
-    /// arrow press or another key matters, and to wake for its deadline.
+    /// See [`CanvasModel::arrow_group`].
     pub fn arrow_group(mut self, group: ArrowGroupView) -> Self {
-        self.arrow_group = group;
-        self
-    }
-
-    /// Sets the check for typed values: given a module, a widget, and the
-    /// text, why it is not a value. The field shows the reason and Enter does
-    /// nothing (panel-widgets.md, Typing a value). Only the app knows the
-    /// parameter, so the canvas asks.
-    pub fn typed_check(mut self, check: impl Fn(u32, usize, &str) -> Result<(), String> + 'a) -> Self {
-        self.typed_check = Some(Box::new(check));
+        self.model = self.model.arrow_group(group);
         self
     }
 
     /// Sets the live values of panel controls and lights.
+    /// See [`CanvasModel::values`].
     pub fn values(mut self, values: &'a PanelValues) -> Self {
-        self.values = Some(values);
+        self.model = self.model.values(values);
         self
     }
 
     /// The app draws output drags in its window layer, including the canvas.
+    /// See [`CanvasModel::window_drag_line`].
     pub fn window_drag_line(mut self, enabled: bool) -> Self {
-        self.window_drag_line = enabled;
+        self.model = self.model.window_drag_line(enabled);
         self
     }
 
-    /// Sets the scope traces (`docs/design/panels.md`, Drawing the scope
-    /// trace). They have their own GPU buffer: a new trace uploads only it.
+    /// Sets the scope traces.
+    /// See [`CanvasModel::traces`].
     pub fn traces(mut self, traces: &'a ScopeTraces) -> Self {
-        self.traces = Some(traces);
-        self
-    }
-
-    /// Sets live port activity without changing the scene's GPU geometry.
-    pub fn activity(mut self, outputs: impl IntoIterator<Item = (u32, usize)>) -> Self {
-        self.activity = outputs.into_iter().collect();
+        self.model = self.model.traces(traces);
         self
     }
 
     /// Sets the colours.
+    /// See [`CanvasModel::palette`].
     pub fn palette(mut self, palette: Palette) -> Self {
-        self.palette = palette;
+        self.model = self.model.palette(palette);
         self
     }
 
-    /// The canvas frames the whole scene when it first appears and whenever
-    /// this key changes (for example after loading a patch).
+    /// Frames the whole scene whenever this key changes.
+    /// See [`CanvasModel::frame_key`].
     pub fn frame_key(mut self, key: u64) -> Self {
-        self.frame_key = key;
+        self.model = self.model.frame_key(key);
         self
     }
 
-    /// Says which level of a nested patch the scene shows, and the camera
-    /// that level had when it was last shown, if any. When the key changes,
-    /// the canvas adopts that camera, or frames the scene when there is
-    /// none (a first visit), and reports [`CanvasEvent::Camera`]. A
-    /// [`frame_key`](Self::frame_key) change still frames the scene, and
-    /// wins over a camera given here. The default key 0 never changes, so
-    /// a caller that shows one level needs nothing.
+    /// Says which level of a nested patch the scene shows, and its camera.
+    /// See [`CanvasModel::level`].
     pub fn level(mut self, key: u64, camera: Option<Camera>) -> Self {
-        self.level_key = key;
-        self.level_camera = camera;
+        self.model = self.model.level(key, camera);
         self
     }
 
-    /// The canvas sends [`CanvasEvent::OpenBrowser`] at the centre of the
-    /// view whenever this key changes, but not when it first appears. The
-    /// app uses it for a toolbar button, because only the canvas knows its
-    /// camera.
+    /// Opens the module browser at the centre whenever this key changes.
+    /// See [`CanvasModel::browser_key`].
     pub fn browser_key(mut self, key: u64) -> Self {
-        self.browser_key = key;
+        self.model = self.model.browser_key(key);
         self
     }
 
-    /// Moves the camera continuously in a slow loop. For measuring frame
-    /// rate while panning and zooming (ADR-0010 performance gates).
+    /// Moves the camera continuously in a slow loop, for measuring.
+    /// See [`CanvasModel::animate`].
     pub fn animate(mut self, animate: bool) -> Self {
-        self.animate = animate;
+        self.model = self.model.animate(animate);
         self
     }
 
-    /// True if dropping `from` on this control makes an assignment: an
-    /// output, a control that takes modulation, and not in MIDI learn mode,
-    /// where touching a control arms it instead.
-    fn takes_assignment(&self, from: PortRef, module: u32, widget: usize) -> bool {
-        from.output
-            && self.learn.is_none()
-            && self
-                .scene
-                .module(module)
-                .and_then(|m| m.panel.widgets.get(widget))
-                .is_some_and(WidgetView::accepts_modulation)
+    /// Sets the check for typed values.
+    /// See [`CanvasModel::typed_check`].
+    pub fn typed_check(mut self, check: impl Fn(u32, usize, &str) -> Result<(), String> + 'a) -> Self {
+        self.model = self.model.typed_check(check);
+        self
     }
 
-    /// Reports an output drag in window coordinates for the inspector layer.
-    fn assign_drag(
-        &self,
-        from: PortRef,
-        at: Option<Point>,
-        camera: Camera,
-        bounds: Rect,
-        shell: &mut Shell<'_, Message>,
-    ) {
-        if let Some(world) = self.scene.port_position(from) {
-            let screen = camera.to_screen(world);
-            self.emit(
-                shell,
-                CanvasEvent::AssignDrag {
-                    from,
-                    start: Point::new(bounds.x + screen.x, bounds.y + screen.y),
-                    at,
-                    zoom: camera.zoom,
-                },
-            );
+    /// Sets live port activity without changing the scene's GPU geometry.
+    /// See [`CanvasModel::activity`].
+    pub fn activity(mut self, outputs: impl IntoIterator<Item = (u32, usize)>) -> Self {
+        self.model = self.model.activity(outputs);
+        self
+    }
+
+    /// Hands a reaction to Iced: the events as messages, the input as
+    /// captured, and the redraw as a request for the next frame.
+    fn apply(&self, reaction: Reaction, shell: &mut Shell<'_, Message>) {
+        for event in reaction.events {
+            shell.publish((self.on_event)(event));
+        }
+        if reaction.taken {
+            shell.capture_event();
+        }
+        if reaction.redraw {
+            shell.request_redraw();
         }
     }
 
-    /// Everything one event does: what it means, the hover text, and the
-    /// wake-up for the arrow group's deadline.
-    fn on_event(
-        &self,
-        state: &mut State,
-        event: &Event,
-        bounds: Rect,
-        cursor: mouse::Cursor,
-        shell: &mut Shell<'_, Message>,
-    ) {
-        self.handle(state, event, bounds, cursor, shell);
-        self.sync_hover_text(state, event, shell);
-        // Asked again on every event, because a later request for the next
-        // frame replaces a pending one for a time, and the group would then
-        // stay open on an idle patch.
-        if let ArrowGroupView::Released { due } = self.arrow_group {
-            shell.request_redraw_at(due);
-        }
-    }
-
-    fn emit(&self, shell: &mut Shell<'_, Message>, event: CanvasEvent) {
-        shell.publish((self.on_event)(event));
-    }
-
-    /// Starts a gesture and sets the interaction that lasts through it.
-    fn begin(&self, state: &mut State, interaction: Interaction, shell: &mut Shell<'_, Message>) {
-        self.emit(shell, CanvasEvent::GestureStart);
-        state.interaction = interaction;
-    }
-
-    /// Ends the gesture of the current interaction, if it has one. Used when
-    /// the interaction is replaced or cut off, so a start always has an end.
-    /// The arrow group ends separately, with [`PatchCanvas::end_arrow_group`].
-    fn end_gestures(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
-        if matches!(
-            state.interaction,
-            Interaction::Wiring {
-                from: PortRef { output: true, .. },
-                pulled: false
-            }
-        ) {
-            self.emit(shell, CanvasEvent::AssignCancel);
-        }
-        if matches!(
-            state.interaction,
-            Interaction::Moving { .. }
-                | Interaction::Resizing { .. }
-                | Interaction::Turning { .. }
-                | Interaction::Pad { .. }
-                | Interaction::Range { .. }
-                | Interaction::Wiring { .. }
-                | Interaction::Depth { .. }
-        ) {
-            state.interaction = Interaction::Idle;
-            self.emit(shell, CanvasEvent::GestureEnd);
-        }
-    }
-
-    /// Ends the arrow group. With `always` false, only when this view shows
-    /// one open, so the paths that run on every key or redraw stay quiet.
-    /// The app ignores an end with no group open, so sending one too many is
-    /// safe; with `always` true it is sent where no key-up or timer would
-    /// follow to close a group the view does not show yet.
-    fn end_arrow_group(&self, shell: &mut Shell<'_, Message>, always: bool) {
-        if always || self.arrow_group != ArrowGroupView::Closed {
-            self.emit(shell, CanvasEvent::ArrowGroupEnd);
-        }
-    }
-
-    /// Reports an arrow key about to edit.
-    fn arrow_step(&self, shell: &mut Shell<'_, Message>) {
-        self.emit(shell, CanvasEvent::ArrowStep { at: Instant::now() });
-    }
-}
-
-/// The app's arrow-key undo group, as the canvas sees it in one view
-/// (`docs/design/undo.md`). The app owns the group and its history step.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ArrowGroupView {
-    /// No arrow group is open.
-    #[default]
-    Closed,
-    /// An arrow key is down, and its edits are one step.
-    Held,
-    /// The last arrow key came up. Another arrow press before `due` joins
-    /// the same step.
-    Released {
-        /// When the group ends if no arrow comes.
-        due: Instant,
-    },
-}
-
-/// Who else in the window has the keyboard, so the canvas knows which
-/// keys and presses are its own. The app builds it from who has the input,
-/// once per view.
-///
-/// It is a set of flags rather than one enum because they combine: the
-/// matrix's depth field is a text field inside the matrix, so
-/// `matrix_keyboard` and `text_field_keys` are both true while it has focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanvasFocusPolicy {
-    /// False while a pop-up such as the module browser has the input. The
-    /// canvas then ignores the keyboard and the pointer, and lets go of any
-    /// hold or drag.
-    pub interactive: bool,
-    /// The focused matrix has the keys: unmodified keys are left to it, and
-    /// the pointer still works.
-    pub matrix_keyboard: bool,
-    /// The matrix has the keys and no cell editor is open, so Escape can
-    /// still hide a pinned badge's lines.
-    pub matrix_escape: bool,
-    /// An app text field has focus. The canvas then leaves every key to it
-    /// except Tab, which moves focus as usual. The pointer still works
-    /// (panel-widgets.md, Typing a value).
-    pub text_field_keys: bool,
-    /// The focused text field moves to the next field on Tab, so the canvas
-    /// leaves Tab alone too (panels.md, Keyboard without a mouse).
-    pub text_field_keeps_tab: bool,
-}
-
-impl Default for CanvasFocusPolicy {
-    /// The canvas has the keys and the pointer.
-    fn default() -> Self {
-        Self {
-            interactive: true,
-            matrix_keyboard: false,
-            matrix_escape: false,
-            text_field_keys: false,
-            text_field_keeps_tab: false,
-        }
-    }
-}
-
-/// What the modulation lines depend on: the scene (assignments and module
-/// positions), the pin, what the pointer is on, and the selection.
-#[derive(Debug, Clone, PartialEq)]
-struct LinesKey {
-    scene: u64,
-    overlay: u64,
-    pinned: Option<PortRef>,
-    hover: Option<Hit>,
-    selection: Vec<u32>,
-    matrix_line: Option<crate::scene::ModulationView>,
-}
-
-#[derive(Debug, Clone, Default)]
-enum Interaction {
-    #[default]
-    Idle,
-    Panning {
-        last: Point,
-        /// Where a right press began, on screen, until the pointer moves
-        /// away from it. A release while it is set is a click, which may
-        /// open the probe menu.
-        click: Option<Point>,
-        /// The view at the press. The release reports the view only when
-        /// it differs, so a click or a drag back to the start says nothing.
-        start: Camera,
-    },
-    Moving {
-        ids: Vec<u32>,
-        start: Point,
-        applied: Vector,
-        /// A choice press: applied on release if the tile did not move,
-        /// so dragging a closed choice control moves the tile.
-        click: Option<ChoiceClick>,
-    },
-    /// A resize preview, committed only when the pointer is released.
-    Resizing {
-        module: u32,
-        start: Point,
-        original: Size,
-        current: Size,
-        minimum: Size,
-    },
-    Turning {
-        module: u32,
-        widget: usize,
-        /// How pointer movement changes the value.
-        drag: ValueDrag,
-        /// Where the pointer was along the drag at the last move.
-        last: f32,
-        position: f32,
-    },
-    /// A button is held. Pointer up reports a release, wherever the pointer
-    /// is, so a release always follows the press. The tile does not move.
-    /// The app decides whether that release changes a parameter.
-    Holding { module: u32, widget: usize },
-    Wiring {
-        from: PortRef,
-        /// True when the drag began by pulling a cable off an input. Then a
-        /// drop on a control assigns nothing: the user is discarding the
-        /// cable (modulation.md, Making an assignment).
-        pulled: bool,
-    },
-    /// Dragging the point of an XY pad.
-    Pad {
-        module: u32,
-        widget: usize,
-        /// Screen pixels for the full range.
-        throw: f32,
-        /// Where the pointer was at the last move.
-        last: Point,
-        /// The positions last sent.
-        position: (f32, f32),
-    },
-    /// Dragging a range's handle or band.
-    Range {
-        module: u32,
-        widget: usize,
-        /// What the press took.
-        grab: RangeGrab,
-        /// How pointer movement changes the position.
-        drag: ValueDrag,
-        /// Where the pointer was along the drag at the last move.
-        last: f32,
-        /// The positions last sent.
-        position: (f32, f32),
-    },
-    /// Dragging a knob's range arc or a fader's bar: its depth, not its value.
-    Depth {
-        module: u32,
-        widget: usize,
-        /// Which of the control's values the depth belongs to.
-        part: ControlPart,
-        /// How pointer movement changes the depth.
-        drag: ValueDrag,
-        /// Where the pointer was along the drag at the last move.
-        last: f32,
-    },
-    Selecting {
-        start: Point,
-        current: Point,
-        base: BTreeSet<u32>,
-    },
-}
-
-/// The cursor that says which way a value drag goes.
-fn drag_cursor(drag: &ValueDrag) -> mouse::Interaction {
-    if drag.is_horizontal() {
-        mouse::Interaction::ResizingHorizontally
-    } else {
-        mouse::Interaction::ResizingVertically
-    }
-}
-
-impl Interaction {
-    /// The cursor during this gesture, or `None` with no gesture. A value drag
-    /// shows its own direction, so a horizontal fader keeps the cursor it had
-    /// on hover.
-    fn cursor(&self) -> Option<mouse::Interaction> {
-        Some(match self {
-            Self::Panning { .. } | Self::Moving { .. } => mouse::Interaction::Grabbing,
-            Self::Resizing { .. } => mouse::Interaction::ResizingDiagonallyDown,
-            Self::Turning { drag, .. } | Self::Depth { drag, .. } | Self::Range { drag, .. } => drag_cursor(drag),
-            Self::Holding { .. } => mouse::Interaction::Pointer,
-            Self::Pad { .. } | Self::Wiring { .. } | Self::Selecting { .. } => mouse::Interaction::Crosshair,
-            Self::Idle => return None,
-        })
-    }
-}
-
-/// What a stationary click on a choice control does.
-#[derive(Debug, Clone)]
-enum ChoiceClick {
-    Set(u32, usize, f32),
-    Open(u32, usize),
-    /// A press on a meter's clip light, which clears it on release.
-    ClearClip(u32, usize),
-}
-
-/// The choice list that is open above the canvas, for the focused control.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SelectPopup {
-    highlight: usize,
-    /// The first row that shows, for a list longer than it can show.
-    scroll: usize,
-    /// Wheel movement that has not yet made a whole row.
-    wheel: f32,
-}
-
-#[derive(Default)]
-struct State {
-    camera: Camera,
-    /// The canvas size at the last event, for key handling that needs it.
-    size: Size,
-    framed_key: Option<u64>,
-    /// The level key last shown, so a change is seen on the next redraw.
-    level_key: Option<u64>,
-    interaction: Interaction,
-    /// A release after CursorLeft cannot target the inspector until the
-    /// window reports CursorEntered again.
-    outside_window: bool,
-    hover: Option<Hit>,
-    /// Cursor in world coordinates, while over the canvas or dragging.
-    cursor: Option<Point>,
-    modifiers: keyboard::Modifiers,
-    geometry: RefCell<Option<Arc<Geometry>>>,
-    controls: RefCell<Option<Arc<ControlGeometry>>>,
-    traces: RefCell<Option<Arc<TraceGeometry>>>,
-    /// Whether scopes were last reported as drawing full traces.
-    reported_full_traces: Option<bool>,
-    animation: Option<(Instant, Camera)>,
-    /// The control with keyboard focus, and what the keys do on it.
-    focus: focus::FocusState,
-    /// True from a Tab press until the pointer moves: the focused control's
-    /// hover text wins over the port or control under a resting pointer. It
-    /// is not part of [`focus::FocusState`], because it outlives a control:
-    /// Tab off a module and then Enter keep it.
-    focus_first: bool,
-    /// The output whose modulation lines stay on screen: its badge was
-    /// clicked (`docs/design/modulation.md`, Lines).
-    pinned: Option<PortRef>,
-    /// The modulation lines and outlines last built, and what they were
-    /// built from. They are rebuilt only when that changes, not every
-    /// frame (ADR-0010).
-    lines: RefCell<Option<(LinesKey, Overlay)>>,
-    /// When hover text shows (panels.md, Labels and hover text).
-    hover_text: HoverTimer,
-    /// The last press on a control, for double-click.
-    last_click: Option<(Instant, u32, usize, ControlPart)>,
-    /// The last press on empty canvas, in screen coordinates, for
-    /// double-click.
-    last_empty_click: Option<(Instant, Point)>,
-    /// The last press on a tile's header, for double-click: when, the
-    /// module, and where on screen.
-    last_header_click: Option<(Instant, u32, Point)>,
-    /// The last press on a meter with a clip light, for double-click: when,
-    /// the module, the widget, and where on screen.
-    last_meter_click: Option<(Instant, u32, usize, Point)>,
-    /// The browser key last seen.
-    browser_key: Option<u64>,
-    /// Buttons held from the keyboard, one slot for Space and one for Enter.
+    /// Asks Iced to wake the canvas at its next deadline, if it has one.
     ///
-    /// Each key is its own hold. Releasing one leaves a button high while the
-    /// other key is still down on it. Replacing a key's hold releases the
-    /// button that key was holding, when nothing else is holding it.
-    key_holds: [Option<KeyHold>; 2],
-    /// Modules with lights on screen, as last reported.
-    reported_lights: Option<Vec<u32>>,
-}
-
-impl State {
-    fn hit_radius(&self) -> f32 {
-        // At least 7 screen pixels, so ports stay easy to grab when zoomed
-        // out. At most a quarter of a tile's width, so the middle of a tile
-        // always grabs the tile, not a port.
-        PORT_HIT_RADIUS.max(7.0 / self.camera.zoom).min(TILE_WIDTH * 0.25)
+    /// Iced forgets a timed request when a later one asks for the next
+    /// frame, so this runs after every Iced event, whether or not the event
+    /// means anything to the canvas. Without it, an arrow group could stay
+    /// open on an idle patch.
+    fn schedule(&self, input: &CanvasInput, shell: &mut Shell<'_, Message>) {
+        if let Some(deadline) = input.next_deadline(&self.model) {
+            shell.request_redraw_at(deadline);
+        }
     }
-}
-
-/// One key holding one button down.
-#[derive(Clone, Copy)]
-struct KeyHold {
-    key: keyboard::key::Named,
-    module: u32,
-    widget: usize,
-}
-
-/// True when a press at `screen` is the second click of a double-click
-/// after the `last` press.
-fn double_click(last: Option<(Instant, Point)>, screen: Point) -> bool {
-    last.is_some_and(|(at, point)| at.elapsed() < DOUBLE_CLICK && point.distance(screen) < DOUBLE_CLICK_SLOP)
-}
-
-fn relative(cursor: mouse::Cursor, bounds: Rect) -> Option<Point> {
-    cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for PatchCanvas<'_, Message>
@@ -811,11 +203,14 @@ where
     }
 
     fn state(&self) -> tree::State {
-        let state = match self.still {
-            Some(still) => self.still_state(still),
-            None => State::default(),
+        let input = match self.model.still {
+            Some(still) => CanvasInput::still(&self.model, still, Instant::now()),
+            None => CanvasInput::default(),
         };
-        tree::State::new(state)
+        tree::State::new(State {
+            input,
+            ..State::default()
+        })
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -829,7 +224,7 @@ where
     fn update(
         &mut self,
         tree: &mut Tree,
-        event: &Event,
+        event: &iced::Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
@@ -838,7 +233,25 @@ where
         _viewport: &iced::Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
-        self.on_event(state, event, layout.bounds().to_core(), cursor, shell);
+        // A redraw carries the time of its frame. Every other event
+        // happened now.
+        let now = match event {
+            iced::Event::Window(window::Event::RedrawRequested(at)) => *at,
+            _ => Instant::now(),
+        };
+        let moment = Moment {
+            pointer: cursor.position().map(|point| point.to_core()),
+            bounds: layout.bounds().to_core(),
+            now,
+        };
+        // An Iced event with no meaning to the canvas still passes through,
+        // so what runs on every event keeps running.
+        let reaction = match crate::iced_convert::event_to_core(event) {
+            Some(event) => state.input.handle(&self.model, &event, moment),
+            None => state.input.pass(&self.model, moment),
+        };
+        self.apply(reaction, shell);
+        self.schedule(&state.input, shell);
     }
 
     fn operate(
@@ -849,25 +262,13 @@ where
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
         let state = tree.state.downcast_ref::<State>();
-        let mut view = CanvasView {
-            bounds: layout.bounds().to_core(),
-            camera: state.camera,
-        };
+        let mut view = state.input.view(layout.bounds().to_core());
         operation.custom(None, layout.bounds(), &mut view);
         // What the pointer is on, for the control channel's snapshot.
-        let mut pointer = CanvasPointer {
-            hover: state.hover.filter(|hit| *hit != Hit::Nothing),
-            pinned: self.pin(state),
-            drag: PointerDrag::of(&state.interaction),
-        };
+        let mut pointer = state.input.pointer(&self.model);
         operation.custom(None, layout.bounds(), &mut pointer);
         // The open typed field, for the same snapshot.
-        if let (Some((module, widget)), Some(field)) = (state.focus.control(), state.focus.typed()) {
-            let mut typed = CanvasTyped {
-                module,
-                widget,
-                text: field.draft.text.clone(),
-            };
+        if let Some(mut typed) = state.input.typed() {
             operation.custom(None, layout.bounds(), &mut typed);
         }
     }
@@ -881,11 +282,10 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
-        match state.interaction.cursor() {
-            Some(gesture) => gesture,
-            None if cursor.is_over(layout.bounds()) => self.hover_interaction(state),
-            None => mouse::Interaction::default(),
-        }
+        state
+            .input
+            .cursor(&self.model, cursor.is_over(layout.bounds()))
+            .to_iced()
     }
 
     fn draw(
@@ -900,13 +300,16 @@ where
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds().to_core();
+        let model = &self.model;
+        let input = &state.input;
+        let camera = input.camera();
 
         let geometry = {
             let mut cache = state.geometry.borrow_mut();
             match cache.as_ref() {
-                Some(g) if g.generation == self.scene.generation() => g.clone(),
+                Some(g) if g.generation == model.scene.generation() => g.clone(),
                 _ => {
-                    let built = Arc::new(Geometry::build(self.scene, &self.palette));
+                    let built = Arc::new(Geometry::build(model.scene, &model.palette));
                     *cache = Some(built.clone());
                     built
                 }
@@ -916,14 +319,14 @@ where
         // Controls follow the titles: drawn as shapes once titles show, and
         // not at all when zoomed further out (panels.md, Level of detail).
         let empty = PanelValues::default();
-        let values = self.values.unwrap_or(&empty);
-        let controls = (detail(state.camera.zoom) != Detail::Far).then(|| {
-            let key = (self.scene.generation(), values.generation());
+        let values = model.values.unwrap_or(&empty);
+        let controls = (detail(camera.zoom) != Detail::Far).then(|| {
+            let key = (model.scene.generation(), values.generation());
             let mut cache = state.controls.borrow_mut();
             match cache.as_ref() {
                 Some(c) if c.key == key => c.clone(),
                 _ => {
-                    let built = Arc::new(ControlGeometry::build(self.scene, values, &self.palette));
+                    let built = Arc::new(ControlGeometry::build(model.scene, values, &model.palette));
                     *cache = Some(built.clone());
                     built
                 }
@@ -932,17 +335,17 @@ where
 
         // Scope traces: full close up, a flat line at the middle zoom, and
         // not drawn far out (panels.md, Drawing the scope trace).
-        let traces = self
+        let traces = model
             .traces
-            .filter(|_| detail(state.camera.zoom) != Detail::Far)
+            .filter(|_| detail(camera.zoom) != Detail::Far)
             .map(|traces| {
-                let full = detail(state.camera.zoom) == Detail::Close;
-                let key = (self.scene.generation(), traces.generation(), full);
+                let full = detail(camera.zoom) == Detail::Close;
+                let key = (model.scene.generation(), traces.generation(), full);
                 let mut cache = state.traces.borrow_mut();
                 match cache.as_ref() {
                     Some(t) if t.key == key => t.clone(),
                     _ => {
-                        let built = Arc::new(TraceGeometry::build(self.scene, traces, full, &self.palette));
+                        let built = Arc::new(TraceGeometry::build(model.scene, traces, full, &model.palette));
                         *cache = Some(built.clone());
                         built
                     }
@@ -950,20 +353,20 @@ where
             });
 
         // Text too small to draw leaves a bar in its place.
-        let bars = match detail(state.camera.zoom) {
+        let bars = match detail(camera.zoom) {
             Detail::Close => geometry.bars(false, false),
             Detail::Middle => geometry.bars(true, false),
             Detail::Far => geometry.bars(true, true),
         };
         // A box's text bar draws over the box, and only at middle zoom.
-        let value_bars = geometry.value_bars(detail(state.camera.zoom) == Detail::Middle);
+        let value_bars = geometry.value_bars(detail(camera.zoom) == Detail::Middle);
 
         renderer.fill_quad(
             renderer::Quad {
                 bounds: bounds.to_iced(),
                 ..renderer::Quad::default()
             },
-            self.palette.background.to_iced(),
+            model.palette.background.to_iced(),
         );
         renderer.draw_primitive(
             bounds.to_iced(),
@@ -971,68 +374,17 @@ where
                 geometry,
                 controls,
                 traces,
-                overlay: self.overlay_in(state, state.camera.visible(bounds.size())),
+                overlay: model.overlay_in(input, &state.lines, camera.visible(bounds.size())),
                 bars,
                 value_bars,
-                camera: state.camera,
+                camera,
                 cable_dim: CABLE_OPACITY,
             },
         );
-        self.draw_text(state, values, renderer, bounds);
-        self.draw_select_popup(state, renderer, bounds);
-        self.draw_typed_field(state, renderer, bounds);
-        self.draw_hover_text(state, renderer, bounds);
-    }
-}
-
-/// How much a zoom level shows (panels.md, Level of detail).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Detail {
-    /// Port labels and panel text.
-    Close,
-    /// Titles and control shapes, no other text.
-    Middle,
-    /// Plain tiles: no text, no controls.
-    Far,
-}
-
-fn detail(zoom: f32) -> Detail {
-    let quantise = |size: f32| (size * 2.0).round() / 2.0;
-    if quantise(LABEL_SIZE * zoom) >= LABEL_MIN_PX {
-        Detail::Close
-    } else if quantise(TITLE_SIZE * zoom) >= TITLE_MIN_PX {
-        Detail::Middle
-    } else {
-        Detail::Far
-    }
-}
-
-/// Modules with a light or meter on screen, at a zoom where they are drawn.
-fn visible_lights(scene: &Scene, camera: &Camera, size: Size) -> Vec<u32> {
-    if detail(camera.zoom) == Detail::Far {
-        return Vec::new();
-    }
-    let visible = camera.visible(size);
-    scene
-        .modules()
-        .iter()
-        .filter(|m| m.panel.widgets.iter().any(|w| !w.is_control()) && m.bounds().intersects(visible))
-        .map(|m| m.id)
-        .collect()
-}
-
-/// A slow figure-eight pan with a zoom swing, around the starting view.
-fn animated(base: Camera, size: Size, t: f32) -> Camera {
-    let centre = base.to_world(Point::new(size.width * 0.5, size.height * 0.5));
-    let zoom = (base.zoom * (1.0 + 0.4 * (t * 0.45).sin())).clamp(crate::camera::MIN_ZOOM, crate::camera::MAX_ZOOM);
-    let reach = 0.25 * size.width / base.zoom;
-    let target = Point::new(
-        centre.x + reach * (t * 0.31).sin(),
-        centre.y + 0.5 * reach * (t * 0.62).sin(),
-    );
-    Camera {
-        origin: Point::new(target.x - size.width * 0.5 / zoom, target.y - size.height * 0.5 / zoom),
-        zoom,
+        model.draw_text(input, values, renderer, bounds);
+        model.draw_select_popup(input, renderer, bounds);
+        model.draw_typed_field(input, renderer, bounds);
+        model.draw_hover_text(input, renderer, bounds);
     }
 }
 

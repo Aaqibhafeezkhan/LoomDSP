@@ -31,25 +31,30 @@ pub(super) fn focusable(panel: &crate::scene::PanelView) -> Vec<usize> {
 }
 
 /// True for the four arrow keys.
-pub(super) fn is_arrow(key: &keyboard::Key) -> bool {
-    use keyboard::key::Named;
-    matches!(
-        key.as_ref(),
-        keyboard::Key::Named(Named::ArrowUp | Named::ArrowRight | Named::ArrowDown | Named::ArrowLeft)
-    )
+pub(super) fn is_arrow(key: &Key) -> bool {
+    matches!(*key, Key::Up | Key::Right | Key::Down | Key::Left)
 }
 
 /// True for a modifier key pressed on its own, which the window reports as
 /// a key press too.
-fn is_modifier(key: &keyboard::Key) -> bool {
-    use keyboard::key::Named;
-    matches!(
-        key.as_ref(),
-        keyboard::Key::Named(Named::Shift | Named::Control | Named::Alt | Named::AltGraph | Named::Meta | Named::Super)
-    )
+fn is_modifier(key: &Key) -> bool {
+    matches!(*key, Key::Modifier)
 }
 
-impl<Message> PatchCanvas<'_, Message> {
+/// One key press, as the key handlers take it.
+#[derive(Clone, Copy)]
+pub(super) struct KeyPress<'a> {
+    /// Which key went down.
+    pub(super) key: &'a Key,
+    /// The modifier keys held.
+    pub(super) modifiers: Modifiers,
+    /// The text the press types, if any.
+    pub(super) text: Option<&'a str>,
+    /// True when the system repeats a held key.
+    pub(super) repeat: bool,
+}
+
+impl CanvasModel<'_> {
     pub(super) fn is_control(&self, module: u32, widget: usize) -> bool {
         self.scene
             .module(module)
@@ -57,7 +62,7 @@ impl<Message> PatchCanvas<'_, Message> {
             .is_some_and(|w| w.is_control())
     }
 
-    pub(super) fn widget_kind(&self, module: u32, widget: usize) -> Option<&WidgetViewKind> {
+    pub(crate) fn widget_kind(&self, module: u32, widget: usize) -> Option<&WidgetViewKind> {
         Some(&self.scene.module(module)?.panel.widgets.get(widget)?.kind)
     }
 
@@ -143,13 +148,13 @@ impl<Message> PatchCanvas<'_, Message> {
     /// Learn mode has its own keys, and Tab always leaves.
     fn range_keys(
         &self,
-        state: &mut State,
-        key: &keyboard::Key,
-        modifiers: keyboard::Modifiers,
+        state: &mut CanvasInput,
+        key: &Key,
+        modifiers: Modifiers,
         repeat: bool,
-        shell: &mut Shell<'_, Message>,
+        now: Instant,
+        out: &mut Reaction,
     ) -> bool {
-        use keyboard::key::Named;
         let Some((module, widget)) = state.focus.control() else {
             return false;
         };
@@ -162,44 +167,42 @@ impl<Message> PatchCanvas<'_, Message> {
             state.focus.set_range_part(None);
             return false;
         }
-        let keyboard::Key::Named(named) = key.as_ref() else {
-            return false;
-        };
+        let named = *key;
         let low = self.part_position(module, widget, ControlPart::Main);
         let high = self.part_position(module, widget, ControlPart::Second);
         match (named, state.focus.range_part()) {
-            (Named::Tab, _) => {
+            (Key::Tab, _) => {
                 state.focus.set_range_part(None);
                 false
             }
-            (Named::Enter, None) => {
+            (Key::Enter, None) => {
                 if !repeat {
                     state.focus.set_range_part(Some(RangePart { part: 0, grab: None }));
                 }
                 true
             }
             // Space on the widget itself does what it does on a knob.
-            (Named::Space | Named::Escape, None) => false,
-            (Named::ArrowUp | Named::ArrowDown | Named::ArrowLeft | Named::ArrowRight, None) => true,
-            (Named::Escape, Some(inside)) if inside.grab.is_some() => {
+            (Key::Space | Key::Escape, None) => false,
+            (Key::Up | Key::Down | Key::Left | Key::Right, None) => true,
+            (Key::Escape, Some(inside)) if inside.grab.is_some() => {
                 state.focus.set_range_part(Some(RangePart { grab: None, ..inside }));
                 true
             }
             // Pinned lines hide first; the next Escape leaves (modulation.md,
             // Lines).
-            (Named::Escape, Some(_)) if self.pin(state).is_some() => false,
-            (Named::Escape, Some(_)) => {
+            (Key::Escape, Some(_)) if self.pin(state).is_some() => false,
+            (Key::Escape, Some(_)) => {
                 state.focus.set_range_part(None);
                 true
             }
-            (Named::Enter, Some(inside)) if inside.grab.is_some() => {
+            (Key::Enter, Some(inside)) if inside.grab.is_some() => {
                 if !repeat {
                     state.focus.set_range_part(Some(RangePart { grab: None, ..inside }));
                 }
                 true
             }
-            (Named::Space, Some(inside)) if inside.grab.is_some() => true,
-            (Named::Space | Named::Enter, Some(inside)) => {
+            (Key::Space, Some(inside)) if inside.grab.is_some() => true,
+            (Key::Space | Key::Enter, Some(inside)) => {
                 if !repeat {
                     let grab = match inside.part {
                         0 => RangeGrab::handle(ControlPart::Main, low, high),
@@ -213,16 +216,16 @@ impl<Message> PatchCanvas<'_, Message> {
                 }
                 true
             }
-            (Named::ArrowUp | Named::ArrowDown | Named::ArrowLeft | Named::ArrowRight, Some(inside)) => {
+            (Key::Up | Key::Down | Key::Left | Key::Right, Some(inside)) => {
                 let along = if vertical {
-                    matches!(named, Named::ArrowUp | Named::ArrowDown)
+                    matches!(named, Key::Up | Key::Down)
                 } else {
-                    matches!(named, Named::ArrowLeft | Named::ArrowRight)
+                    matches!(named, Key::Left | Key::Right)
                 };
                 if !along {
                     return true;
                 }
-                let up = matches!(named, Named::ArrowUp | Named::ArrowRight);
+                let up = matches!(named, Key::Up | Key::Right);
                 let Some(grab) = inside.grab else {
                     let part = if up {
                         inside.part.saturating_add(1).min(2)
@@ -232,10 +235,10 @@ impl<Message> PatchCanvas<'_, Message> {
                     state.focus.set_range_part(Some(RangePart { part, ..inside }));
                     return true;
                 };
-                let step = if modifiers.shift() { 0.001 } else { 0.01 };
+                let step = if modifiers.shift { 0.001 } else { 0.01 };
                 let (_, next_low, next_high) = grab.moved(low, high, if up { step } else { -step });
-                self.arrow_step(shell);
-                self.set_pad(shell, module, widget, (low, high), (next_low, next_high));
+                self.arrow_step(now, out);
+                self.set_pad(out, module, widget, (low, high), (next_low, next_high));
                 true
             }
             _ => false,
@@ -243,24 +246,17 @@ impl<Message> PatchCanvas<'_, Message> {
     }
 
     /// Sends the values of an XY pad that changed.
-    pub(super) fn set_pad(
-        &self,
-        shell: &mut Shell<'_, Message>,
-        module: u32,
-        widget: usize,
-        before: (f32, f32),
-        next: (f32, f32),
-    ) {
+    pub(super) fn set_pad(&self, out: &mut Reaction, module: u32, widget: usize, before: (f32, f32), next: (f32, f32)) {
         if next.0 != before.0 {
-            self.set_part(shell, module, widget, ControlPart::Main, next.0);
+            self.set_part(out, module, widget, ControlPart::Main, next.0);
         }
         if next.1 != before.1 {
-            self.set_part(shell, module, widget, ControlPart::Second, next.1);
+            self.set_part(out, module, widget, ControlPart::Second, next.1);
         }
     }
 
     /// The position of one value of a control.
-    pub(super) fn part_position(&self, module: u32, widget: usize, part: ControlPart) -> f32 {
+    pub(crate) fn part_position(&self, module: u32, widget: usize, part: ControlPart) -> f32 {
         self.values.map_or(0.0, |v| v.part_position(module, widget, part))
     }
 
@@ -305,12 +301,12 @@ impl<Message> PatchCanvas<'_, Message> {
         .then_some(part)
     }
 
-    pub(super) fn position(&self, module: u32, widget: usize) -> f32 {
+    pub(crate) fn position(&self, module: u32, widget: usize) -> f32 {
         self.values.map_or(0.0, |v| v.position(module, widget))
     }
 
     /// True when Space or Enter is still holding this button.
-    pub(super) fn key_holds_button(state: &State, module: u32, widget: usize) -> bool {
+    pub(super) fn key_holds_button(state: &CanvasInput, module: u32, widget: usize) -> bool {
         state
             .key_holds
             .iter()
@@ -319,7 +315,7 @@ impl<Message> PatchCanvas<'_, Message> {
     }
 
     /// True when the pointer is still down on this button.
-    pub(super) fn pointer_holds_button(state: &State, module: u32, widget: usize) -> bool {
+    pub(super) fn pointer_holds_button(state: &CanvasInput, module: u32, widget: usize) -> bool {
         matches!(
             state.interaction,
             Interaction::Holding {
@@ -331,27 +327,26 @@ impl<Message> PatchCanvas<'_, Message> {
 
     /// Ends a pointer hold, if there is one. The release is reported only
     /// when no key is still holding that button.
-    pub(super) fn release_pointer_hold(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
+    pub(super) fn release_pointer_hold(&self, state: &mut CanvasInput, out: &mut Reaction) {
         if let Interaction::Holding { module, widget } = state.interaction {
             state.interaction = Interaction::Idle;
             if !Self::key_holds_button(state, module, widget) {
-                self.emit(shell, CanvasEvent::ButtonReleased { module, widget });
+                self.emit(out, CanvasEvent::ButtonReleased { module, widget });
             }
         }
     }
 
     /// Ends what keys are doing on the canvas, because something else now
     /// takes them: no button stays held, and an arrow-key edit closes.
-    pub(super) fn leave_keys(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
-        self.release_every_key_hold(state, shell);
-        self.end_arrow_group(shell, false);
+    pub(super) fn leave_keys(&self, state: &mut CanvasInput, out: &mut Reaction) {
+        self.release_every_key_hold(state, out);
+        self.end_arrow_group(out, false);
     }
 
     /// Space or Enter, the keys that hold a button.
-    pub(super) fn button_key(key: &keyboard::Key) -> Option<keyboard::key::Named> {
-        use keyboard::key::Named;
-        match key.as_ref() {
-            keyboard::Key::Named(named @ (Named::Space | Named::Enter)) => Some(named),
+    pub(super) fn button_key(key: &Key) -> Option<Key> {
+        match *key {
+            named @ (Key::Space | Key::Enter) => Some(named),
             _ => None,
         }
     }
@@ -360,11 +355,11 @@ impl<Message> PatchCanvas<'_, Message> {
     /// nothing else is, that button is released first.
     pub(super) fn press_button_key(
         &self,
-        state: &mut State,
-        key: keyboard::key::Named,
+        state: &mut CanvasInput,
+        key: Key,
         module: u32,
         widget: usize,
-        shell: &mut Shell<'_, Message>,
+        out: &mut Reaction,
     ) {
         let same = state
             .key_holds
@@ -374,20 +369,15 @@ impl<Message> PatchCanvas<'_, Message> {
         if same {
             return;
         }
-        self.release_button_key(state, key, shell);
-        self.emit(shell, CanvasEvent::ButtonPressed { module, widget });
+        self.release_button_key(state, key, out);
+        self.emit(out, CanvasEvent::ButtonPressed { module, widget });
         if let Some(slot) = state.key_holds.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(KeyHold { key, module, widget });
         }
     }
 
     /// Ends one key's hold. The button stays down while another key holds it.
-    pub(super) fn release_button_key(
-        &self,
-        state: &mut State,
-        key: keyboard::key::Named,
-        shell: &mut Shell<'_, Message>,
-    ) {
+    pub(super) fn release_button_key(&self, state: &mut CanvasInput, key: Key, out: &mut Reaction) {
         let Some(index) = state
             .key_holds
             .iter()
@@ -402,20 +392,20 @@ impl<Message> PatchCanvas<'_, Message> {
             || Self::pointer_holds_button(state, hold.module, hold.widget);
         if !still_held {
             self.emit(
-                shell,
+                out,
                 CanvasEvent::ButtonReleased {
                     module: hold.module,
                     widget: hold.widget,
                 },
             );
-            shell.request_redraw();
-            shell.capture_event();
+            out.redraw();
+            out.take();
         }
     }
 
     /// Ends every keyboard hold. Used when the window loses focus, because
     /// the key releases never arrive.
-    pub(super) fn release_every_key_hold(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
+    pub(super) fn release_every_key_hold(&self, state: &mut CanvasInput, out: &mut Reaction) {
         let holds = std::mem::take(&mut state.key_holds);
         let mut reported = [(0_u32, 0_usize); 2];
         let mut count = 0;
@@ -428,7 +418,7 @@ impl<Message> PatchCanvas<'_, Message> {
             reported[count] = (hold.module, hold.widget);
             count += 1;
             self.emit(
-                shell,
+                out,
                 CanvasEvent::ButtonReleased {
                     module: hold.module,
                     widget: hold.widget,
@@ -436,44 +426,37 @@ impl<Message> PatchCanvas<'_, Message> {
             );
         }
         if count > 0 {
-            shell.request_redraw();
-            shell.capture_event();
+            out.redraw();
+            out.take();
         }
     }
 
     /// Ends the hold for the key that came up.
-    pub(super) fn release_key(&self, state: &mut State, key: &keyboard::Key, shell: &mut Shell<'_, Message>) {
+    pub(super) fn release_key(&self, state: &mut CanvasInput, key: &Key, now: Instant, out: &mut Reaction) {
         if let Some(named) = Self::button_key(key) {
-            self.release_button_key(state, named, shell);
+            self.release_button_key(state, named, out);
         }
         if is_arrow(key) {
-            self.emit(shell, CanvasEvent::ArrowReleased { at: Instant::now() });
+            self.emit(out, CanvasEvent::ArrowReleased { at: now });
         }
     }
 
     /// Selects the module of a control being edited, so the inspector
     /// follows.
-    pub(super) fn select_for_edit(&self, module: u32, shell: &mut Shell<'_, Message>) {
+    pub(super) fn select_for_edit(&self, module: u32, out: &mut Reaction) {
         if self.selection.len() != 1 || !self.selection.contains(&module) {
-            self.emit(shell, CanvasEvent::Select(vec![module]));
+            self.emit(out, CanvasEvent::Select(vec![module]));
         }
     }
 
-    pub(super) fn set_control(&self, shell: &mut Shell<'_, Message>, module: u32, widget: usize, position: f32) {
-        self.set_part(shell, module, widget, ControlPart::Main, position);
+    pub(super) fn set_control(&self, out: &mut Reaction, module: u32, widget: usize, position: f32) {
+        self.set_part(out, module, widget, ControlPart::Main, position);
     }
 
     /// Sets one value of a control.
-    pub(super) fn set_part(
-        &self,
-        shell: &mut Shell<'_, Message>,
-        module: u32,
-        widget: usize,
-        part: ControlPart,
-        position: f32,
-    ) {
+    pub(super) fn set_part(&self, out: &mut Reaction, module: u32, widget: usize, part: ControlPart, position: f32) {
         self.emit(
-            shell,
+            out,
             CanvasEvent::SetControl {
                 module,
                 widget,
@@ -485,8 +468,8 @@ impl<Message> PatchCanvas<'_, Message> {
 
     /// Pointer down on a button. The tile stays put. Pointer up reports a
     /// release, whichever mode the app has stored.
-    pub(super) fn press_button(&self, state: &mut State, module: u32, widget: usize, shell: &mut Shell<'_, Message>) {
-        self.emit(shell, CanvasEvent::ButtonPressed { module, widget });
+    pub(super) fn press_button(&self, state: &mut CanvasInput, module: u32, widget: usize, out: &mut Reaction) {
+        self.emit(out, CanvasEvent::ButtonPressed { module, widget });
         state.interaction = Interaction::Holding { module, widget };
     }
 
@@ -494,22 +477,25 @@ impl<Message> PatchCanvas<'_, Message> {
     /// key was used.
     pub(super) fn focus_keys(
         &self,
-        state: &mut State,
-        key: &keyboard::Key,
-        modifiers: keyboard::Modifiers,
-        text: Option<&str>,
-        repeat: bool,
-        shell: &mut Shell<'_, Message>,
+        state: &mut CanvasInput,
+        press: KeyPress<'_>,
+        now: Instant,
+        out: &mut Reaction,
     ) -> bool {
-        use keyboard::key::Named;
+        let KeyPress {
+            key,
+            modifiers,
+            text,
+            repeat,
+        } = press;
         // Within the release window, an arrow keeps the group open and any
         // other key ends it. A modifier alone does not: Shift pressed before
         // the next arrow is part of that arrow.
         if let ArrowGroupView::Released { .. } = self.arrow_group {
             if is_arrow(key) {
-                self.emit(shell, CanvasEvent::ArrowPressed { at: Instant::now() });
+                self.emit(out, CanvasEvent::ArrowPressed { at: now });
             } else if !is_modifier(key) {
-                self.end_arrow_group(shell, false);
+                self.end_arrow_group(out, false);
             }
         }
         // Focus is only valid on a control of the one selected module.
@@ -546,48 +532,41 @@ impl<Message> PatchCanvas<'_, Message> {
         }
         if lost_to_mode
             && matches!(
-                key.as_ref(),
-                keyboard::Key::Named(
-                    Named::ArrowUp
-                        | Named::ArrowRight
-                        | Named::ArrowDown
-                        | Named::ArrowLeft
-                        | Named::Space
-                        | Named::Enter
-                )
+                *key,
+                Key::Up | Key::Right | Key::Down | Key::Left | Key::Space | Key::Enter
             )
         {
-            shell.capture_event();
+            out.take();
             return true;
         }
         // An open list or field comes before every other use of a key.
-        if self.select_popup_key(state, key, modifiers, text, repeat, shell) {
+        if self.select_popup_key(state, key, modifiers, text, repeat, out) {
             return true;
         }
-        if self.typed_field_key(state, key, modifiers, text, repeat, shell) {
+        if self.typed_field_key(state, key, modifiers, text, repeat, out) {
             return true;
         }
         if self.open_typed_field(state, key, modifiers, text, repeat) {
-            shell.request_redraw();
-            shell.capture_event();
+            out.redraw();
+            out.take();
             return true;
         }
-        if self.range_keys(state, key, modifiers, repeat, shell) {
-            shell.request_redraw();
-            shell.capture_event();
+        if self.range_keys(state, key, modifiers, repeat, now, out) {
+            out.redraw();
+            out.take();
             return true;
         }
         // Ctrl+Enter (Cmd+Enter on macOS) and a command-modified Escape are
         // the app's: they open and leave a sub-patch (sub-patches.md).
-        let command = modifiers.command();
-        let used = match key.as_ref() {
+        let command = modifiers.shortcut();
+        let used = match *key {
             // Escape hides pinned lines before it does anything else
             // (modulation.md, Lines).
-            keyboard::Key::Named(Named::Escape) if !command && self.pin(state).is_some() => {
+            Key::Escape if !command && self.pin(state).is_some() => {
                 state.pinned = None;
                 true
             }
-            keyboard::Key::Named(Named::Tab) => {
+            Key::Tab => {
                 let mut order: Vec<_> = self.scene.modules().iter().collect();
                 order.sort_by(|a, b| {
                     a.position
@@ -599,7 +578,7 @@ impl<Message> PatchCanvas<'_, Message> {
                 if order.is_empty() {
                     return false;
                 }
-                let back = modifiers.shift();
+                let back = modifiers.shift;
                 if let Some((module, widget)) = state.focus.control() {
                     let controls = self
                         .scene
@@ -616,8 +595,8 @@ impl<Message> PatchCanvas<'_, Message> {
                     if let Some(next) = next {
                         state.focus.set(module, controls[next], true);
                         state.focus_first = true;
-                        shell.request_redraw();
-                        shell.capture_event();
+                        out.redraw();
+                        out.take();
                         return true;
                     }
                 }
@@ -629,20 +608,20 @@ impl<Message> PatchCanvas<'_, Message> {
                     None => 0,
                 };
                 state.focus.clear();
-                self.emit(shell, CanvasEvent::Select(vec![order[next].id]));
+                self.emit(out, CanvasEvent::Select(vec![order[next].id]));
                 true
             }
-            keyboard::Key::Named(Named::Escape) if !command && state.focus.control().is_some() => {
+            Key::Escape if !command && state.focus.control().is_some() => {
                 state.focus.clear();
                 // In MIDI learn mode, Escape also ends the mode, so the app
                 // must see it too.
                 self.learn.is_none()
             }
-            keyboard::Key::Named(Named::Escape) if !command && !self.selection.is_empty() && self.learn.is_none() => {
-                self.emit(shell, CanvasEvent::Select(Vec::new()));
+            Key::Escape if !command && !self.selection.is_empty() && self.learn.is_none() => {
+                self.emit(out, CanvasEvent::Select(Vec::new()));
                 true
             }
-            keyboard::Key::Named(Named::Enter) if !command && state.focus.control().is_none() => {
+            Key::Enter if !command && state.focus.control().is_none() => {
                 let Some(module) = selected.and_then(|id| self.scene.module(id)) else {
                     return false;
                 };
@@ -656,38 +635,30 @@ impl<Message> PatchCanvas<'_, Message> {
             // a click, and never changes a value (midi-learn.md).
             // With nothing focused, Space still toggles Run below: that is
             // the transport, not a parameter.
-            keyboard::Key::Named(Named::Space | Named::Enter)
-                if !command && self.learn.is_some() && state.focus.control().is_some() =>
-            {
+            Key::Space | Key::Enter if !command && self.learn.is_some() && state.focus.control().is_some() => {
                 if !repeat && let Some((module, widget)) = state.focus.control() {
-                    self.emit(shell, CanvasEvent::Learn { module, widget });
+                    self.emit(out, CanvasEvent::Learn { module, widget });
                 }
                 true
             }
-            keyboard::Key::Named(Named::ArrowUp | Named::ArrowRight | Named::ArrowDown | Named::ArrowLeft)
-                if self.learn.is_some() =>
-            {
-                false
-            }
-            keyboard::Key::Named(
-                named @ (Named::ArrowUp | Named::ArrowRight | Named::ArrowDown | Named::ArrowLeft),
-            ) => {
-                if modifiers.alt() && !modifiers.shift() && self.selection.len() == 1 {
+            Key::Up | Key::Right | Key::Down | Key::Left if self.learn.is_some() => false,
+            named @ (Key::Up | Key::Right | Key::Down | Key::Left) => {
+                if modifiers.alt && !modifiers.shift && self.selection.len() == 1 {
                     let id = *self.selection.iter().next().expect("one selected module");
                     if let Some(tile) = self.scene.module(id).filter(|tile| tile.is_growable()) {
                         let width = (tile.width() / GRID) as u8;
                         let height = (tile.height() / GRID) as u8;
                         let size = match named {
-                            Named::ArrowUp => (width, height.saturating_sub(1)),
-                            Named::ArrowDown => (width, height.saturating_add(1)),
-                            Named::ArrowLeft => (width.saturating_sub(1), height),
-                            Named::ArrowRight => (width.saturating_add(1), height),
+                            Key::Up => (width, height.saturating_sub(1)),
+                            Key::Down => (width, height.saturating_add(1)),
+                            Key::Left => (width.saturating_sub(1), height),
+                            Key::Right => (width.saturating_add(1), height),
                             _ => unreachable!(),
                         };
-                        self.arrow_step(shell);
-                        self.emit(shell, CanvasEvent::Resize { module: id, size });
-                        shell.request_redraw();
-                        shell.capture_event();
+                        self.arrow_step(now, out);
+                        self.emit(out, CanvasEvent::Resize { module: id, size });
+                        out.redraw();
+                        out.take();
                         return true;
                     }
                     return false;
@@ -696,44 +667,44 @@ impl<Message> PatchCanvas<'_, Message> {
                     if self.selection.is_empty() {
                         return false;
                     }
-                    let step = if modifiers.shift() { 10.0 } else { 1.0 } * GRID;
+                    let step = if modifiers.shift { 10.0 } else { 1.0 } * GRID;
                     let delta = match named {
-                        Named::ArrowUp => Vector::new(0.0, -step),
-                        Named::ArrowRight => Vector::new(step, 0.0),
-                        Named::ArrowDown => Vector::new(0.0, step),
-                        Named::ArrowLeft => Vector::new(-step, 0.0),
+                        Key::Up => Vector::new(0.0, -step),
+                        Key::Right => Vector::new(step, 0.0),
+                        Key::Down => Vector::new(0.0, step),
+                        Key::Left => Vector::new(-step, 0.0),
                         _ => unreachable!(),
                     };
-                    self.arrow_step(shell);
+                    self.arrow_step(now, out);
                     self.emit(
-                        shell,
+                        out,
                         CanvasEvent::Move {
                             ids: self.selection.iter().copied().collect(),
                             delta,
                         },
                     );
-                    shell.request_redraw();
-                    shell.capture_event();
+                    out.redraw();
+                    out.take();
                     return true;
                 };
-                let up = matches!(named, Named::ArrowUp | Named::ArrowRight);
+                let up = matches!(named, Key::Up | Key::Right);
                 if matches!(self.widget_kind(module, widget), Some(WidgetViewKind::XyPad { .. })) {
                     // Left and Right change `x`, Up and Down change `y`
                     // (panel-widgets.md, XY pad).
-                    let part = if matches!(named, Named::ArrowLeft | Named::ArrowRight) {
+                    let part = if matches!(named, Key::Left | Key::Right) {
                         ControlPart::Main
                     } else {
                         ControlPart::Second
                     };
                     let position = self.part_position(module, widget, part);
-                    let next = knob_step(position, up, modifiers.shift(), 0);
-                    self.arrow_step(shell);
+                    let next = knob_step(position, up, modifiers.shift, 0);
+                    self.arrow_step(now, out);
                     if next != position {
-                        self.set_part(shell, module, widget, part, next);
+                        self.set_part(out, module, widget, part, next);
                     }
                 } else if matches!(self.widget_kind(module, widget), Some(WidgetViewKind::Button)) {
                     self.emit(
-                        shell,
+                        out,
                         CanvasEvent::ButtonArrow {
                             module,
                             widget,
@@ -746,14 +717,14 @@ impl<Message> PatchCanvas<'_, Message> {
                         // A parameter can declare its own step (panel-widgets.md,
                         // Number).
                         Some(WidgetViewKind::Number { key_step, .. }) if *key_step > 0.0 => {
-                            let step = key_step * if modifiers.shift() { 0.1 } else { 1.0 };
+                            let step = key_step * if modifiers.shift { 0.1 } else { 1.0 };
                             (position + if up { step } else { -step }).clamp(0.0, 1.0)
                         }
                         Some(
                             WidgetViewKind::Knob { steps }
                             | WidgetViewKind::Fader { steps, .. }
                             | WidgetViewKind::Number { steps, .. },
-                        ) => knob_step(position, up, modifiers.shift(), *steps),
+                        ) => knob_step(position, up, modifiers.shift, *steps),
                         Some(WidgetViewKind::Toggle) => {
                             if up {
                                 1.0
@@ -771,14 +742,14 @@ impl<Message> PatchCanvas<'_, Message> {
                         }
                         _ => return false,
                     };
-                    self.arrow_step(shell);
+                    self.arrow_step(now, out);
                     if next != position {
-                        self.set_control(shell, module, widget, next);
+                        self.set_control(out, module, widget, next);
                     }
                 }
                 true
             }
-            keyboard::Key::Named(named @ (Named::Space | Named::Enter)) if !command => {
+            named @ (Key::Space | Key::Enter) if !command => {
                 if let Some((module, widget)) = state.focus.control() {
                     let position = self.position(module, widget);
                     let one_number = self
@@ -789,31 +760,31 @@ impl<Message> PatchCanvas<'_, Message> {
                         .is_some_and(WidgetViewKind::is_two_numbers);
                     match self.widget_kind(module, widget) {
                         Some(WidgetViewKind::Toggle) => {
-                            self.set_control(shell, module, widget, if position > 0.5 { 0.0 } else { 1.0 })
+                            self.set_control(out, module, widget, if position > 0.5 { 0.0 } else { 1.0 })
                         }
                         // A repeated key must not press again. The first press is
                         // still held, so key up can release it.
                         Some(WidgetViewKind::Button) if repeat => {}
                         Some(WidgetViewKind::Button) => {
-                            self.press_button_key(state, named, module, widget, shell);
+                            self.press_button_key(state, named, module, widget, out);
                         }
                         Some(WidgetViewKind::Radio { options } | WidgetViewKind::Segmented { options, .. }) => {
                             let next = (position.round() as usize + 1) % options.len().max(1);
-                            self.set_control(shell, module, widget, next as f32);
+                            self.set_control(out, module, widget, next as f32);
                         }
                         Some(WidgetViewKind::Select { .. }) if !repeat => self.open_select(state, module, widget),
-                        _ if (one_number || two_numbers) && matches!(named, Named::Space) && !repeat => {
-                            self.emit(shell, CanvasEvent::ToggleRun);
+                        _ if (one_number || two_numbers) && matches!(named, Key::Space) && !repeat => {
+                            self.emit(out, CanvasEvent::ToggleRun);
                         }
                         _ => {}
                     }
-                    !(one_number && matches!(named, Named::Enter))
-                } else if matches!(named, Named::Space) {
+                    !(one_number && matches!(named, Key::Enter))
+                } else if matches!(named, Key::Space) {
                     // Space with nothing focused is the Run shortcut. A
                     // repeat is swallowed so holding the key does not toggle
                     // again. Enter is not that shortcut.
                     if !repeat {
-                        self.emit(shell, CanvasEvent::ToggleRun);
+                        self.emit(out, CanvasEvent::ToggleRun);
                     }
                     true
                 } else {
@@ -823,8 +794,8 @@ impl<Message> PatchCanvas<'_, Message> {
             _ => false,
         };
         if used {
-            shell.request_redraw();
-            shell.capture_event();
+            out.redraw();
+            out.take();
         }
         used
     }
