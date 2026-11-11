@@ -32,6 +32,7 @@ use loom_canvas::CanvasView;
 use loom_core::ModuleId;
 use loom_ui_core::IdTable;
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) mod actions;
@@ -80,6 +81,40 @@ pub(crate) enum Touch {
     Live,
     /// Anything else: a view model may have changed.
     Changed,
+    /// A timer's poll, with the key from before it ran, or `None` while no
+    /// screen reader listens. Most polls change nothing, so the tree is
+    /// built only when the key differs afterwards.
+    Poll(Option<PollKey>),
+}
+
+/// What the tree reports that a timer's poll can change, as a key that is
+/// cheap to make and to compare. A poll (the audio device check, the MIDI
+/// port check, autosave, the pickup check, the audio watchers' readings of
+/// load and dropouts) runs several times a second for the whole session, and building the tree for each would be idle work
+/// (NFR-PERF-04).
+///
+/// Every field stands for something the tree reads. When the tree starts
+/// to report something new that a poll can change, add it here, or the
+/// tree goes stale until the next ordinary message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PollKey {
+    /// The scene's generation: the tiles, their names and places, and the
+    /// widgets on them. A device change that rebuilds tiles changes it.
+    scene: u64,
+    /// The panel values' generation: every control's value and text, and a
+    /// meter's reading. It also changes for things the tree does not say,
+    /// such as a pickup mark, which costs one build that sends nothing.
+    values: u64,
+    /// The status line's text and severity, hashed. A poll that finds a
+    /// device gone, or a failed autosave, says so there.
+    status: u64,
+    /// True while a panel owns the input, which hides the tiles.
+    covered: bool,
+    // The audio load and the dropout count are not here: the tree does not
+    // report the stats bar yet. They join when it does (step 1.4, slice 3),
+    // as live values (ui-layer.md, section 3, rule 7).
+    /// The control the tree reports focus on.
+    focus: Option<(u32, usize)>,
 }
 
 /// What the accessibility layer tells the app.
@@ -133,6 +168,59 @@ pub(crate) struct Access {
     live_dirty: bool,
     /// True when the next rebuild sends live values too.
     flush_live: bool,
+    /// The control with keyboard focus on the canvas, as the canvas last
+    /// reported it: module ID and panel index.
+    focus: Option<(u32, usize)>,
+    /// A screen reader's request to focus a control: a key that changes
+    /// with each request, and the control. The canvas acts when the key
+    /// changes.
+    focus_request: (u64, Option<(u32, usize)>),
+    /// True with `--measure-tree`: each build is timed.
+    timed: bool,
+}
+
+/// How many times this process built the tree while `--measure-tree` timed
+/// it, and how long that took. Process-wide, as the canvas counters are,
+/// because the report runs on its own thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BuildTimes {
+    /// The builds so far.
+    pub count: u64,
+    /// The time of all of them.
+    pub total: Duration,
+    /// The longest one.
+    pub worst: Duration,
+}
+
+static BUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+static BUILD_NANOS: AtomicU64 = AtomicU64::new(0);
+static BUILD_WORST_NANOS: AtomicU64 = AtomicU64::new(0);
+
+impl BuildTimes {
+    /// The counts of this process so far.
+    pub(crate) fn process() -> Self {
+        Self {
+            count: BUILD_COUNT.load(Ordering::Relaxed),
+            total: Duration::from_nanos(BUILD_NANOS.load(Ordering::Relaxed)),
+            worst: Duration::from_nanos(BUILD_WORST_NANOS.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// The time of one build, on average. Zero before the first.
+    pub(crate) fn average(self) -> Duration {
+        match u32::try_from(self.count) {
+            Ok(count) if count > 0 => self.total / count,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Adds one build that took `time`.
+    fn record(time: Duration) {
+        let nanos = u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+        BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+        BUILD_NANOS.fetch_add(nanos, Ordering::Relaxed);
+        BUILD_WORST_NANOS.fetch_max(nanos, Ordering::Relaxed);
+    }
 }
 
 impl Default for Access {
@@ -145,6 +233,9 @@ impl Default for Access {
             locating: false,
             live_dirty: false,
             flush_live: false,
+            focus: None,
+            focus_request: (0, None),
+            timed: false,
         }
     }
 }
@@ -156,11 +247,35 @@ impl Access {
     /// (ui-layer.md, section 4, rule 4).
     pub(crate) fn patch_replaced(&mut self) {
         self.ids.forget(&tree::canvas_id());
+        // The old patch's module IDs mean nothing in the new one.
+        self.focus = None;
+        self.focus_request.1 = None;
+    }
+
+    /// Notes which control has keyboard focus on the canvas.
+    pub(crate) fn set_focus(&mut self, control: Option<(u32, usize)>) {
+        self.focus = control;
+    }
+
+    /// The focus request the canvas is shown: its key and its control.
+    pub(crate) fn focus_request(&self) -> (u64, Option<(u32, usize)>) {
+        self.focus_request
     }
 
     /// True while a screen reader listens.
     pub(crate) fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// The layer as `--measure-tree` runs it: building the tree as if a
+    /// screen reader were listening from the start, and timing each build.
+    /// For measuring only. A normal run starts with [`Access::default`].
+    pub(crate) fn measured() -> Self {
+        Self {
+            active: true,
+            timed: true,
+            ..Self::default()
+        }
     }
 
     /// True while live values wait to be sent.
@@ -239,6 +354,23 @@ impl crate::App {
                 Task::none()
             }
             Touch::Changed => self.a11y_rebuild(),
+            Touch::Poll(before) if before == Some(self.a11y_poll_key()) => Task::none(),
+            Touch::Poll(_) => self.a11y_rebuild(),
+        }
+    }
+
+    /// The key a poll is compared by, before and after it runs.
+    pub(crate) fn a11y_poll_key(&self) -> PollKey {
+        use std::hash::{Hash, Hasher};
+        let mut status = std::collections::hash_map::DefaultHasher::new();
+        self.alerts.status().hash(&mut status);
+        std::mem::discriminant(&self.alerts.severity()).hash(&mut status);
+        PollKey {
+            scene: self.session.scene.generation(),
+            values: self.session.values.generation(),
+            status: status.finish(),
+            covered: !self.no_overlay(),
+            focus: self.a11y.focus,
         }
     }
 
@@ -264,7 +396,45 @@ impl crate::App {
             self.a11y.live_dirty = false;
         }
         let table = &self.a11y.ids;
-        let hold = |node: accesskit::NodeId| !flush && table.id(node.0).is_some_and(|id| ids.is_live(id));
+        // The canvas in the window, in physical pixels, as node bounds are.
+        let screen = view.map(|view| {
+            let s = f64::from(self.a11y.scale);
+            let b = view.bounds;
+            accesskit::Rect {
+                x0: f64::from(b.x) * s,
+                y0: f64::from(b.y) * s,
+                x1: f64::from(b.x + b.width) * s,
+                y1: f64::from(b.y + b.height) * s,
+            }
+        });
+        let canvas = tree::canvas_id();
+        let hold = |node: accesskit::NodeId, built: &accesskit::Node| {
+            let Some(id) = table.id(node.0) else {
+                return tree::Hold::Send;
+            };
+            // Below a panel that owns the input, what is inside a tile
+            // keeps the value last sent. The tile itself is sent, hidden.
+            if ids.is_covered() && id.is_under(&canvas) && tree::tile_of(id).is_none() && *id != canvas {
+                return tree::Hold::Skip;
+            }
+            if !ids.is_live(id) {
+                return tree::Hold::Send;
+            }
+            // A live value off screen keeps the value last sent.
+            let off_screen = match (screen, built.bounds()) {
+                (Some(screen), Some(bounds)) => {
+                    bounds.x1 <= screen.x0 || bounds.x0 >= screen.x1 || bounds.y1 <= screen.y0 || bounds.y0 >= screen.y1
+                }
+                _ => false,
+            };
+            if off_screen {
+                tree::Hold::Skip
+            } else if flush {
+                tree::Hold::Send
+            } else {
+                tree::Hold::Wait
+            }
+        };
         let (changes, held) = self.a11y.sent.changes(&whole, hold);
         if held {
             self.a11y.live_dirty = true;
@@ -278,6 +448,9 @@ impl crate::App {
         let graph = self.session.controller.graph();
         let hierarchy = &self.session.hierarchy;
         let mut ids = tree::WidgetIds::default();
+        if !self.no_overlay() {
+            ids.set_covered();
+        }
         for tile in &snapshot.tiles {
             let part = crate::surface::part_tile(hierarchy, tile.id);
             let node = graph.node(ModuleId(part));
@@ -288,9 +461,12 @@ impl crate::App {
                 tree::tile_id(tile.id)
             } else if let Some(node) = node {
                 tree::part_id(tile.id, tree::SlotPart::Module(node.descriptor.id))
-            } else {
-                let key = hierarchy.key_at(&hierarchy.path_of(ModuleId(part))).unwrap_or_default();
+            } else if let Some(key) = hierarchy.key_at(&hierarchy.path_of(ModuleId(part))) {
                 tree::part_id(tile.id, tree::SlotPart::SubPatch(key))
+            } else {
+                // A part with no key cannot be told from another: its
+                // controls get no IDs, so no nodes, rather than shared ones.
+                continue;
             };
             let widgets = (0..tile.widgets.len()).map(|index| {
                 // From the panel's description, not from how the widget is
@@ -305,6 +481,9 @@ impl crate::App {
                 (kind, crate::surface::widget_name(graph, hierarchy, tile.id, index))
             });
             ids.add_tile(tile.id, &under, widgets);
+            if let Some((module, widget)) = self.a11y.focus.filter(|(module, _)| *module == tile.id) {
+                ids.set_focus(module, widget);
+            }
             // What each widget is: its kind from the scene the canvas
             // draws, and its range from the parameter the control moves.
             let views = self
@@ -328,6 +507,7 @@ impl crate::App {
                         name,
                         main: spec(loom_canvas::ControlPart::Main),
                         second: spec(loom_canvas::ControlPart::Second),
+                        reading: self.session.values.get(tile.id, index).and_then(|value| value.reading),
                     },
                 );
             }
@@ -364,6 +544,16 @@ impl crate::App {
         }
         let snapshot = self.ui_snapshot();
         let ids = self.a11y_widget_ids(&snapshot);
+        if request.action == accesskit::Action::Focus {
+            // Focus on a control moves the canvas's keyboard focus there.
+            // The canvas selects the control's tile as a press on it does.
+            // It changes nothing in the patch, and Focus on a tile does
+            // nothing (ui-layer.md, section 7, rules 9 and 20).
+            if let Some(control) = actions::focus_target(&snapshot, &ids, &self.a11y.ids, request) {
+                self.a11y.focus_request = (self.a11y.focus_request.0 + 1, Some(control));
+            }
+            return Vec::new();
+        }
         let messages = actions::messages(&snapshot, &ids, &self.a11y.ids, request);
         if messages.is_empty() {
             // A Click that changes nothing, such as one on the option
@@ -428,7 +618,11 @@ impl crate::App {
             Event::Located(view) => {
                 self.a11y.locating = false;
                 if self.a11y.active {
+                    let start = self.a11y.timed.then(std::time::Instant::now);
                     let (whole, changes) = self.a11y_changes(view.as_ref());
+                    if let Some(start) = start {
+                        BuildTimes::record(start.elapsed());
+                    }
                     platform::push(whole, changes);
                 }
                 Task::none()

@@ -1937,7 +1937,7 @@ fn losing_the_window_releases_a_hold() {
         events,
         vec![
             CanvasEvent::ButtonReleased { module: 1, widget: 0 },
-            CanvasEvent::ArrowGroupEnd
+            CanvasEvent::EditGroupEnd
         ]
     );
     assert!(matches!(state.interaction, Interaction::Idle));
@@ -2186,15 +2186,15 @@ fn untimed(events: Vec<CanvasEvent>) -> Vec<CanvasEvent> {
             CanvasEvent::ArrowStep { .. } => CanvasEvent::ArrowStep { at: epoch() },
             CanvasEvent::ArrowPressed { .. } => CanvasEvent::ArrowPressed { at: epoch() },
             CanvasEvent::ArrowReleased { .. } => CanvasEvent::ArrowReleased { at: epoch() },
-            CanvasEvent::ArrowGroupDue { .. } => CanvasEvent::ArrowGroupDue { at: epoch() },
+            CanvasEvent::EditGroupDue { .. } => CanvasEvent::EditGroupDue { at: epoch() },
             other => other,
         })
         .collect()
 }
 
 /// The group as the app shows it after a release, with a deadline far off.
-fn released_group() -> ArrowGroupView {
-    ArrowGroupView::Released {
+fn released_group() -> EditGroupView {
+    EditGroupView::Open {
         due: Instant::now() + Duration::from_secs(60),
     }
 }
@@ -2205,18 +2205,18 @@ fn released_group() -> ArrowGroupView {
 fn a_modifier_alone_keeps_a_released_group() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let selected = BTreeSet::from([1]);
-    let released = CanvasModel::new(&scene, &selected).arrow_group(released_group());
+    let released = CanvasModel::new(&scene, &selected).edit_group(released_group());
     let mut state = CanvasInput::default();
     let at = Point::new(700.0, 500.0);
     // Which modifier key it was is not told apart here: every one is
     // `Key::Modifier`. The conversion's own tests cover each of them.
     let events = drive(&released, &mut state, &key_event(Key::Modifier, true), at);
     assert!(
-        !events.contains(&CanvasEvent::ArrowGroupEnd),
+        !events.contains(&CanvasEvent::EditGroupEnd),
         "a modifier alone ended the group: {events:?}"
     );
     let other = drive(&released, &mut state, &key_event(Key::Tab, true), at);
-    assert!(other.contains(&CanvasEvent::ArrowGroupEnd), "{other:?}");
+    assert!(other.contains(&CanvasEvent::EditGroupEnd), "{other:?}");
 }
 
 /// An unfocused selected tile moves by one grid cell, or ten with Shift.
@@ -2246,7 +2246,7 @@ fn keyboard_moves_selected_tile_and_closes_group_on_next_key() {
         vec![CanvasEvent::ArrowReleased { at: epoch() }]
     );
 
-    let released = CanvasModel::new(&scene, &selected).arrow_group(released_group());
+    let released = CanvasModel::new(&scene, &selected).edit_group(released_group());
     let next = untimed(drive(&released, &mut state, &shifted(Key::Right), at));
     assert_eq!(
         next,
@@ -2261,11 +2261,11 @@ fn keyboard_moves_selected_tile_and_closes_group_on_next_key() {
     );
     assert_eq!(
         drive(&released, &mut state, &escape(), at),
-        vec![CanvasEvent::ArrowGroupEnd, CanvasEvent::Select(Vec::new())]
+        vec![CanvasEvent::EditGroupEnd, CanvasEvent::Select(Vec::new())]
     );
     let plain = drive(&closed, &mut state, &escape(), at);
     assert!(
-        !plain.contains(&CanvasEvent::ArrowGroupEnd),
+        !plain.contains(&CanvasEvent::EditGroupEnd),
         "with no group open, Escape ends none: {plain:?}"
     );
 }
@@ -2278,14 +2278,14 @@ fn pointer_press_ends_an_open_arrow_group() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let selected = BTreeSet::from([1]);
     let at = Point::new(700.0, 500.0);
-    for group in [ArrowGroupView::Held, released_group()] {
-        let canvas = CanvasModel::new(&scene, &selected).arrow_group(group);
+    for group in [EditGroupView::Held, released_group()] {
+        let canvas = CanvasModel::new(&scene, &selected).edit_group(group);
         let press = drive(&canvas, &mut CanvasInput::default(), &click(PointerButton::Left), at);
-        assert_eq!(press.first(), Some(&CanvasEvent::ArrowGroupEnd), "{group:?}: {press:?}");
+        assert_eq!(press.first(), Some(&CanvasEvent::EditGroupEnd), "{group:?}: {press:?}");
     }
     let canvas = CanvasModel::new(&scene, &selected);
     let press = drive(&canvas, &mut CanvasInput::default(), &click(PointerButton::Left), at);
-    assert!(!press.contains(&CanvasEvent::ArrowGroupEnd), "{press:?}");
+    assert!(!press.contains(&CanvasEvent::EditGroupEnd), "{press:?}");
 }
 
 /// Losing the window ends the group whatever the view shows, because no key
@@ -2301,7 +2301,7 @@ fn losing_the_window_always_ends_the_arrow_group() {
         &Event::WindowUnfocused,
         Point::ORIGIN,
     );
-    assert!(lost.contains(&CanvasEvent::ArrowGroupEnd), "{lost:?}");
+    assert!(lost.contains(&CanvasEvent::EditGroupEnd), "{lost:?}");
 }
 
 /// Keys that belong to an app text field leave the canvas, and end an open
@@ -2319,10 +2319,10 @@ fn keys_leaving_the_canvas_end_only_an_open_group() {
     assert!(drive(&quiet, &mut CanvasInput::default(), &arrow_up(), at).is_empty());
     let open = CanvasModel::new(&scene, &selected)
         .focus_policy(policy)
-        .arrow_group(released_group());
+        .edit_group(released_group());
     assert_eq!(
         drive(&open, &mut CanvasInput::default(), &arrow_up(), at),
-        vec![CanvasEvent::ArrowGroupEnd]
+        vec![CanvasEvent::EditGroupEnd]
     );
 }
 
@@ -2359,10 +2359,10 @@ fn keys_reach_and_leave_a_panel_control() {
     );
     drive(&canvas, &mut state, &key_event(Key::Up, false), at);
     // The app now shows the group released, so Escape ends it first.
-    let released = CanvasModel::new(&scene, &selected).arrow_group(released_group());
+    let released = CanvasModel::new(&scene, &selected).edit_group(released_group());
     assert_eq!(
         drive(&released, &mut state, &escape(), at),
-        vec![CanvasEvent::ArrowGroupEnd]
+        vec![CanvasEvent::EditGroupEnd]
     );
     assert_eq!(state.focus.control(), None);
     assert_eq!(
@@ -2975,7 +2975,7 @@ fn a_new_patch_clears_old_canvas_state() {
     };
     let redraw = Event::Redraw;
     let events = drive(&canvas, &mut state, &redraw, Point::ORIGIN);
-    assert!(!events.contains(&CanvasEvent::ArrowGroupEnd), "{events:?}");
+    assert!(!events.contains(&CanvasEvent::EditGroupEnd), "{events:?}");
     assert_eq!(state.pinned, None);
 }
 
@@ -2986,7 +2986,7 @@ fn a_redraw_past_the_deadline_reports_it() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let none = BTreeSet::new();
     let due = Instant::now() + Duration::from_millis(100);
-    let canvas = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due });
+    let canvas = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due });
     let mut state = CanvasInput::default();
     let early = drive_at(
         &canvas,
@@ -2996,11 +2996,11 @@ fn a_redraw_past_the_deadline_reports_it() {
         due - Duration::from_millis(1),
     );
     assert!(
-        !early.iter().any(|e| matches!(e, CanvasEvent::ArrowGroupDue { .. })),
+        !early.iter().any(|e| matches!(e, CanvasEvent::EditGroupDue { .. })),
         "{early:?}"
     );
     let late = drive_at(&canvas, &mut state, Some(&Event::Redraw), Point::ORIGIN, due);
-    assert!(late.contains(&CanvasEvent::ArrowGroupDue { at: due }), "{late:?}");
+    assert!(late.contains(&CanvasEvent::EditGroupDue { at: due }), "{late:?}");
 }
 
 /// While the group is released, every event asks for a redraw at its
@@ -3013,7 +3013,7 @@ fn every_event_asks_for_a_redraw_at_the_deadline() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let none = BTreeSet::new();
     let due = Instant::now() + Duration::from_millis(400);
-    let canvas = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due });
+    let canvas = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due });
     let bounds = Rect::new(Point::ORIGIN, Size::new(800.0, 600.0));
     // Already framed and reported, so a redraw asks for nothing itself.
     let mut state = CanvasInput::default();
@@ -3048,7 +3048,7 @@ fn an_event_with_no_meaning_still_asks_for_a_redraw_at_the_deadline() {
     let scene = Scene::new(vec![module(1, 0.0)], Vec::new());
     let none = BTreeSet::new();
     let due = Instant::now() + Duration::from_millis(400);
-    let canvas = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due });
+    let canvas = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due });
     let bounds = Rect::new(Point::ORIGIN, Size::new(800.0, 600.0));
     let mut state = CanvasInput::default();
     let mut out = Reaction::default();
@@ -3329,7 +3329,7 @@ fn losing_the_window_ends_a_drag_gesture() {
     drive(&canvas, &mut state, &click(PointerButton::Left), knob);
     let lost = drive(&canvas, &mut state, &Event::WindowUnfocused, knob);
     // The arrow group ends too: losing the window always sends its end.
-    assert_eq!(lost, vec![CanvasEvent::GestureEnd, CanvasEvent::ArrowGroupEnd]);
+    assert_eq!(lost, vec![CanvasEvent::GestureEnd, CanvasEvent::EditGroupEnd]);
     let later = drive(&canvas, &mut state, &released(), knob);
     assert!(later.is_empty(), "{later:?}");
 }
@@ -3923,7 +3923,7 @@ fn handle_and_pass_both_keep_the_deadline() {
     let none = BTreeSet::new();
     let now = Instant::now();
     let due = now + Duration::from_millis(400);
-    let model = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due });
+    let model = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due });
     let mut input = CanvasInput::default();
     // The first redraw frames the patch and asks for a frame of its own.
     input.handle(&model, &Event::Redraw, moment(None, now));
@@ -4017,16 +4017,16 @@ fn the_next_deadline_is_the_earlier_of_what_is_pending() {
 
     // An arrow group that closes sooner comes first.
     let sooner = hover_due - Duration::from_millis(1);
-    let closing = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due: sooner });
+    let closing = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due: sooner });
     assert_eq!(input.next_deadline(&closing), Some(sooner));
 
     // One that closes later leaves the hover text first.
     let later = hover_due + Duration::from_millis(1);
-    let waiting = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Released { due: later });
+    let waiting = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Open { due: later });
     assert_eq!(input.next_deadline(&waiting), Some(hover_due));
 
     // A held arrow group has no deadline of its own.
-    let held = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Held);
+    let held = CanvasModel::new(&scene, &none).edit_group(EditGroupView::Held);
     assert_eq!(input.next_deadline(&held), Some(hover_due));
 }
 
@@ -4045,6 +4045,158 @@ fn a_world_rect_in_the_window() {
     assert_eq!((found.x, found.y), (corner.x, corner.y));
     assert!((found.x + found.width - far.x).abs() < 1e-4);
     assert!((found.y + found.height - far.y).abs() < 1e-4);
+}
+
+/// Sends one event through the canvas's public entry, as a host does, and
+/// gives what it reported.
+fn host_event(canvas: &CanvasModel<'_>, state: &mut CanvasInput, event: &Event) -> Vec<CanvasEvent> {
+    let moment = Moment {
+        pointer: Some(Point::new(700.0, 500.0)),
+        bounds: Rect::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+        now: Instant::now(),
+    };
+    state.handle(canvas, event, moment).events
+}
+
+/// The canvas reports a focus change once, when focus lands on a control,
+/// moves to another, and leaves. An event that keeps the focus where it is
+/// reports none.
+#[test]
+fn a_focus_change_is_reported_once() {
+    let mut tile = module(2, 0.0);
+    tile.panel = panel();
+    let scene = Scene::new(vec![tile], Vec::new());
+    let selected = BTreeSet::from([2]);
+    let canvas = CanvasModel::new(&scene, &selected);
+    let mut state = CanvasInput::default();
+    assert_eq!(state.focused_control(), None);
+
+    let enter = host_event(&canvas, &mut state, &key_event(Key::Enter, true));
+    assert_eq!(enter, vec![CanvasEvent::FocusChanged(Some((2, 0)))]);
+    assert_eq!(state.focused_control(), Some((2, 0)));
+
+    let tab = host_event(&canvas, &mut state, &key_event(Key::Tab, true));
+    assert_eq!(tab, vec![CanvasEvent::FocusChanged(Some((2, 2)))]);
+
+    let up = host_event(&canvas, &mut state, &key_event(Key::Enter, false));
+    assert!(
+        !up.iter().any(|event| matches!(event, CanvasEvent::FocusChanged(_))),
+        "the focus stayed"
+    );
+
+    let escape = host_event(&canvas, &mut state, &key_event(Key::Escape, true));
+    assert!(escape.contains(&CanvasEvent::FocusChanged(None)));
+    assert_eq!(state.focused_control(), None);
+}
+
+/// A focus request moves keyboard focus when its key changes, and the
+/// change is reported. It does nothing when the canvas first appears, for
+/// a light, a hidden control, or a module that is gone, and it never
+/// changes the selection.
+#[test]
+fn a_focus_request_moves_focus_when_its_key_changes() {
+    let mut tile = module(2, 0.0);
+    tile.panel = panel();
+    tile.panel.widgets[2].hidden = true;
+    let scene = Scene::new(vec![tile], Vec::new());
+    let none = BTreeSet::new();
+    let mut state = CanvasInput::default();
+    let at = |key, control| CanvasModel::new(&scene, &none).focus_request(key, control);
+
+    // The first redraw only notes the key.
+    let first = host_event(&at(5, Some((2, 0))), &mut state, &Event::Redraw);
+    assert!(!first.iter().any(|event| matches!(event, CanvasEvent::FocusChanged(_))));
+    assert_eq!(state.focused_control(), None);
+
+    let moved = host_event(&at(6, Some((2, 0))), &mut state, &Event::Redraw);
+    assert!(moved.contains(&CanvasEvent::FocusChanged(Some((2, 0)))));
+    assert!(
+        moved.contains(&CanvasEvent::Select(vec![2])),
+        "its tile is selected, as a press on the control selects it"
+    );
+
+    // With its tile already the one selected, nothing is selected again.
+    let chosen = BTreeSet::from([2]);
+    let again = CanvasModel::new(&scene, &chosen).focus_request(60, Some((2, 0)));
+    state.focus.clear();
+    let moved = host_event(&again, &mut state, &Event::Redraw);
+    assert!(moved.contains(&CanvasEvent::FocusChanged(Some((2, 0)))));
+    assert!(!moved.iter().any(|event| matches!(event, CanvasEvent::Select(_))));
+
+    // The same key again asks for nothing.
+    state.focus.clear();
+    let same = host_event(&again, &mut state, &Event::Redraw);
+    assert!(!same.iter().any(|event| matches!(event, CanvasEvent::FocusChanged(_))));
+
+    // A light, a hidden control, a missing module, and no control at all.
+    for (key, control) in [(7, Some((2, 1))), (8, Some((2, 2))), (9, Some((4, 0))), (10, None)] {
+        let _ = host_event(&at(key, control), &mut state, &Event::Redraw);
+        assert_eq!(state.focused_control(), None, "{control:?}");
+    }
+}
+
+/// A selection that changes from outside the canvas drops focus left on a
+/// tile that is no longer the one selected, and reports it. Focus on the
+/// tile that is selected stays, and so does focus while the selection has
+/// not changed.
+#[test]
+fn focus_is_dropped_when_the_selection_moves_elsewhere() {
+    let mut first = module(2, 0.0);
+    first.panel = panel();
+    let mut second = module(3, 200.0);
+    second.panel = panel();
+    let scene = Scene::new(vec![first, second], Vec::new());
+    let on_first = BTreeSet::from([2]);
+    let on_second = BTreeSet::from([3]);
+    let both = BTreeSet::from([2, 3]);
+    let mut state = CanvasInput::default();
+
+    let _ = host_event(&CanvasModel::new(&scene, &on_first), &mut state, &Event::Redraw);
+    state.focus.set(2, 0, true);
+    // The same selection again: nothing to reconcile.
+    let same = host_event(&CanvasModel::new(&scene, &on_first), &mut state, &Event::Redraw);
+    assert!(!same.iter().any(|event| matches!(event, CanvasEvent::FocusChanged(_))));
+    assert_eq!(state.focused_control(), Some((2, 0)));
+
+    let moved = host_event(&CanvasModel::new(&scene, &on_second), &mut state, &Event::Redraw);
+    assert!(moved.contains(&CanvasEvent::FocusChanged(None)));
+    assert_eq!(state.focused_control(), None);
+
+    // Back on the first tile, then a second tile joins the selection.
+    let _ = host_event(&CanvasModel::new(&scene, &on_first), &mut state, &Event::Redraw);
+    state.focus.set(2, 0, true);
+    let _ = host_event(&CanvasModel::new(&scene, &both), &mut state, &Event::Redraw);
+    assert_eq!(state.focused_control(), None, "focus lives on the one selected tile");
+}
+
+/// A focus request waits while something else has the input, and is
+/// applied on the first redraw after the canvas has it again.
+#[test]
+fn a_focus_request_waits_while_the_canvas_has_no_input() {
+    let mut tile = module(2, 0.0);
+    tile.panel = panel();
+    let scene = Scene::new(vec![tile], Vec::new());
+    let none = BTreeSet::new();
+    let mut state = CanvasInput::default();
+    let busy = CanvasFocusPolicy {
+        interactive: false,
+        ..CanvasFocusPolicy::default()
+    };
+    let at = |key| CanvasModel::new(&scene, &none).focus_request(key, Some((2, 0)));
+
+    let _ = host_event(&at(5), &mut state, &Event::Redraw);
+    let waiting = host_event(&at(6).focus_policy(busy), &mut state, &Event::Redraw);
+    assert!(
+        !waiting
+            .iter()
+            .any(|event| matches!(event, CanvasEvent::FocusChanged(_)))
+    );
+    assert!(!waiting.iter().any(|event| matches!(event, CanvasEvent::Select(_))));
+    assert_eq!(state.focused_control(), None);
+
+    let applied = host_event(&at(6), &mut state, &Event::Redraw);
+    assert!(applied.contains(&CanvasEvent::FocusChanged(Some((2, 0)))));
+    assert!(applied.contains(&CanvasEvent::Select(vec![2])));
 }
 
 /// An arrow key on a focused control is the canvas's: the reaction says

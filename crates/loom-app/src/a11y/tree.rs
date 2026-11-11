@@ -12,7 +12,7 @@
 
 use crate::snapshot::{Rect, UiSnapshot, Widget};
 use accesskit::{Action, Node, NodeId, Role, Toggled, TreeId, TreeInfo, TreeUpdate};
-use loom_canvas::{CanvasView, ControlPart, WidgetViewKind, arrow_share, option_bounds, part_bounds};
+use loom_canvas::{CanvasView, ControlPart, Reading, WidgetViewKind, arrow_share, option_bounds, part_bounds};
 use loom_core::{ParamMapping, ParamSpec};
 use loom_ui_core::{IdKey, IdTable, UiId};
 use std::collections::BTreeMap;
@@ -104,6 +104,10 @@ pub(crate) struct WidgetIds {
     details: BTreeMap<(u32, usize), Detail>,
     /// The widgets that only show a value, which can move on its own.
     live: std::collections::BTreeSet<UiId>,
+    /// The control with keyboard focus on the canvas, if one has it.
+    focus: Option<(u32, usize)>,
+    /// True while a panel over the canvas owns the input.
+    covered: bool,
 }
 
 /// What a panel widget is, beyond what the snapshot says of it: enough to
@@ -123,6 +127,9 @@ pub(crate) struct Detail {
     pub main: Option<ParamSpec>,
     /// The second parameter of an XY pad or a range.
     pub second: Option<ParamSpec>,
+    /// A meter's number, from the code that wrote its text. `None` when
+    /// the text names no single number, and for other widgets.
+    pub reading: Option<Reading>,
 }
 
 /// Which node of a widget an ID names. Most widgets are one node. An XY
@@ -213,6 +220,23 @@ impl WidgetIds {
         self.live.contains(id)
     }
 
+    /// Says that a panel over the canvas owns the input. The tiles are
+    /// then hidden from a screen reader, as they are from the pointer and
+    /// the keys (ui-layer.md, section 5, rule 3).
+    pub(crate) fn set_covered(&mut self) {
+        self.covered = true;
+    }
+
+    /// True while a panel over the canvas owns the input.
+    pub(crate) fn is_covered(&self) -> bool {
+        self.covered
+    }
+
+    /// Says which control has keyboard focus on the canvas.
+    pub(crate) fn set_focus(&mut self, module: u32, widget: usize) {
+        self.focus = Some((module, widget));
+    }
+
     /// Says what one widget is. Without this the widget is a plain label.
     pub(crate) fn set_detail(&mut self, module: u32, widget: usize, detail: Detail) {
         self.details.insert((module, widget), detail);
@@ -268,6 +292,18 @@ fn physical(view: &CanvasView, world: Rect, scale: f32) -> accesskit::Rect {
     }
 }
 
+/// What to do with a node that differs from what was last sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// Send it now.
+    Send,
+    /// A live value: it waits for the live timer, which must keep running.
+    Wait,
+    /// Off screen, or below a panel that owns the input: it keeps the
+    /// value last sent, and nothing waits for it.
+    Skip,
+}
+
 /// What the screen reader was last sent, so the next update holds only the
 /// nodes that changed (ui-layer.md, section 7, rule 7).
 #[derive(Debug, Default)]
@@ -288,20 +324,28 @@ impl Sent {
     /// The part of a whole tree that differs from what was last sent, and
     /// true if a change was held back. `None` when nothing is to be sent.
     ///
-    /// `hold` names the nodes that show a live value. A change on one of
-    /// them waits, so a meter is sent at most as often as the caller lets
-    /// live values through. A node the screen reader has never had is
-    /// always sent. The first update holds every node and says which is
-    /// the root.
-    pub(crate) fn changes(&mut self, whole: &TreeUpdate, hold: impl Fn(NodeId) -> bool) -> (Option<TreeUpdate>, bool) {
+    /// `hold` says what to do with a node that changed. A live value
+    /// waits, so a meter is sent at most as often as the caller lets live
+    /// values through. A node off screen or below a panel is skipped. A
+    /// node the screen reader has never had is always sent. The first
+    /// update holds every node and says which is the root.
+    pub(crate) fn changes(
+        &mut self,
+        whole: &TreeUpdate,
+        hold: impl Fn(NodeId, &Node) -> Hold,
+    ) -> (Option<TreeUpdate>, bool) {
         let first = self.nodes.is_empty();
         let mut held = false;
         let mut nodes = Vec::new();
         for (id, node) in &whole.nodes {
-            match self.nodes.get(&id.0) {
-                Some(last) if last == node => {}
-                Some(_) if hold(*id) => held = true,
-                _ => {
+            let known = self.nodes.get(&id.0);
+            if known == Some(node) {
+                continue;
+            }
+            match known.map_or(Hold::Send, |_| hold(*id, node)) {
+                Hold::Wait => held = true,
+                Hold::Skip => {}
+                Hold::Send => {
                     self.nodes.insert(id.0, node.clone());
                     nodes.push((*id, node.clone()));
                 }
@@ -351,11 +395,18 @@ pub(crate) fn tree(
     nodes.push((status_node, status));
 
     let mut children = vec![status_node];
+    // Focus is on the window unless a control on the canvas has it.
+    let mut focus = None;
     for tile in &snapshot.tiles {
         let id = node_id(table, &tile_id(tile.id));
         let mut node = Node::new(Role::Group);
         node.set_label(tile.title.clone());
         place(&mut node, tile.bounds);
+        if ids.covered {
+            // Below a panel that owns the input: not there for a screen
+            // reader, with everything inside it.
+            node.set_hidden();
+        }
         node.add_action(Action::Focus);
         // Click selects the tile's module, so the inspector follows.
         node.add_action(Action::Click);
@@ -369,6 +420,15 @@ pub(crate) fn tree(
             };
             let child = node_id(table, widget_id);
             let mut w = widget_node(widget, ids.detail(tile.id, index));
+            // A control can take keyboard focus, and so can each of its
+            // pieces, which focus the control.
+            let control = !ids.is_live(widget_id);
+            if control {
+                w.add_action(Action::Focus);
+            }
+            if ids.focus == Some((tile.id, index)) && !ids.covered {
+                focus = Some(child);
+            }
             if let Some(bounds) = widget.bounds {
                 place(&mut w, bounds);
             }
@@ -377,6 +437,9 @@ pub(crate) fn tree(
                 for piece in pieces(&detail.kind) {
                     let piece_node = node_id(table, &piece_id(widget_id, &detail.kind, piece));
                     let mut p = piece_node_of(widget, detail, piece);
+                    if control {
+                        p.add_action(Action::Focus);
+                    }
                     if let Some(bounds) = widget.bounds.and_then(|rect| piece_bounds(widget, detail, piece, rect)) {
                         place(&mut p, bounds);
                     }
@@ -408,7 +471,7 @@ pub(crate) fn tree(
         nodes,
         tree: Some(info),
         tree_id: TreeId::ROOT,
-        focus: root_node,
+        focus: focus.unwrap_or(root_node),
     }
 }
 
@@ -503,8 +566,15 @@ fn widget_node(widget: &Widget, detail: Option<&Detail>) -> Node {
         // One slider per value, inside.
         WidgetViewKind::XyPad { .. } | WidgetViewKind::Range { .. } => Node::new(Role::Group),
         WidgetViewKind::Meter { .. } => {
+            // The number its text says, never the stored level: the
+            // tree does not work the mapping out a second time. Text with
+            // no single number in it is said as words only.
             let mut node = Node::new(Role::Meter);
-            node.set_numeric_value(f64::from(widget.position));
+            if let Some(reading) = detail.reading.filter(|reading| reading.value.is_finite()) {
+                node.set_numeric_value(f64::from(reading.value));
+                node.set_min_numeric_value(f64::from(reading.min));
+                node.set_max_numeric_value(f64::from(reading.max));
+            }
             node
         }
         // A label's text is its value, and it has no label of its own:

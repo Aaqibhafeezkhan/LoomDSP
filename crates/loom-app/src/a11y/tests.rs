@@ -384,7 +384,11 @@ fn every_widget_kind_has_its_role_a_name_and_a_value() {
                     assert!(value.supports_action(Action::Increment), "{kind}");
                 }
             }
-            "meter" => assert!(found.numeric_value().is_some()),
+            // At rest its text is "below -60 dB": words, so no number.
+            "meter" => {
+                assert_eq!(found.numeric_value(), None);
+                assert!(found.description().is_some_and(|text| text.contains("below")));
+            }
             "readout" => {
                 let snapshot = app.ui_snapshot();
                 let shown = &snapshot.tiles.iter().find(|t| t.id == module).unwrap().widgets[index];
@@ -436,6 +440,7 @@ fn a_widget_without_a_detail_or_a_parameter() {
             name: "Cutoff".into(),
             main: None,
             second: None,
+            reading: None,
         },
     );
     assert_eq!(tree::piece_id(&id, &kind, tree::Piece::Whole), id);
@@ -769,9 +774,9 @@ fn a_screen_reader_group_ends_as_the_rule_says() {
 
     // The deadline: the canvas wakes once and reports it.
     let _ = app.a11y_action(&up(cutoff), t);
-    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupDue { at: t + ms(499) }));
+    let _ = app.update(Message::Canvas(CanvasEvent::EditGroupDue { at: t + ms(499) }));
     assert_ne!(app.session.edits.reader_group(), ReaderGroup::Closed, "not yet due");
-    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupDue { at: t + ms(500) }));
+    let _ = app.update(Message::Canvas(CanvasEvent::EditGroupDue { at: t + ms(500) }));
     assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
     assert_eq!(steps(&app), start + 1);
 
@@ -786,7 +791,7 @@ fn a_screen_reader_group_ends_as_the_rule_says() {
     assert_eq!(steps(&app), start + 3);
 
     // A key press or a pointer press on the canvas ends it.
-    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupEnd));
+    let _ = app.update(Message::Canvas(CanvasEvent::EditGroupEnd));
     assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
     assert_eq!(steps(&app), start + 4);
 
@@ -982,8 +987,9 @@ fn each_value_of_a_two_value_control_is_its_own_slider() {
     assert_eq!(at, low_at, "high stops at low");
 }
 
-/// Focus on a node never changes the patch: focusing a tile or a control
-/// does not select anything (ui-layer.md, section 7, rule 9).
+/// Focus on a tile changes nothing, and Focus on a control changes
+/// nothing by itself: the canvas moves the focus and selects the tile
+/// when it next draws (ui-layer.md, section 7, rules 9 and 20).
 #[test]
 fn focus_does_not_change_the_selection() {
     let (mut app, module, knob) = app_with_filter();
@@ -1304,6 +1310,185 @@ fn a_rescaled_window_reports_its_scale_factor() {
     assert!(super::rescaled(focused, status, window).is_none());
 }
 
+/// The tree reports focus on the control the canvas says has it, and on
+/// the window when no control has it (ui-layer.md, section 7, rule 7).
+#[test]
+fn focus_is_reported_on_the_focused_control() {
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_event(Event::Activated);
+    let (whole, _) = app.a11y_changes(None);
+    let root = node_of(&mut app, &window_id());
+    assert_eq!(whole.focus, root);
+
+    let _ = app.update(Message::Canvas(CanvasEvent::FocusChanged(Some((module, knob)))));
+    let cutoff = widget_node(&mut app, module, knob);
+    let (whole, changes) = app.a11y_changes(None);
+    assert_eq!(whole.focus, cutoff);
+    assert_eq!(changes.expect("the focus moved, so an update goes").focus, cutoff);
+
+    let (_, again) = app.a11y_changes(None);
+    assert!(again.is_none(), "the same focus sends nothing");
+
+    let _ = app.update(Message::Canvas(CanvasEvent::FocusChanged(None)));
+    let (whole, changes) = app.a11y_changes(None);
+    assert_eq!(whole.focus, root);
+    assert!(changes.is_some());
+}
+
+/// A control and its pieces offer Focus, and a widget that only shows a
+/// value does not.
+#[test]
+fn controls_offer_focus_and_displays_do_not() {
+    let mut app = app_with_every_widget();
+    let update = app.a11y_tree(None);
+    for kind in ["knob", "toggle", "button", "select", "radio", "xy_pad"] {
+        let (module, index) = first_of(&app, kind);
+        let found = node(&update, widget_node(&mut app, module, index));
+        assert!(found.supports_action(Action::Focus), "{kind}");
+        for piece in found.children() {
+            assert!(node(&update, *piece).supports_action(Action::Focus), "{kind} piece");
+        }
+    }
+    for kind in ["meter", "light", "readout", "scope"] {
+        let (module, index) = first_of(&app, kind);
+        let found = node(&update, widget_node(&mut app, module, index));
+        assert!(!found.supports_action(Action::Focus), "{kind}");
+    }
+}
+
+/// The Focus action on a control asks the canvas to move keyboard focus
+/// there, with a new key each time. It changes nothing in the patch, and
+/// the canvas selects the tile. Focus on a piece asks for its control. Focus
+/// on a display, or on a hidden control, asks for nothing.
+#[test]
+fn the_focus_action_asks_the_canvas_for_focus() {
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    let t = std::time::Instant::now();
+    let (module, knob) = first_of(&app, "knob");
+    let selection = app.session.selection.clone();
+    let (key, _) = app.a11y.focus_request();
+
+    let target = widget_node(&mut app, module, knob);
+    let _ = app.a11y_action(&request(Action::Focus, target, None), t);
+    assert_eq!(app.a11y.focus_request(), (key + 1, Some((module, knob))));
+    assert_eq!(app.session.selection, selection, "the canvas selects, when it draws");
+    assert!(!app.unsaved(), "focus is not an edit");
+
+    let (pad_module, pad) = first_of(&app, "xy_pad");
+    let y = piece_node(&mut app, pad_module, pad, tree::Piece::Second);
+    let _ = app.a11y_action(&request(Action::Focus, y, None), t);
+    assert_eq!(app.a11y.focus_request(), (key + 2, Some((pad_module, pad))));
+
+    let (light_module, light) = first_of(&app, "light");
+    let display = widget_node(&mut app, light_module, light);
+    let _ = app.a11y_action(&request(Action::Focus, display, None), t);
+    assert_eq!(app.a11y.focus_request().0, key + 2, "a display takes no focus");
+    let tile = node_of(&mut app, &tile_id(module));
+    let _ = app.a11y_action(&request(Action::Focus, tile, None), t);
+    assert_eq!(app.a11y.focus_request().0, key + 2, "a tile takes no focus");
+}
+
+/// Focus moving to another control ends a screen reader's undo group, and
+/// a replaced patch forgets the focus, since its module IDs mean nothing
+/// in the new one.
+#[test]
+fn focus_ends_the_group_and_a_new_patch_forgets_it() {
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_tree(None);
+    let cutoff = widget_node(&mut app, module, knob);
+    let steps = app.session.edits.history.len();
+    let _ = app.a11y_action(&request(Action::Increment, cutoff, None), std::time::Instant::now());
+    let _ = app.update(Message::Canvas(CanvasEvent::FocusChanged(Some((module, knob)))));
+    assert_eq!(app.session.edits.reader_group(), crate::edits::ReaderGroup::Closed);
+    assert_eq!(app.session.edits.history.len(), steps + 1);
+
+    let _ = app.a11y_action(&request(Action::Focus, cutoff, None), std::time::Instant::now());
+    assert!(app.a11y.focus_request().1.is_some());
+    app.a11y.patch_replaced();
+    assert_eq!(app.a11y.focus_request().1, None);
+    let update = app.a11y_tree(None);
+    assert_eq!(update.focus, node_of(&mut app, &window_id()));
+}
+
+/// While a panel owns the input, the tiles are hidden from a screen
+/// reader, focus is not reported inside them, and what is inside a tile
+/// keeps the value last sent. When the panel closes, the tiles show again
+/// with their current values (ui-layer.md, section 7, rule 7).
+#[test]
+fn tiles_below_a_panel_are_hidden_and_keep_their_values() {
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_event(Event::Activated);
+    let (whole, _) = app.a11y_changes(None);
+    let tile = node_of(&mut app, &tile_id(module));
+    let cutoff = widget_node(&mut app, module, knob);
+    assert!(!node(&whole, tile).is_hidden());
+    let _ = app.update(Message::Canvas(CanvasEvent::FocusChanged(Some((module, knob)))));
+    let _ = app.a11y_changes(None);
+
+    app.overlays.open(crate::overlays::Overlay::RecentList(Vec::new()));
+    // The patch changes behind the panel, as MIDI or a script can do.
+    app.set_param(module, 0, 0.5);
+    let _ = app.update(Message::Canvas(CanvasEvent::SetControl {
+        module,
+        widget: knob,
+        position: 0.1,
+        part: ControlPart::Main,
+    }));
+    let _ = app.update(Message::SliderReleased);
+    let (whole, changes) = app.a11y_changes(None);
+    assert!(node(&whole, tile).is_hidden());
+    assert_eq!(
+        whole.focus,
+        node_of(&mut app, &window_id()),
+        "no focus inside a hidden tile"
+    );
+    let sent = sent_ids(&changes.expect("the tile is sent, hidden"));
+    assert!(sent.contains(&tile));
+    assert!(!sent.contains(&cutoff), "the knob keeps the value last sent");
+
+    app.overlays = crate::overlays::Overlays::default();
+    let (whole, changes) = app.a11y_changes(None);
+    assert!(!node(&whole, tile).is_hidden());
+    let sent = sent_ids(&changes.expect("the tiles show again"));
+    assert!(sent.contains(&tile) && sent.contains(&cutoff));
+}
+
+/// A live value off screen keeps the value last sent, and nothing waits
+/// for it, so the live timer does not run for a meter nobody can see. When
+/// it comes on screen it is sent again.
+#[test]
+fn live_values_off_screen_are_not_sent() {
+    let mut app = app_with_every_widget();
+    let on_screen = CanvasView {
+        bounds: Rect::new(Point::new(0.0, 0.0), Size::new(4000.0, 4000.0)),
+        camera: Camera::default(),
+    };
+    // The canvas is a small corner far from every tile.
+    let away = CanvasView {
+        bounds: Rect::new(Point::new(-9000.0, -9000.0), Size::new(1.0, 1.0)),
+        camera: Camera::default(),
+    };
+    let _ = app.a11y_event(Event::Activated);
+    let _ = app.a11y_changes(Some(&away));
+    move_live_values(&mut app);
+    assert!(app.a11y.live_waits());
+
+    app.a11y.flush_live = true;
+    let (_, changes) = app.a11y_changes(Some(&away));
+    let sent = changes.map(|update| sent_ids(&update)).unwrap_or_default();
+    assert_eq!(live_among(&app, &sent), Vec::new(), "off screen, nothing is sent");
+    assert!(!app.a11y.live_waits(), "and the timer stops");
+
+    // On screen now: the bounds changed, so the live nodes wait, then go.
+    let _ = app.a11y_changes(Some(&on_screen));
+    assert!(app.a11y.live_waits());
+    app.a11y.flush_live = true;
+    let (_, changes) = app.a11y_changes(Some(&on_screen));
+    let sent = sent_ids(&changes.expect("on screen, the values are sent"));
+    assert!(!live_among(&app, &sent).is_empty());
+}
+
 /// The widget operation that finds the canvas reports the view the canvas
 /// gave it, and nothing when no canvas answered.
 #[test]
@@ -1326,6 +1511,161 @@ fn the_canvas_is_found_by_its_view() {
     let mut visited = false;
     find.traverse(&mut |_| visited = true);
     assert!(visited);
+}
+
+/// A meter reports the number its text shows, in dB, with the range the
+/// meter draws, never the stored level from 0 to 1. The tree reads the
+/// number the text was written from (ui-layer.md, section 7, rule 6).
+#[test]
+fn a_meter_reports_the_number_its_text_shows() {
+    let mut app = app_with_every_widget();
+    move_live_values(&mut app);
+    let snapshot = app.ui_snapshot();
+    let ids = app.a11y_widget_ids(&snapshot);
+    let update = app.a11y_tree(None);
+    let mut numbered = 0;
+    for tile in &snapshot.tiles {
+        for (index, widget) in tile.widgets.iter().enumerate() {
+            if widget.kind != "meter" {
+                continue;
+            }
+            let reading = ids.detail(tile.id, index).unwrap().reading;
+            let found = node(&update, widget_node(&mut app, tile.id, index));
+            assert_eq!(found.numeric_value(), reading.map(|reading| f64::from(reading.value)));
+            assert_eq!(found.description(), Some(widget.text.as_str()));
+            let Some(reading) = reading else { continue };
+            numbered += 1;
+            assert_eq!(found.min_numeric_value(), Some(f64::from(reading.min)));
+            assert_eq!(found.max_numeric_value(), Some(f64::from(reading.max)));
+            assert!(
+                widget.text.contains(&format!("{:.1}", reading.value)),
+                "{} says {}",
+                widget.text,
+                reading.value
+            );
+            assert!(
+                (reading.value - widget.position).abs() > f32::EPSILON,
+                "the stored level is not the number"
+            );
+        }
+    }
+    assert!(numbered > 0, "a meter moved and shows a number");
+}
+
+/// A Focus action that arrives while nothing else happens still moves the
+/// focus: the runtime draws the window after every message, and the canvas
+/// applies the request on that redraw. The control's tile is selected, as
+/// a press on the control selects it, so an arrow key then changes that
+/// control and the focus stays (ui-layer.md, section 7, rule 20).
+#[test]
+fn focus_on_a_control_selects_its_tile_and_arrow_keys_reach_it() {
+    use iced::keyboard::{Key, key::Named};
+    let (mut app, module, knob) = app_with_filter();
+    let other = app.session.controller.add_module("loom.filter.svf").unwrap().0;
+    app.commit();
+    let _ = app.update(Message::Canvas(CanvasEvent::Select(vec![other])));
+    let mut ui = crate::ui_test::Ui::with_app(app);
+    // The first frame only notes the request's key.
+    let _ = ui.redraw();
+    let _ = ui.app.a11y_tree(None);
+    let cutoff = widget_node(&mut ui.app, module, knob);
+    let steps = ui.app.session.edits.history.len();
+
+    // The action and the one redraw that follows any message.
+    ui.send(Message::A11y(Event::Action(request(Action::Focus, cutoff, None))));
+    let drawn = ui.redraw();
+    assert!(drawn.iter().any(
+        |message| matches!(message, Message::Canvas(CanvasEvent::FocusChanged(Some(at))) if *at == (module, knob))
+    ));
+    assert_eq!(ui.app.ui_snapshot().selection, vec![module]);
+    assert_eq!(
+        ui.app.session.edits.history.len(),
+        steps,
+        "selecting is not an undo step"
+    );
+    assert!(!ui.app.unsaved(), "nor an edit");
+    assert_eq!(ui.app.a11y_tree(None).focus, cutoff);
+
+    let before = ui
+        .app
+        .ui_snapshot()
+        .tiles
+        .iter()
+        .find(|t| t.id == module)
+        .unwrap()
+        .widgets[knob]
+        .position;
+    let _ = ui.key_down(Key::Named(Named::ArrowUp), false);
+    let _ = ui.key_up(Key::Named(Named::ArrowUp));
+    let after = ui
+        .app
+        .ui_snapshot()
+        .tiles
+        .iter()
+        .find(|t| t.id == module)
+        .unwrap()
+        .widgets[knob]
+        .position;
+    assert!(after > before, "the arrow key moved the focused control");
+    assert_eq!(ui.app.a11y_tree(None).focus, cutoff, "and the focus stayed");
+}
+
+/// `--measure-tree` runs the layer as if a screen reader listened from the
+/// start, and times each build. A normal run does neither.
+#[test]
+fn a_measured_layer_builds_and_times_the_tree() {
+    assert!(!Access::default().is_active());
+    let (mut app, _, _) = app_with_filter();
+    app.a11y = Access::measured();
+    assert!(app.a11y.is_active());
+
+    let before = BuildTimes::process();
+    let _ = app.a11y_event(Event::Located(None));
+    let after = BuildTimes::process();
+    // Other tests build trees too, but only a measured layer counts them.
+    assert!(after.count > before.count);
+    assert!(after.total >= before.total && after.worst >= before.worst);
+    assert!(after.average() <= after.worst);
+    assert_eq!(BuildTimes::default().average(), Duration::ZERO);
+}
+
+/// A timer's poll that changes nothing builds no tree, however many come.
+/// One that changes the status line asks for one build. With no screen
+/// reader, a poll takes no key at all (ui-layer.md, section 7, rule 7).
+#[test]
+fn a_poll_that_changes_nothing_builds_no_tree() {
+    let (mut app, _, _) = app_with_filter();
+    app.a11y = Access::measured();
+    app.a11y.locating = false;
+
+    let before = app.a11y_poll_key();
+    for _ in 0..20 {
+        for poll in [
+            Message::AudioPoll,
+            Message::MidiPoll,
+            Message::Autosave,
+            Message::MidiGhosts,
+        ] {
+            let _ = app.update(poll);
+            assert!(!app.a11y.locating, "a poll that changed nothing asks for no build");
+        }
+    }
+    assert_eq!(app.a11y_poll_key(), before);
+
+    // The same poll, after something it reports changed underneath it.
+    let _ = app.a11y_after(Touch::Poll(Some(before)));
+    assert!(!app.a11y.locating);
+    app.alerts.say("The audio device is gone");
+    assert_ne!(app.a11y_poll_key(), before);
+    let _ = app.a11y_after(Touch::Poll(Some(before)));
+    assert!(app.a11y.locating, "a changed status asks for one build");
+    let _ = app.a11y_after(Touch::Poll(Some(before)));
+    assert!(app.a11y.locating, "and one build is on its way, not two");
+
+    // Each part of the key is something the tree reports.
+    let key = app.a11y_poll_key();
+    app.a11y.set_focus(Some((1, 0)));
+    assert_ne!(app.a11y_poll_key(), key);
 }
 
 /// A label node never has both a label and a value. An adapter gives a
@@ -1477,4 +1817,44 @@ fn a_focused_field_does_not_rebuild_the_tree_in_a_loop() {
         .count();
     assert!(rebuilds <= 2, "{rebuilds} rebuilds for one message");
     assert!(asked <= 1, "focus was asked {asked} times");
+}
+
+/// A screen reader focuses a control on one tile and then clicks another
+/// tile. The focus does not stay on the first tile: the tree reports it on
+/// the window again, and an arrow key then moves the selected tile, not a
+/// control the tree still claimed was focused.
+#[test]
+fn a_click_on_another_tile_drops_focus_from_the_first() {
+    let (mut app, module, knob) = app_with_filter();
+    let other = app.session.controller.add_module("loom.filter.svf").unwrap().0;
+    app.commit();
+    let mut ui = crate::ui_test::Ui::with_app(app);
+    let _ = ui.redraw();
+    let _ = ui.app.a11y_tree(None);
+    let cutoff = widget_node(&mut ui.app, module, knob);
+    let other_tile = node_of(&mut ui.app, &tile_id(other));
+    let window = node_of(&mut ui.app, &window_id());
+
+    ui.send(Message::A11y(Event::Action(request(Action::Focus, cutoff, None))));
+    let _ = ui.redraw();
+    assert_eq!(ui.app.a11y_tree(None).focus, cutoff);
+
+    ui.send(Message::A11y(Event::Action(request(Action::Click, other_tile, None))));
+    let drawn = ui.redraw();
+    assert!(
+        drawn
+            .iter()
+            .any(|message| matches!(message, Message::Canvas(CanvasEvent::FocusChanged(None))))
+    );
+    assert_eq!(ui.app.ui_snapshot().selection, vec![other]);
+    assert_eq!(ui.app.a11y_tree(None).focus, window);
+
+    let before = position(&ui.app, module, knob);
+    let _ = ui.key_down(iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp), false);
+    let _ = ui.key_up(iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp));
+    assert_eq!(
+        position(&ui.app, module, knob),
+        before,
+        "the first tile's knob is left alone"
+    );
 }

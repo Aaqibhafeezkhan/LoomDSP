@@ -751,3 +751,50 @@ fn framed_displays_have_no_caption() {
         }
     }
 }
+
+/// A meter's number is the one its text says, with the range the meter
+/// draws. Text with no single number in it gives none: a stereo meter says
+/// two, and a level under the floor is words (ui-layer.md, section 7).
+#[test]
+fn a_meters_number_is_the_one_its_text_says() {
+    let meter = &loom_modules::display::METER;
+    let out = &meter.panel.widgets[0];
+    let reading = meter_reading(meter, out, 0.8, None).expect("one level is one number");
+    assert!((reading.value - -12.0).abs() < 1e-4);
+    assert_eq!((reading.min, reading.max), (-60.0, 0.0));
+    assert_eq!(display_text(meter, out, 0.8, None), "Out: -12.0 dB");
+    assert_eq!(meter_reading(meter, out, 0.0, None), None, "below the floor is words");
+    assert_eq!(meter_reading(meter, out, 0.8, Some((0.8, 0.9))), None, "two levels");
+
+    // A meter on a display value: the value as stored, in the range the
+    // display declares, even past its end.
+    let dynamics = &loom_modules::dynamics::DYNAMICS;
+    let reduction = dynamics
+        .panel
+        .widgets
+        .iter()
+        .find(|widget| dynamics.meter_display(widget).is_some())
+        .unwrap();
+    let reading = meter_reading(dynamics, reduction, -40.0, None).unwrap();
+    // Past the end of the range the bounds reach out to the value, so the
+    // number is never outside its own bounds.
+    assert_eq!((reading.value, reading.min, reading.max), (-40.0, -40.0, 0.0));
+    let inside = meter_reading(dynamics, reduction, -12.04, None).unwrap();
+    assert_eq!((inside.min, inside.max), (-36.0, 0.0));
+    // The number is the one the text writes, digit for digit.
+    assert_eq!(display_text(dynamics, reduction, -12.04, None), "Reduction: -12.0 dB");
+    assert_eq!(inside.value, -12.0);
+    assert_eq!(meter_reading(dynamics, reduction, 3.26, None).unwrap().value, 3.3);
+    assert_eq!(meter_reading(dynamics, reduction, 3.26, None).unwrap().max, 3.3);
+    let level = meter_reading(meter, out, 0.7993, None).unwrap();
+    assert_eq!(
+        display_text(meter, out, 0.7993, None),
+        format!("Out: {:.1} dB", level.value)
+    );
+    assert_eq!(level.value, format!("{:.1}", level.value).parse::<f32>().unwrap());
+    assert_eq!(display_text(dynamics, reduction, -40.0, None), "Reduction: -40.0 dB");
+
+    // Nothing else has one.
+    let divide = &loom_modules::logic::DIVIDE;
+    assert_eq!(meter_reading(divide, &divide.panel.widgets[2], 0.4, None), None);
+}

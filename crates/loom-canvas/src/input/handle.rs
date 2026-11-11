@@ -96,7 +96,7 @@ impl CanvasModel<'_> {
             self.release_pointer_hold(state, out);
             self.release_every_key_hold(state, out);
             self.end_gestures(state, out);
-            self.end_arrow_group(out, false);
+            self.end_edit_group(out, false);
             state.interaction = Interaction::Idle;
             state.focus.close_typing();
             // Only what the window itself reports goes on from here. `None`
@@ -127,16 +127,16 @@ impl CanvasModel<'_> {
                 if matches!(state.interaction, Interaction::Wiring { .. }) =>
             {
                 self.end_gestures(state, out);
-                self.end_arrow_group(out, false);
+                self.end_edit_group(out, false);
                 out.redraw();
                 out.take();
             }
             Event::Redraw => {
                 let new_frame = state.framed_key != Some(self.frame_key);
-                if let ArrowGroupView::Released { due } = self.arrow_group
+                if let EditGroupView::Open { due } = self.edit_group
                     && now >= due
                 {
-                    self.emit(out, CanvasEvent::ArrowGroupDue { at: now });
+                    self.emit(out, CanvasEvent::EditGroupDue { at: now });
                 }
                 if state
                     .browser_key
@@ -145,6 +145,50 @@ impl CanvasModel<'_> {
                 {
                     let centre = Point::new(bounds.width / 2.0, bounds.height / 2.0);
                     self.open_browser(state.camera.to_world(centre), centre, bounds, out);
+                }
+                // The selection can change from outside the canvas: a
+                // screen reader's Click on another tile, say. Focus lives
+                // only on the one selected tile, so focus left on another
+                // is dropped now, and what the canvas reports as focused
+                // stays true. An open list stays with its control, as on a
+                // key press.
+                let same = state
+                    .selection_seen
+                    .as_ref()
+                    .is_some_and(|seen| seen.iter().eq(self.selection.iter()));
+                if !same {
+                    let first = state.selection_seen.is_none();
+                    state.selection_seen = Some(self.selection.iter().copied().collect());
+                    let elsewhere = state
+                        .focus
+                        .control()
+                        .is_some_and(|(module, _)| self.selection.len() != 1 || !self.selection.contains(&module));
+                    if !first && elsewhere && state.focus.popup().is_none() {
+                        state.focus.clear();
+                        out.redraw();
+                    }
+                }
+                // A focus request waits while something else has the
+                // input: the app would drop the events it makes, and the
+                // request would be used up. It is applied on the first
+                // redraw after the canvas has the input again.
+                let (focus_key, focus_control) = self.focus_request;
+                if self.focus_policy.interactive
+                    && state.focus_key.replace(focus_key).is_some_and(|key| key != focus_key)
+                    && let Some((module, widget)) = focus_control
+                {
+                    let can_focus = self
+                        .scene
+                        .module(module)
+                        .is_some_and(|tile| super::panel_input::focusable(&tile.panel).contains(&widget));
+                    if can_focus {
+                        // As a press on the control does: its tile is the
+                        // one selected, so the keys reach it and the
+                        // inspector follows.
+                        self.select_for_edit(module, out);
+                        state.focus.set(module, widget, true);
+                        out.redraw();
+                    }
                 }
                 let new_level = state.level_key != Some(self.level_key);
                 if (new_frame || new_level) && bounds.width > 0.0 {
@@ -307,7 +351,7 @@ impl CanvasModel<'_> {
                 // without a release would leave a momentary gate high.
                 self.release_pointer_hold(state, out);
                 self.end_gestures(state, out);
-                self.end_arrow_group(out, false);
+                self.end_edit_group(out, false);
                 let world = state.camera.to_world(screen);
                 match button {
                     PointerButton::Middle => {
@@ -657,7 +701,7 @@ impl CanvasModel<'_> {
                 self.end_gestures(state, out);
                 // No key-up follows, so a group this view does not show yet
                 // must end too.
-                self.end_arrow_group(out, true);
+                self.end_edit_group(out, true);
                 out.redraw();
             }
             _ => {}

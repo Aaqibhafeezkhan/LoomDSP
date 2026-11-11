@@ -88,9 +88,9 @@ impl<'a, Message> PatchCanvas<'a, Message> {
     }
 
     /// Says where the app's arrow-key undo group is (`docs/design/undo.md`).
-    /// See [`CanvasModel::arrow_group`].
-    pub fn arrow_group(mut self, group: ArrowGroupView) -> Self {
-        self.model = self.model.arrow_group(group);
+    /// See [`CanvasModel::edit_group`].
+    pub fn edit_group(mut self, group: EditGroupView) -> Self {
+        self.model = self.model.edit_group(group);
         self
     }
 
@@ -140,6 +140,13 @@ impl<'a, Message> PatchCanvas<'a, Message> {
     /// See [`CanvasModel::browser_key`].
     pub fn browser_key(mut self, key: u64) -> Self {
         self.model = self.model.browser_key(key);
+        self
+    }
+
+    /// Moves keyboard focus to a control whenever this key changes. See
+    /// [`CanvasModel::focus_request`].
+    pub fn focus_request(mut self, key: u64, control: Option<(u32, usize)>) -> Self {
+        self.model = self.model.focus_request(key, control);
         self
     }
 

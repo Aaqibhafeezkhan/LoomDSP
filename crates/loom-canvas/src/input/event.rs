@@ -243,6 +243,11 @@ pub enum CanvasEvent {
     /// (`docs/design/undo.md`, Gestures). Arrow edits group differently: see
     /// [`CanvasEvent::ArrowStep`].
     GestureStart,
+    /// Keyboard focus moved to this control (module ID and widget index),
+    /// or left every control. Sent once per change, whatever caused it: a
+    /// key, a click, a request, or the control going away. It is not an
+    /// edit.
+    FocusChanged(Option<(u32, usize)>),
     /// The gesture ended. It is always sent after a start, also when the
     /// pointer is released outside the window or the window loses focus.
     GestureEnd,
@@ -254,8 +259,10 @@ pub enum CanvasEvent {
         /// When the key was pressed.
         at: Instant,
     },
-    /// An arrow key was pressed while the group was released. It keeps the
-    /// group open if it came in time, even when the press edits nothing.
+    /// An arrow key was pressed while the view showed a group open and
+    /// waiting. The app decides what it means: it keeps an arrow group open
+    /// if it came in time, even when the press edits nothing, and it ends a
+    /// group that arrow keys did not open.
     ArrowPressed {
         /// When the key was pressed.
         at: Instant,
@@ -267,11 +274,11 @@ pub enum CanvasEvent {
     },
     /// The group ends now: another key or a pointer press came, the keys left
     /// the canvas, or the window lost focus.
-    ArrowGroupEnd,
+    EditGroupEnd,
     /// A redraw at `at` passed the group's deadline, as the app gave it. The
     /// app ends the group only if that deadline is still the group's, so a
     /// redraw built from an older view cannot end a newer group.
-    ArrowGroupDue {
+    EditGroupDue {
         /// The redraw's time.
         at: Instant,
     },

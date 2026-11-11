@@ -111,6 +111,9 @@ pub struct CanvasModel<'a> {
     pub(crate) palette: Palette,
     frame_key: u64,
     browser_key: u64,
+    /// A request to move keyboard focus: a key that changes with each
+    /// request, and the control to focus.
+    focus_request: (u64, Option<(u32, usize)>),
     /// The level shown, and its camera when the app has one. See
     /// [`CanvasModel::level`].
     level_key: u64,
@@ -121,9 +124,9 @@ pub struct CanvasModel<'a> {
     matrix_line: Option<crate::scene::ModulationView>,
     /// Who else in the window has the keys. See [`CanvasFocusPolicy`].
     focus_policy: CanvasFocusPolicy,
-    /// The app's arrow-key undo group, as of this view. See
-    /// [`CanvasModel::arrow_group`].
-    arrow_group: ArrowGroupView,
+    /// The app's open edit group, as of this view. See
+    /// [`CanvasModel::edit_group`].
+    edit_group: EditGroupView,
     /// The check for typed values. See [`CanvasModel::typed_check`].
     typed_check: Option<TypedCheck<'a>>,
     pub(crate) still: Option<Still>,
@@ -293,13 +296,14 @@ impl<'a> CanvasModel<'a> {
             palette: Palette::default(),
             frame_key: 0,
             browser_key: 0,
+            focus_request: (0, None),
             level_key: 0,
             level_camera: None,
             animate: false,
             learn: None,
             matrix_line: None,
             focus_policy: CanvasFocusPolicy::default(),
-            arrow_group: ArrowGroupView::Closed,
+            edit_group: EditGroupView::Closed,
             typed_check: None,
             still: None,
             window_drag_line: false,
@@ -336,11 +340,14 @@ impl<'a> CanvasModel<'a> {
         self
     }
 
-    /// Says where the app's arrow-key undo group is (`docs/design/undo.md`).
-    /// The app owns the group; the canvas only reads it, to know when an
-    /// arrow press or another key matters, and to wake for its deadline.
-    pub fn arrow_group(mut self, group: ArrowGroupView) -> Self {
-        self.arrow_group = group;
+    /// Says where the app's open edit group is: the run of edits that make
+    /// one undo step (`docs/design/undo.md`). Arrow keys open one, and so
+    /// can the app for edits that come from outside the canvas. The app
+    /// owns the group; the canvas only reads it, to know when an arrow
+    /// press or another key matters, and to wake for its deadline. It is
+    /// not told who opened the group.
+    pub fn edit_group(mut self, group: EditGroupView) -> Self {
+        self.edit_group = group;
         self
     }
 
@@ -413,6 +420,21 @@ impl<'a> CanvasModel<'a> {
         self
     }
 
+    /// Moves keyboard focus to a control whenever this key changes, but
+    /// not when the canvas first appears: `control` is the module ID and
+    /// the widget's index in its panel. The focus shows as after a Tab
+    /// press. Nothing happens when the widget is gone, hidden, or not a
+    /// control. The control's tile becomes the one selected, as a press on
+    /// the control makes it, so the keys reach the control.
+    ///
+    /// This is how something outside the canvas asks for focus on one of
+    /// its parts: a screen reader's Focus action now, the UI layer's focus
+    /// effect later (ui-layer.md, section 7 and section 9).
+    pub fn focus_request(mut self, key: u64, control: Option<(u32, usize)>) -> Self {
+        self.focus_request = (key, control);
+        self
+    }
+
     /// Moves the camera continuously in a slow loop. For measuring frame
     /// rate while panning and zooming (ADR-0010 performance gates).
     pub fn animate(mut self, animate: bool) -> Self {
@@ -482,7 +504,7 @@ impl<'a> CanvasModel<'a> {
 
     /// Ends the gesture of the current interaction, if it has one. Used when
     /// the interaction is replaced or cut off, so a start always has an end.
-    /// The arrow group ends separately, with [`CanvasModel::end_arrow_group`].
+    /// The edit group ends separately, with [`CanvasModel::end_edit_group`].
     fn end_gestures(&self, state: &mut CanvasInput, out: &mut Reaction) {
         if matches!(
             state.interaction,
@@ -508,14 +530,14 @@ impl<'a> CanvasModel<'a> {
         }
     }
 
-    /// Ends the arrow group. With `always` false, only when this view shows
+    /// Ends the edit group. With `always` false, only when this view shows
     /// one open, so the paths that run on every key or redraw stay quiet.
     /// The app ignores an end with no group open, so sending one too many is
     /// safe; with `always` true it is sent where no key-up or timer would
     /// follow to close a group the view does not show yet.
-    fn end_arrow_group(&self, out: &mut Reaction, always: bool) {
-        if always || self.arrow_group != ArrowGroupView::Closed {
-            self.emit(out, CanvasEvent::ArrowGroupEnd);
+    fn end_edit_group(&self, out: &mut Reaction, always: bool) {
+        if always || self.edit_group != EditGroupView::Closed {
+            self.emit(out, CanvasEvent::EditGroupEnd);
         }
     }
 
@@ -525,19 +547,23 @@ impl<'a> CanvasModel<'a> {
     }
 }
 
-/// The app's arrow-key undo group, as the canvas sees it in one view
-/// (`docs/design/undo.md`). The app owns the group and its history step.
+/// The app's open edit group, as the canvas sees it in one view
+/// (`docs/design/undo.md`): edits that make one undo step. The app owns the
+/// group and its history step. The canvas does not know who opened it.
+/// Arrow keys do, and the app may show one of its own that waits in the
+/// same way, with a deadline.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ArrowGroupView {
-    /// No arrow group is open.
+pub enum EditGroupView {
+    /// No group is open.
     #[default]
     Closed,
     /// An arrow key is down, and its edits are one step.
     Held,
-    /// The last arrow key came up. Another arrow press before `due` joins
-    /// the same step.
-    Released {
-        /// When the group ends if no arrow comes.
+    /// The group waits: no key is held. An arrow press before `due` is
+    /// reported, so the app can join it to the step or end the group, and
+    /// any other key or a pointer press ends it.
+    Open {
+        /// When the group ends if nothing comes.
         due: Instant,
     },
 }
@@ -785,6 +811,11 @@ pub struct CanvasInput {
     last_meter_click: Option<(Instant, u32, usize, Point)>,
     /// The browser key last seen.
     browser_key: Option<u64>,
+    /// The focus request key last seen.
+    focus_key: Option<u64>,
+    /// The selection as of the last redraw, to notice one that changed
+    /// from outside the canvas.
+    selection_seen: Option<Vec<u32>>,
     /// Buttons held from the keyboard, one slot for Space and one for Enter.
     ///
     /// Each key is its own hold. Releasing one leaves a button high while the
@@ -827,22 +858,34 @@ impl CanvasInput {
     /// The shared path of [`CanvasInput::handle`] and [`CanvasInput::pass`].
     fn run(&mut self, model: &CanvasModel<'_>, event: Option<&Event>, moment: Moment) -> Reaction {
         let mut out = Reaction::default();
+        let before = self.focus.control();
         model.on_event(self, event, moment.pointer, moment.bounds, moment.now, &mut out);
+        // Whatever moved the focus, the app hears of it once, here.
+        let after = self.focus.control();
+        if after != before {
+            out.emit(CanvasEvent::FocusChanged(after));
+        }
         out
     }
 
+    /// The control with keyboard focus: its module ID and the widget's
+    /// index in the module's panel.
+    pub fn focused_control(&self) -> Option<(u32, usize)> {
+        self.focus.control()
+    }
+
     /// When the canvas next needs to wake with no input, if it does: the
-    /// earlier of an arrow group closing and hover text appearing.
+    /// earlier of an edit group closing and hover text appearing.
     ///
     /// This is a fact of the state, so it can be asked at any time and
     /// gives the same answer until an event changes it. The driver wakes
     /// the canvas with an [`Event::Redraw`] at or after that time.
     pub fn next_deadline(&self, model: &CanvasModel<'_>) -> Option<Instant> {
-        let arrow_group = match model.arrow_group {
-            ArrowGroupView::Released { due } => Some(due),
+        let edit_group = match model.edit_group {
+            EditGroupView::Open { due } => Some(due),
             _ => None,
         };
-        match (arrow_group, self.hover_text.due()) {
+        match (edit_group, self.hover_text.due()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (one, other) => one.or(other),
         }
