@@ -4029,3 +4029,62 @@ fn the_next_deadline_is_the_earlier_of_what_is_pending() {
     let held = CanvasModel::new(&scene, &none).arrow_group(ArrowGroupView::Held);
     assert_eq!(input.next_deadline(&held), Some(hover_due));
 }
+
+/// A world rectangle lands in the window where its corners do: moved by
+/// the canvas's place in the window and scaled by the zoom.
+#[test]
+fn a_world_rect_in_the_window() {
+    let view = CanvasView {
+        bounds: Rect::new(Point::new(100.0, 50.0), Size::new(800.0, 600.0)),
+        camera: Camera::default(),
+    };
+    let world = Rect::new(Point::new(10.0, 20.0), Size::new(30.0, 40.0));
+    let found = view.rect_to_window(world);
+    let corner = view.to_window(Point::new(10.0, 20.0));
+    let far = view.to_window(Point::new(40.0, 60.0));
+    assert_eq!((found.x, found.y), (corner.x, corner.y));
+    assert!((found.x + found.width - far.x).abs() < 1e-4);
+    assert!((found.y + found.height - far.y).abs() < 1e-4);
+}
+
+/// An arrow key on a focused control is the canvas's: the reaction says
+/// the input was taken and asks for a redraw, for a button as for a knob.
+/// A key the canvas does not use is left for what is behind it.
+#[test]
+fn an_arrow_on_a_focused_control_is_taken() {
+    let mut tile = module(2, 0.0);
+    tile.panel = PanelView {
+        width: 9,
+        height: 3,
+        widgets: vec![
+            widget(WidgetViewKind::Knob { steps: 0 }, 0),
+            widget(WidgetViewKind::Button, 3),
+        ],
+    };
+    let scene = Scene::new(vec![tile], Vec::new());
+    let selected = BTreeSet::from([2]);
+    let canvas = CanvasModel::new(&scene, &selected);
+    let bounds = Rect::new(Point::ORIGIN, Size::new(800.0, 600.0));
+    for (control, expected) in [(0, "knob"), (1, "button")] {
+        let mut state = CanvasInput::default();
+        state.focus.set(2, control, true);
+        let mut out = Reaction::default();
+        canvas.handle(
+            &mut state,
+            Some(&key_event(Key::Up, true)),
+            None,
+            bounds,
+            Instant::now(),
+            &mut out,
+        );
+        assert!(out.taken, "an arrow on a focused {expected} is taken");
+        assert!(out.redraw, "{expected}");
+        if control == 1 {
+            assert!(out.events.contains(&CanvasEvent::ButtonArrow {
+                module: 2,
+                widget: 1,
+                high: true
+            }));
+        }
+    }
+}

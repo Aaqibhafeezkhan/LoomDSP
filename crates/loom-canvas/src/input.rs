@@ -16,7 +16,7 @@
 
 use crate::camera::Camera;
 use crate::controls::{
-    PanelValues, RangeGrab, ValueDrag, focus_ring, knob_step, radio_option, range_bar_at, range_handle, range_nearest,
+    PanelValues, RangeGrab, ValueDrag, arrow_step, focus_ring, radio_option, range_bar_at, range_handle, range_nearest,
     range_track, select_box, xy_area, xy_bar_at, xy_edge_ring, xy_nearest_edge, xy_position, xy_throw,
 };
 use crate::draft::{DraftSubmit, TypedDraft};
@@ -268,6 +268,15 @@ impl CanvasView {
     pub fn to_window(&self, world: Point) -> Point {
         let s = self.camera.to_screen(world);
         Point::new(self.bounds.x + s.x, self.bounds.y + s.y)
+    }
+
+    /// A world rectangle in window coordinates, in logical pixels: where
+    /// something on the canvas is in the window, for a screen reader's
+    /// cursor or a script's pointer.
+    pub fn rect_to_window(&self, world: Rect) -> Rect {
+        let a = self.to_window(Point::new(world.x, world.y));
+        let b = self.to_window(Point::new(world.x + world.width, world.y + world.height));
+        Rect::new(a, Size::new(b.x - a.x, b.y - a.y))
     }
 }
 

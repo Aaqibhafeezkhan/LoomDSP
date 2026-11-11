@@ -1,7 +1,7 @@
 //! Tests for the accessibility tree: UI IDs and node IDs, the tree, and
 //! actions. None needs a window or a screen reader, so they run on every OS.
 
-use super::tree::{STEP, WidgetIds, WidgetKey, canvas_id, status_id, tile_id, window_id};
+use super::tree::{WidgetIds, WidgetKey, canvas_id, status_id, tile_id, window_id};
 use super::*;
 use crate::{App, Message};
 use accesskit::{Action, ActionData, Node, NodeId, Role, TreeId};
@@ -229,7 +229,14 @@ fn tree_shows_tiles_and_controls() {
     let cutoff = node(&update, cutoff_node);
     assert_eq!(cutoff.role(), Role::Slider);
     assert_eq!(cutoff.label(), Some(shown.label.as_str()));
-    assert_eq!(cutoff.numeric_value(), Some(f64::from(shown.position)));
+    // The value is the parameter's own number, in its own range.
+    let spec = app.control_target(module, knob, ControlPart::Main).unwrap().spec;
+    assert_eq!(
+        cutoff.numeric_value(),
+        Some(f64::from(spec.denormalize(shown.position)))
+    );
+    assert_eq!(cutoff.min_numeric_value(), Some(f64::from(spec.min)));
+    assert_eq!(cutoff.max_numeric_value(), Some(f64::from(spec.max)));
     assert_eq!(cutoff.value(), None, "the value is a number, so it can be stepped");
     assert!(!shown.text.is_empty());
     assert_eq!(cutoff.description(), Some(shown.text.as_str()));
@@ -258,51 +265,246 @@ fn node_ids_are_unique_and_children_exist() {
     }
 }
 
-/// Each widget kind gets the role the tree gives it so far: a toggle is a
-/// switch that says whether it is on, a button a button, a meter a meter,
-/// and the kinds the next slice covers a read-only label.
-#[test]
-fn each_widget_kind_has_its_role() {
-    let mut app = crate::tests::app();
-    let id = app.session.controller.add_module("loom.filter.svf").unwrap().0;
-    app.commit();
-    let mut snapshot = app.ui_snapshot();
+/// The app with the patch that shows every panel widget kind.
+fn app_with_every_widget() -> App {
+    let patch = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/dev/test-widgets.ron");
+    App::new(crate::Args {
+        patch: Some(patch),
+        test_modules: true,
+        ..crate::tests::app_args()
+    })
+}
+
+/// The first visible widget drawn as `kind` that has a node: its tile and
+/// its panel index.
+fn first_of(app: &App, kind: &str) -> (u32, usize) {
+    let snapshot = app.ui_snapshot();
     let ids = app.a11y_widget_ids(&snapshot);
-    let at_tile = snapshot.tiles.iter().position(|t| t.id == id).unwrap();
-    let index = (0..snapshot.tiles[at_tile].widgets.len())
-        .find(|i| ids.get(id, *i).is_some())
-        .expect("the tile has a named widget");
-    let kinds = [
-        ("toggle", 1.0, Role::Switch),
-        ("toggle", 0.0, Role::Switch),
-        ("button", 0.0, Role::Button),
-        ("meter", 0.25, Role::Meter),
-        ("radio", 0.0, Role::Label),
-        ("fader", 0.5, Role::Slider),
+    snapshot
+        .tiles
+        .iter()
+        .find_map(|tile| {
+            let index = tile
+                .widgets
+                .iter()
+                .enumerate()
+                .position(|(i, w)| w.kind == kind && !w.hidden && ids.get(tile.id, i).is_some())?;
+            Some((tile.id, index))
+        })
+        .unwrap_or_else(|| panic!("the patch shows a {kind}"))
+}
+
+/// The node ID of one piece of a widget.
+fn piece_node(app: &mut App, module: u32, widget: usize, piece: tree::Piece) -> NodeId {
+    let snapshot = app.ui_snapshot();
+    let ids = app.a11y_widget_ids(&snapshot);
+    let id = tree::piece_id(
+        ids.get(module, widget).unwrap(),
+        &ids.detail(module, widget).unwrap().kind,
+        piece,
+    );
+    node_of(app, &id)
+}
+
+/// Every kind of widget a tile draws has the role the specification's
+/// table gives it, a name, and a value or state. A control can be operated,
+/// and a control that holds a number says its unit in the description
+/// (ui-layer.md, section 7, rule 2).
+#[test]
+fn every_widget_kind_has_its_role_a_name_and_a_value() {
+    let mut app = app_with_every_widget();
+    let update = app.a11y_tree(None);
+    let roles = [
+        ("knob", Role::Slider),
+        ("fader", Role::Slider),
+        ("number", Role::Slider),
+        ("toggle", Role::Switch),
+        ("button", Role::Button),
+        ("radio", Role::RadioGroup),
+        ("select", Role::ComboBox),
+        ("xy_pad", Role::Group),
+        ("range", Role::Group),
+        ("meter", Role::Meter),
+        ("light", Role::Image),
+        ("readout", Role::Label),
+        ("scope", Role::Image),
     ];
-    for (kind, at, role) in kinds {
-        let widget = &mut snapshot.tiles[at_tile].widgets[index];
-        widget.kind = kind;
-        widget.position = at;
-        widget.hidden = false;
-        let update = tree::tree(&snapshot, &ids, None, 1.0, &mut app.a11y.ids);
-        let found = node(&update, NodeId(app.a11y.ids.number(ids.get(id, index).unwrap())));
+    for (kind, role) in roles {
+        let (module, index) = first_of(&app, kind);
+        let found = node(&update, widget_node(&mut app, module, index));
         assert_eq!(found.role(), role, "{kind}");
+        // A label's text is its value, name and all, and it has no label.
+        if kind != "readout" {
+            assert!(found.label().is_some_and(|name| !name.is_empty()), "{kind} has a name");
+        }
         match kind {
+            "knob" | "fader" | "number" => {
+                assert!(found.numeric_value().is_some(), "{kind}");
+                assert!(found.min_numeric_value() < found.max_numeric_value(), "{kind}");
+                assert!(found.description().is_some_and(|text| !text.is_empty()), "{kind}");
+                for action in [Action::Increment, Action::Decrement, Action::SetValue] {
+                    assert!(found.supports_action(action), "{kind}");
+                }
+            }
             "toggle" => {
-                let on = if at >= 0.5 {
-                    accesskit::Toggled::True
-                } else {
-                    accesskit::Toggled::False
-                };
-                assert_eq!(found.toggled(), Some(on));
+                assert!(found.toggled().is_some());
                 assert!(found.supports_action(Action::Click));
             }
             "button" => assert!(found.supports_action(Action::Click)),
-            "meter" => assert_eq!(found.numeric_value(), Some(f64::from(at))),
+            "select" => {
+                assert!(found.value().is_some_and(|option| !option.is_empty()));
+                assert!(found.supports_action(Action::Increment));
+                assert!(found.supports_action(Action::Decrement));
+                assert!(!found.supports_action(Action::Expand), "it does not open until phase 3");
+            }
+            "radio" => {
+                let options = found.children();
+                assert!(options.len() > 1);
+                let chosen = options
+                    .iter()
+                    .filter(|option| node(&update, **option).toggled() == Some(accesskit::Toggled::True))
+                    .count();
+                assert_eq!(chosen, 1, "one option is chosen");
+                for option in options {
+                    let option = node(&update, *option);
+                    assert_eq!(option.role(), Role::RadioButton);
+                    assert!(option.label().is_some_and(|name| !name.is_empty()));
+                    assert!(option.supports_action(Action::Click));
+                }
+            }
+            "xy_pad" | "range" => {
+                let values = found.children();
+                assert_eq!(values.len(), 2, "{kind}: one slider per value");
+                for value in values {
+                    let value = node(&update, *value);
+                    assert_eq!(value.role(), Role::Slider, "{kind}");
+                    assert!(value.label().is_some_and(|name| !name.is_empty()), "{kind}");
+                    assert!(value.numeric_value().is_some(), "{kind}");
+                    assert!(value.description().is_some_and(|text| !text.is_empty()), "{kind}");
+                    assert!(value.supports_action(Action::Increment), "{kind}");
+                }
+            }
+            "meter" => assert!(found.numeric_value().is_some()),
+            "readout" => {
+                let snapshot = app.ui_snapshot();
+                let shown = &snapshot.tiles.iter().find(|t| t.id == module).unwrap().widgets[index];
+                let said = found.value().expect("a readout says its reading");
+                assert!(said.ends_with(shown.text.as_str()), "{said}");
+                assert!(said.len() > shown.text.len() + 2, "{said} names what it reads");
+                assert_eq!(found.label(), None);
+            }
+            "light" => assert!(found.description().is_some_and(|text| !text.is_empty())),
             _ => {}
         }
     }
+}
+
+/// A widget the app says nothing of is a plain label with its text. One
+/// with a kind but no parameter is a slider over the control's travel,
+/// from 0 to 1, and still takes a value and a step.
+#[test]
+fn a_widget_without_a_detail_or_a_parameter() {
+    let (mut app, module, knob) = app_with_filter();
+    let snapshot = app.ui_snapshot();
+    let count = snapshot.tiles.iter().find(|t| t.id == module).unwrap().widgets.len();
+    let named = |ids: &mut WidgetIds| {
+        ids.add_tile(
+            module,
+            &tile_id(module),
+            (0..count).map(|i| (WidgetKey::Param, (i == knob).then(|| "cutoff".to_string()))),
+        );
+    };
+    let mut bare = WidgetIds::default();
+    named(&mut bare);
+    let id = bare.get(module, knob).unwrap().clone();
+    let update = tree::tree(&snapshot, &bare, None, 1.0, &mut app.a11y.ids);
+    let target = node_of(&mut app, &id);
+    let found = node(&update, target);
+    assert_eq!(found.role(), Role::Label);
+    assert!(found.description().is_some_and(|text| !text.is_empty()));
+    let up = request(Action::Increment, target, None);
+    assert!(actions::canvas_events(&snapshot, &bare, &app.a11y.ids, &up).is_empty());
+
+    let mut travel = WidgetIds::default();
+    named(&mut travel);
+    let kind = loom_canvas::WidgetViewKind::Knob { steps: 0 };
+    travel.set_detail(
+        module,
+        knob,
+        tree::Detail {
+            kind: kind.clone(),
+            name: "Cutoff".into(),
+            main: None,
+            second: None,
+        },
+    );
+    assert_eq!(tree::piece_id(&id, &kind, tree::Piece::Whole), id);
+    let update = tree::tree(&snapshot, &travel, None, 1.0, &mut app.a11y.ids);
+    let found = node(&update, target);
+    assert_eq!(found.role(), Role::Slider);
+    assert_eq!(found.min_numeric_value(), Some(0.0));
+    assert_eq!(found.max_numeric_value(), Some(1.0));
+    let set = request(Action::SetValue, target, Some(ActionData::NumericValue(3.0)));
+    assert_eq!(
+        actions::canvas_events(&snapshot, &travel, &app.a11y.ids, &set),
+        vec![CanvasEvent::SetControl {
+            module,
+            widget: knob,
+            position: 1.0,
+            part: ControlPart::Main,
+        }]
+    );
+}
+
+/// A scope is an image that says its trace's lowest and highest points in
+/// words, once it has a trace.
+#[test]
+fn a_scope_says_its_trace_in_words() {
+    let mut app = app_with_every_widget();
+    let (module, index) = first_of(&app, "scope");
+    let mut snapshot = app.ui_snapshot();
+    let ids = app.a11y_widget_ids(&snapshot);
+    let scope = &mut snapshot.tiles.iter_mut().find(|t| t.id == module).unwrap().widgets[index];
+    scope.trace = Some(crate::snapshot::TraceShown {
+        points: 100,
+        low: -0.5,
+        high: 0.25,
+        level: 0.5,
+    });
+    let update = tree::tree(&snapshot, &ids, None, 1.0, &mut app.a11y.ids);
+    let found = node(&update, widget_node(&mut app, module, index));
+    assert_eq!(found.role(), Role::Image);
+    assert_eq!(found.description(), Some("Lowest -0.50, highest 0.25"));
+}
+
+/// A slider on a linear parameter declares the step an arrow key takes, in
+/// the parameter's own units. One on a logarithmic parameter declares none:
+/// an arrow key moves it by a different amount at each place.
+#[test]
+fn a_step_is_declared_only_where_it_is_one_number() {
+    let (mut app, module, knob) = app_with_filter();
+    let update = app.a11y_tree(None);
+    let spec = |app: &App, widget| app.control_target(module, widget, ControlPart::Main).unwrap().spec;
+    assert_eq!(spec(&app, knob).options.mapping, loom_core::ParamMapping::Logarithmic);
+    assert_eq!(
+        node(&update, widget_node(&mut app, module, knob)).numeric_value_step(),
+        None
+    );
+    let snapshot = app.ui_snapshot();
+    let tile = snapshot.tiles.iter().find(|t| t.id == module).unwrap();
+    let linear = (0..tile.widgets.len())
+        .find(|i| {
+            tile.widgets[*i].kind == "knob"
+                && app.control_target(module, *i, ControlPart::Main).is_some_and(|t| {
+                    t.spec.options.mapping == loom_core::ParamMapping::Linear && !t.spec.options.integer
+                })
+        })
+        .expect("the filter has a linear knob");
+    let s = spec(&app, linear);
+    let step = node(&update, widget_node(&mut app, module, linear))
+        .numeric_value_step()
+        .unwrap();
+    assert!((step - f64::from(0.01 * (s.max - s.min))).abs() < 1e-6);
 }
 
 /// A hidden widget is not in the tree, and its tile does not name it.
@@ -460,9 +662,10 @@ fn replacing_the_patch_through_the_app_drops_tile_ids() {
     assert_eq!(app.a11y.ids.id(root.0), Some(&window_id()));
 }
 
-/// Increment turns the knob one step, through the canvas, as one undo step.
+/// Increment turns the knob one step, through the canvas, and Undo can
+/// take it back at once.
 #[test]
-fn increment_turns_the_knob_as_one_undo_step() {
+fn increment_turns_the_knob_and_can_be_undone() {
     let (mut app, module, knob) = app_with_filter();
     let _ = app.a11y_tree(None);
     let cutoff = widget_node(&mut app, module, knob);
@@ -471,17 +674,19 @@ fn increment_turns_the_knob_as_one_undo_step() {
     let _ = app.update(Message::A11y(Event::Action(request(Action::Increment, cutoff, None))));
 
     let after = position(&app, module, knob);
-    assert!((after - (before + STEP).min(1.0)).abs() < 1e-4, "{before} -> {after}");
-    assert!(app.ui_snapshot().undo.is_some(), "the turn can be undone");
+    assert!((after - (before + 0.01).min(1.0)).abs() < 1e-4, "{before} -> {after}");
+    // The turn is in an open group, and Undo closes the group and takes it.
+    assert_eq!(app.undo_hint().unwrap(), "Undo: the screen reader edit");
 
     let _ = app.update(Message::A11y(Event::Action(request(Action::Decrement, cutoff, None))));
     assert!((position(&app, module, knob) - before).abs() < 1e-4);
 }
 
-/// A request becomes the messages the pointer would send: the change, then
-/// the release that ends its undo step.
+/// A SetValue gives only its change, since the app groups it with the
+/// ones that follow. A Click is one step of its own: its change, then the
+/// release that ends the step.
 #[test]
-fn a_set_becomes_a_change_and_a_release() {
+fn a_set_is_a_change_and_a_click_is_a_change_and_a_release() {
     let (mut app, module, knob) = app_with_filter();
     let _ = app.a11y_tree(None);
     let cutoff = widget_node(&mut app, module, knob);
@@ -491,83 +696,290 @@ fn a_set_becomes_a_change_and_a_release() {
         &snapshot,
         &ids,
         &app.a11y.ids,
-        &request(Action::SetValue, cutoff, Some(ActionData::NumericValue(0.5))),
+        &request(Action::SetValue, cutoff, Some(ActionData::NumericValue(500.0))),
     );
+    assert!(matches!(
+        messages.as_slice(),
+        [Message::Canvas(CanvasEvent::SetControl { .. })]
+    ));
+    let none = actions::messages(&snapshot, &ids, &app.a11y.ids, &request(Action::Click, cutoff, None));
+    assert!(none.is_empty(), "a knob cannot be clicked");
+
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    let (module, toggle) = first_of(&app, "toggle");
+    let target = widget_node(&mut app, module, toggle);
+    let snapshot = app.ui_snapshot();
+    let ids = app.a11y_widget_ids(&snapshot);
+    let messages = actions::messages(&snapshot, &ids, &app.a11y.ids, &request(Action::Click, target, None));
     assert!(matches!(
         messages.as_slice(),
         [Message::Canvas(CanvasEvent::SetControl { .. }), Message::SliderReleased]
     ));
-    let none = actions::messages(&snapshot, &ids, &app.a11y.ids, &request(Action::Click, cutoff, None));
-    assert!(none.is_empty(), "a knob cannot be clicked");
 }
 
-/// SetValue moves the knob to the position asked for, kept within 0 to 1.
+/// Screen reader SetValues on one control, each within 500 ms of the last,
+/// make one undo step, and Undo is enabled while the group is open
+/// (ui-layer.md, section 7, rule 6).
 #[test]
-fn set_value_is_clamped() {
+fn quick_sets_on_one_control_are_one_undo_step() {
+    use std::time::{Duration, Instant};
     let (mut app, module, knob) = app_with_filter();
     let _ = app.a11y_tree(None);
     let cutoff = widget_node(&mut app, module, knob);
-    let set = |app: &App, value| events(app, &request(Action::SetValue, cutoff, Some(value)));
+    let before = position(&app, module, knob);
+    let steps = app.session.edits.history.len();
+    let t = Instant::now();
+    for (i, hz) in [200.0, 400.0, 800.0].into_iter().enumerate() {
+        let set = request(Action::SetValue, cutoff, Some(ActionData::NumericValue(hz)));
+        let _ = app.a11y_action(&set, t + Duration::from_millis(300 * i as u64));
+        assert!(app.undo_hint().is_ok(), "Undo is enabled while the group is open");
+    }
+    assert_eq!(app.session.edits.history.len(), steps, "the group is still open");
+    assert_eq!(app.undo_hint().unwrap(), "Undo: the screen reader edit");
+
+    // Undo closes the group first, then takes it back as one step.
+    let _ = app.update(Message::Undo);
+    assert!((position(&app, module, knob) - before).abs() < 1e-6);
+    assert_eq!(app.session.edits.reader_group(), crate::edits::ReaderGroup::Closed);
+}
+
+/// The group ends at its deadline, on an action on another control, on a
+/// Click, and on a key press, and each end is one undo step.
+#[test]
+fn a_screen_reader_group_ends_as_the_rule_says() {
+    use crate::edits::ReaderGroup;
+    use std::time::{Duration, Instant};
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_tree(None);
+    let cutoff = widget_node(&mut app, module, knob);
+    let other_knob = {
+        let snapshot = app.ui_snapshot();
+        let tile = snapshot.tiles.iter().find(|t| t.id == module).unwrap();
+        (0..tile.widgets.len())
+            .find(|i| *i != knob && tile.widgets[*i].kind == "knob")
+            .expect("the filter has a second knob")
+    };
+    let other = widget_node(&mut app, module, other_knob);
+    let t = Instant::now();
+    let ms = Duration::from_millis;
+    let up = |node| request(Action::Increment, node, None);
+    let steps = |app: &App| app.session.edits.history.len();
+    let start = steps(&app);
+
+    // The deadline: the canvas wakes once and reports it.
+    let _ = app.a11y_action(&up(cutoff), t);
+    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupDue { at: t + ms(499) }));
+    assert_ne!(app.session.edits.reader_group(), ReaderGroup::Closed, "not yet due");
+    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupDue { at: t + ms(500) }));
+    assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    assert_eq!(steps(&app), start + 1);
+
+    // Another control: the first group ends, and a new one opens.
+    let _ = app.a11y_action(&up(cutoff), t + ms(1000));
+    let _ = app.a11y_action(&up(other), t + ms(1100));
+    assert_eq!(steps(&app), start + 2);
+    assert_ne!(app.session.edits.reader_group(), ReaderGroup::Closed);
+
+    // A late action on the same control is a new group too.
+    let _ = app.a11y_action(&up(other), t + ms(1700));
+    assert_eq!(steps(&app), start + 3);
+
+    // A key press or a pointer press on the canvas ends it.
+    let _ = app.update(Message::Canvas(CanvasEvent::ArrowGroupEnd));
+    assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    assert_eq!(steps(&app), start + 4);
+
+    // An arrow key press does too, before its own group opens.
+    let _ = app.a11y_action(&up(cutoff), t + ms(3000));
+    let _ = app.update(Message::Canvas(CanvasEvent::ArrowPressed { at: t + ms(3100) }));
+    assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    assert_eq!(steps(&app), start + 5);
+}
+
+/// While a screen reader's group is open, the canvas is shown a released
+/// arrow group with the same deadline, so it wakes once then. With no
+/// group open it is shown none, so nothing wakes at rest.
+#[test]
+fn the_canvas_wakes_once_for_an_open_group() {
+    use std::time::Instant;
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_tree(None);
+    assert_eq!(app.session.edits.reader_group().due(), None);
+    let cutoff = widget_node(&mut app, module, knob);
+    let t = Instant::now();
+    let _ = app.a11y_action(&request(Action::Increment, cutoff, None), t);
     assert_eq!(
-        set(&app, ActionData::NumericValue(3.0)),
-        vec![CanvasEvent::SetControl {
-            module,
-            widget: knob,
-            position: 1.0,
-            part: ControlPart::Main,
-        }]
+        app.session.edits.reader_group().due(),
+        Some(t + crate::edits::ARROW_GROUP)
     );
+}
+
+/// SetValue takes a number in the parameter's own range and moves the
+/// knob to it, kept within the range.
+#[test]
+fn set_value_is_in_the_parameters_range_and_clamped() {
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_tree(None);
+    let cutoff = widget_node(&mut app, module, knob);
+    let spec = app.control_target(module, knob, ControlPart::Main).unwrap().spec;
+    let set = |app: &App, value| events(app, &request(Action::SetValue, cutoff, Some(value)));
+    let at = |events: Vec<CanvasEvent>| match events.as_slice() {
+        [
+            CanvasEvent::SetControl {
+                module: m,
+                widget,
+                position,
+                part: ControlPart::Main,
+            },
+        ] if *m == module && *widget == knob => *position,
+        other => panic!("expected one set, got {other:?}"),
+    };
+    let middle = spec.denormalize(0.5);
+    assert!((at(set(&app, ActionData::NumericValue(f64::from(middle)))) - 0.5).abs() < 1e-4);
+    assert_eq!(at(set(&app, ActionData::NumericValue(f64::from(spec.max) * 4.0))), 1.0);
+    assert_eq!(at(set(&app, ActionData::NumericValue(f64::INFINITY))), 1.0);
+    assert_eq!(at(set(&app, ActionData::NumericValue(f64::NEG_INFINITY))), 0.0);
+    assert_eq!(at(set(&app, ActionData::NumericValue(-2.0))), 0.0);
     assert!(
         set(&app, ActionData::Value("loud".into())).is_empty(),
         "a knob takes a number"
     );
     assert!(
         set(&app, ActionData::NumericValue(f64::NAN)).is_empty(),
-        "NaN is not a position"
+        "NaN is not a value"
     );
-    let at = |events: Vec<CanvasEvent>| match events.as_slice() {
-        [CanvasEvent::SetControl { position, .. }] => *position,
-        other => panic!("expected one set, got {other:?}"),
-    };
-    assert_eq!(at(set(&app, ActionData::NumericValue(f64::INFINITY))), 1.0);
-    assert_eq!(at(set(&app, ActionData::NumericValue(f64::NEG_INFINITY))), 0.0);
-    assert_eq!(at(set(&app, ActionData::NumericValue(-2.0))), 0.0);
 }
 
 /// A click turns a toggle over, and presses a button.
 #[test]
 fn click_works_a_toggle_and_a_button() {
-    let (mut app, module, knob) = app_with_filter();
+    let mut app = app_with_every_widget();
     let _ = app.a11y_tree(None);
-    let target = widget_node(&mut app, module, knob);
-    let mut snapshot = app.ui_snapshot();
-    let ids = app.a11y_widget_ids(&snapshot);
-    let click = |snapshot: &crate::snapshot::UiSnapshot, app: &App| {
-        actions::canvas_events(snapshot, &ids, &app.a11y.ids, &request(Action::Click, target, None))
-    };
-    let set = |position| {
+    let (module, toggle) = first_of(&app, "toggle");
+    let target = widget_node(&mut app, module, toggle);
+    let before = position(&app, module, toggle);
+    assert_eq!(
+        events(&app, &request(Action::Click, target, None)),
         vec![CanvasEvent::SetControl {
             module,
-            widget: knob,
-            position,
+            widget: toggle,
+            position: if before >= 0.5 { 0.0 } else { 1.0 },
             part: ControlPart::Main,
         }]
+    );
+    let (module, button) = first_of(&app, "button");
+    let target = widget_node(&mut app, module, button);
+    assert_eq!(
+        events(&app, &request(Action::Click, target, None)),
+        vec![CanvasEvent::ButtonPressed { module, widget: button }]
+    );
+    assert!(
+        events(&app, &request(Action::Increment, target, None)).is_empty(),
+        "a button has no value to step"
+    );
+}
+
+/// Increment and Decrement move a control by what an arrow key moves it,
+/// from the one function the keyboard uses (ui-layer.md, section 7, rule
+/// 5): a knob by its step, a select by one option.
+#[test]
+fn increment_and_decrement_take_the_arrow_keys_step() {
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    for kind in ["knob", "fader", "number", "select"] {
+        let (module, index) = first_of(&app, kind);
+        let target = widget_node(&mut app, module, index);
+        let snapshot = app.ui_snapshot();
+        let ids = app.a11y_widget_ids(&snapshot);
+        let drawn = &ids.detail(module, index).unwrap().kind;
+        let before = position(&app, module, index);
+        for (action, up) in [(Action::Increment, true), (Action::Decrement, false)] {
+            let (next, _) = loom_canvas::arrow_step(drawn, ControlPart::Main, before, 0.0, up, false).unwrap();
+            let expected = if next == before {
+                Vec::new()
+            } else {
+                vec![CanvasEvent::SetControl {
+                    module,
+                    widget: index,
+                    position: next,
+                    part: ControlPart::Main,
+                }]
+            };
+            assert_eq!(events(&app, &request(action, target, None)), expected, "{kind}");
+        }
+    }
+}
+
+/// A click on a radio option chooses it, and a click on the chosen one
+/// does nothing.
+#[test]
+fn click_on_an_option_chooses_it() {
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    let (module, radio) = first_of(&app, "radio");
+    let chosen = position(&app, module, radio).round() as usize;
+    let other = if chosen == 0 { 1 } else { 0 };
+    let option = piece_node(&mut app, module, radio, tree::Piece::Option(other));
+    assert_eq!(
+        events(&app, &request(Action::Click, option, None)),
+        vec![CanvasEvent::SetControl {
+            module,
+            widget: radio,
+            position: other as f32,
+            part: ControlPart::Main,
+        }]
+    );
+    let same = piece_node(&mut app, module, radio, tree::Piece::Option(chosen));
+    assert!(events(&app, &request(Action::Click, same, None)).is_empty());
+    let whole = widget_node(&mut app, module, radio);
+    assert!(events(&app, &request(Action::Click, whole, None)).is_empty());
+}
+
+/// Each value of an XY pad and of a range is its own slider. Increment
+/// moves that value alone, and a range's handle set past the other handle
+/// stops at it.
+#[test]
+fn each_value_of_a_two_value_control_is_its_own_slider() {
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    let second_at = |app: &App, module: u32, index: usize| {
+        let snapshot = app.ui_snapshot();
+        let tile = snapshot.tiles.iter().find(|t| t.id == module).unwrap();
+        tile.widgets[index].second.as_ref().unwrap().position
     };
-    let widget = |snapshot: &mut crate::snapshot::UiSnapshot, kind, position| {
-        let tile = snapshot.tiles.iter_mut().find(|t| t.id == module).unwrap();
-        tile.widgets[knob].kind = kind;
-        tile.widgets[knob].position = position;
+    let part_of = |events: Vec<CanvasEvent>| match events.as_slice() {
+        [CanvasEvent::SetControl { part, position, .. }] => (*part, *position),
+        other => panic!("expected one set, got {other:?}"),
     };
 
-    widget(&mut snapshot, "toggle", 0.0);
-    assert_eq!(click(&snapshot, &app), set(1.0));
-    widget(&mut snapshot, "toggle", 1.0);
-    assert_eq!(click(&snapshot, &app), set(0.0));
-    widget(&mut snapshot, "button", 0.0);
-    assert_eq!(
-        click(&snapshot, &app),
-        vec![CanvasEvent::ButtonPressed { module, widget: knob }]
-    );
+    let (module, pad) = first_of(&app, "xy_pad");
+    let y = piece_node(&mut app, module, pad, tree::Piece::Second);
+    let before = second_at(&app, module, pad);
+    let (part, at) = part_of(events(&app, &request(Action::Decrement, y, None)));
+    assert_eq!(part, ControlPart::Second);
+    assert!((at - (before - 0.01)).abs() < 1e-6);
+    let x = piece_node(&mut app, module, pad, tree::Piece::Main);
+    let x_before = position(&app, module, pad);
+    let (part, at) = part_of(events(&app, &request(Action::Increment, x, None)));
+    assert_eq!(part, ControlPart::Main);
+    assert!((at - (x_before + 0.01)).abs() < 1e-6);
+
+    let (module, range) = first_of(&app, "range");
+    let low = piece_node(&mut app, module, range, tree::Piece::Main);
+    let high_at = second_at(&app, module, range);
+    let low_at = position(&app, module, range);
+    assert!(low_at < high_at, "the test patch's range is open");
+    let spec = app.control_target(module, range, ControlPart::Main).unwrap().spec;
+    let top = Some(ActionData::NumericValue(f64::from(spec.max) * 2.0));
+    let (part, at) = part_of(events(&app, &request(Action::SetValue, low, top)));
+    assert_eq!(part, ControlPart::Main);
+    assert_eq!(at, high_at, "low stops at high");
+    let high = piece_node(&mut app, module, range, tree::Piece::Second);
+    let bottom = Some(ActionData::NumericValue(f64::NEG_INFINITY));
+    let (part, at) = part_of(events(&app, &request(Action::SetValue, high, bottom)));
+    assert_eq!(part, ControlPart::Second);
+    assert_eq!(at, low_at, "high stops at low");
 }
 
 /// Focus on a node never changes the patch: focusing a tile or a control
@@ -685,8 +1097,8 @@ fn actions_wait_while_a_panel_owns_input() {
     assert!(!app.unsaved(), "no edit was made");
 }
 
-/// The refresh timer runs only once a screen reader listens, and the events
-/// that only set up the layer change nothing in the patch.
+/// Nothing is built until a screen reader listens, and the events that
+/// only set up the layer change nothing in the patch.
 #[test]
 fn a_screen_reader_turns_the_layer_on() {
     let (mut app, _, _) = app_with_filter();
@@ -695,14 +1107,201 @@ fn a_screen_reader_turns_the_layer_on() {
     let _ = app.a11y_event(Event::Attached(Ok(())));
     let _ = app.a11y_event(Event::Attached(Err("no window".into())));
     assert!(!app.a11y.active, "attaching is not listening");
+    let _ = app.a11y_event(Event::Located(None));
+    assert!(app.a11y.ids.is_empty(), "no tree without a screen reader");
+    let _ = app.a11y_after(Touch::Changed);
+    assert!(!app.a11y.locating, "and no rebuild is asked for");
 
     let _ = app.a11y_event(Event::Activated);
     assert!(app.a11y.active);
+    assert!(app.a11y.locating, "the first tree is on its way");
     let _ = app.a11y_subscription();
-    let _ = app.a11y_event(Event::Refresh);
     let _ = app.a11y_event(Event::Located(None));
+    assert!(!app.a11y.locating);
     assert!(!app.a11y.ids.is_empty(), "locating the canvas built the tree");
     assert!(!app.unsaved(), "no edit was made");
+}
+
+/// Makes a screen reader listen, and takes the first whole tree.
+fn listen(app: &mut App) {
+    let _ = app.a11y_event(Event::Activated);
+    let _ = app.a11y_event(Event::Located(None));
+}
+
+/// The node IDs in an update, sorted.
+fn sent_ids(update: &TreeUpdate) -> Vec<NodeId> {
+    let mut ids: Vec<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable_by_key(|id| id.0);
+    ids
+}
+
+/// The first update is the whole tree with its root. After that, a build
+/// with nothing changed sends nothing, and a turned knob sends that knob's
+/// node alone (ui-layer.md, section 7, rule 7).
+#[test]
+fn only_changed_nodes_are_sent() {
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_event(Event::Activated);
+    let (whole, first) = app.a11y_changes(None);
+    let first = first.expect("the first update is sent");
+    assert!(first.tree.is_some(), "it names the root");
+    assert_eq!(sent_ids(&first), sent_ids(&whole));
+
+    let (_, again) = app.a11y_changes(None);
+    assert!(again.is_none(), "nothing changed, so nothing is sent");
+
+    let cutoff = widget_node(&mut app, module, knob);
+    let _ = app.update(Message::Canvas(CanvasEvent::SetControl {
+        module,
+        widget: knob,
+        position: 0.25,
+        part: ControlPart::Main,
+    }));
+    let _ = app.update(Message::SliderReleased);
+    let (_, changes) = app.a11y_changes(None);
+    let changes = changes.expect("the knob changed");
+    assert!(changes.tree.is_none(), "the root is named once");
+    let changed = sent_ids(&changes);
+    assert!(changed.contains(&cutoff));
+    // The knob, and at most what shows the same value beside it.
+    assert!(changed.len() <= 2, "{changed:?}");
+    assert!(changed.len() < whole.nodes.len());
+}
+
+/// A message that changes nothing the tree reports sends nothing, and a
+/// change of selection, which the tree does not report, sends nothing.
+#[test]
+fn a_message_that_changes_nothing_sends_nothing() {
+    let (mut app, module, _) = app_with_filter();
+    listen(&mut app);
+    let _ = app.update(Message::Canvas(CanvasEvent::Select(vec![module])));
+    assert!(app.a11y.locating, "the message asked for a rebuild");
+    app.a11y.locating = false;
+    let (_, changes) = app.a11y_changes(None);
+    assert!(changes.is_none());
+}
+
+/// Messages that arrive while a rebuild waits for the canvas ask for no
+/// second one: the one on its way holds them.
+#[test]
+fn one_rebuild_at_a_time() {
+    let (mut app, _, _) = app_with_filter();
+    listen(&mut app);
+    let _ = app.a11y_after(Touch::Changed);
+    assert!(app.a11y.locating);
+    // Asking again while it waits changes nothing.
+    let _ = app.a11y_after(Touch::Changed);
+    let _ = app.a11y_after(Touch::Own);
+    assert!(app.a11y.locating);
+    let _ = app.a11y_event(Event::Located(None));
+    assert!(!app.a11y.locating);
+}
+
+/// Runs the engine and hands the app the lights and meters that moved, as
+/// the watcher thread does.
+fn move_live_values(app: &mut App) {
+    let tiles: Vec<u32> = app.ui_snapshot().tiles.iter().map(|t| t.id).collect();
+    let _ = app.update(Message::Canvas(CanvasEvent::VisibleDisplays(tiles)));
+    let watch = app.watched_lights().expect("the patch shows lights");
+    app.process(4_800);
+    let _ = app.update(Message::Lights(watch.read()));
+}
+
+/// The nodes of widgets that only show a value, among `ids`.
+fn live_among(app: &App, ids: &[NodeId]) -> Vec<NodeId> {
+    let snapshot = app.ui_snapshot();
+    let widgets = app.a11y_widget_ids(&snapshot);
+    ids.iter()
+        .copied()
+        .filter(|node| app.a11y.ids.id(node.0).is_some_and(|id| widgets.is_live(id)))
+        .collect()
+}
+
+/// A node that shows a live value is held until the live timer fires, so
+/// it is sent at most every 250 ms. The timer runs only while a live value
+/// waits, and the last value is sent after the values stop moving
+/// (ui-layer.md, section 7, rule 7).
+#[test]
+fn live_values_wait_for_the_timer() {
+    let mut app = app_with_every_widget();
+    listen(&mut app);
+    assert!(!app.a11y.live_waits(), "at rest no timer runs");
+
+    // The engine runs: meters and lights move.
+    move_live_values(&mut app);
+    assert!(app.a11y.live_waits(), "live values wait for the timer");
+
+    // A rebuild for another reason holds the live nodes back.
+    app.a11y.locating = false;
+    let (_, changes) = app.a11y_changes(None);
+    let sent = changes.map(|update| sent_ids(&update)).unwrap_or_default();
+    assert_eq!(live_among(&app, &sent), Vec::new(), "live nodes wait");
+    assert!(app.a11y.live_waits());
+
+    // The timer fires: the live values are sent, and the timer stops.
+    let _ = app.a11y_event(Event::LiveTick);
+    assert!(app.a11y.locating, "the timer asks for a rebuild");
+    app.a11y.locating = false;
+    let (_, changes) = app.a11y_changes(None);
+    let sent = sent_ids(&changes.expect("the lights moved"));
+    assert!(!live_among(&app, &sent).is_empty(), "the moved values are sent");
+    assert!(!app.a11y.live_waits(), "nothing waits, so the timer stops");
+
+    // The values have stopped, and the last ones were sent.
+    let (_, none) = app.a11y_changes(None);
+    assert!(none.is_none());
+}
+
+/// A new scale factor sends every node that has bounds again, and the
+/// same one asks for nothing (ui-layer.md, section 7, rule 8).
+#[test]
+fn a_new_scale_factor_resends_bounds() {
+    let (mut app, module, knob) = app_with_filter();
+    let view = CanvasView {
+        bounds: Rect::new(Point::new(0.0, 0.0), Size::new(800.0, 600.0)),
+        camera: Camera::default(),
+    };
+    let _ = app.a11y_event(Event::Activated);
+    let _ = app.a11y_changes(Some(&view));
+    app.a11y.locating = false;
+
+    let _ = app.a11y_event(Event::ScaleFactor(1.0));
+    assert!(!app.a11y.locating, "the same scale factor asks for nothing");
+    let _ = app.a11y_event(Event::ScaleFactor(2.0));
+    assert!(app.a11y.locating, "a new one asks for a rebuild");
+    let (_, changes) = app.a11y_changes(Some(&view));
+    let changed = sent_ids(&changes.expect("bounds changed"));
+    assert!(changed.contains(&node_of(&mut app, &tile_id(module))));
+    assert!(changed.contains(&widget_node(&mut app, module, knob)));
+}
+
+/// When the screen reader leaves, nothing is built, and one that comes
+/// back gets the whole tree again.
+#[test]
+fn a_screen_reader_that_leaves_stops_the_tree() {
+    let (mut app, _, _) = app_with_filter();
+    listen(&mut app);
+    let _ = app.a11y_event(Event::Deactivated);
+    assert!(!app.a11y.is_active());
+    let _ = app.a11y_after(Touch::Changed);
+    let _ = app.a11y_after(Touch::Live);
+    assert!(!app.a11y.locating && !app.a11y.live_waits());
+
+    let _ = app.a11y_event(Event::Activated);
+    let (whole, first) = app.a11y_changes(None);
+    assert_eq!(sent_ids(&first.expect("the whole tree again")), sent_ids(&whole));
+}
+
+/// The window event that carries a new scale factor becomes the layer's
+/// event, and other window events do not.
+#[test]
+fn a_rescaled_window_reports_its_scale_factor() {
+    let window = iced::window::Id::unique();
+    let status = iced::event::Status::Ignored;
+    let rescaled = iced::Event::Window(iced::window::Event::Rescaled(2.0));
+    assert!(matches!(super::rescaled(rescaled, status, window), Some(Event::ScaleFactor(s)) if s == 2.0));
+    let focused = iced::Event::Window(iced::window::Event::Focused);
+    assert!(super::rescaled(focused, status, window).is_none());
 }
 
 /// The widget operation that finds the canvas reports the view the canvas
@@ -727,4 +1326,155 @@ fn the_canvas_is_found_by_its_view() {
     let mut visited = false;
     find.traverse(&mut |_| visited = true);
     assert!(visited);
+}
+
+/// A label node never has both a label and a value. An adapter gives a
+/// label node's label in place of its value (`accesskit_macos` 0.27.2,
+/// `label_is_exposed_in_value`), so the value would not be read.
+#[test]
+fn a_label_node_never_hides_its_value() {
+    let mut app = app_with_every_widget();
+    let update = app.a11y_tree(None);
+    let mut labels = 0;
+    for (_, found) in &update.nodes {
+        if found.role() == Role::Label {
+            labels += 1;
+            assert!(
+                found.label().is_none() || found.value().is_none(),
+                "{:?} would hide {:?}",
+                found.label(),
+                found.value()
+            );
+        }
+    }
+    assert!(labels > 1, "the status line and a readout");
+}
+
+/// A range handle set by a screen reader stops at the other handle from
+/// the side it is on. A typed value can leave low above high, and then low
+/// moves freely above and stops when it comes down to high.
+#[test]
+fn a_range_handle_stops_on_its_own_side() {
+    use actions::stop_at;
+    // Low below high, the usual way round. The last argument says which
+    // handle moves: false for low, true for high.
+    assert_eq!(stop_at(0.9, 0.2, 0.8, false), 0.8, "low stops at high");
+    assert_eq!(stop_at(0.5, 0.2, 0.8, false), 0.5);
+    assert_eq!(stop_at(0.1, 0.8, 0.2, true), 0.2, "high stops at low");
+    // Low above high.
+    assert_eq!(stop_at(0.9, 0.8, 0.2, false), 0.9, "low moves away from high");
+    assert_eq!(stop_at(0.1, 0.8, 0.2, false), 0.2);
+    assert_eq!(stop_at(0.1, 0.2, 0.8, true), 0.1, "high moves away from low");
+    // Together: low is the one below and high the one above, so low can
+    // go down and high can go up, and neither crosses.
+    assert_eq!(stop_at(0.3, 0.5, 0.5, false), 0.3);
+    assert_eq!(stop_at(0.8, 0.5, 0.5, false), 0.5);
+    assert_eq!(stop_at(0.8, 0.5, 0.5, true), 0.8);
+    assert_eq!(stop_at(0.3, 0.5, 0.5, true), 0.5);
+}
+
+/// A Click that changes nothing, such as one on the option already
+/// chosen, still ends an open undo group, as a pointer press does. A
+/// request for a node that is gone ends nothing.
+#[test]
+fn a_click_that_changes_nothing_ends_the_group() {
+    use crate::edits::ReaderGroup;
+    let mut app = app_with_every_widget();
+    let _ = app.a11y_tree(None);
+    let (module, knob) = first_of(&app, "knob");
+    let (radio_module, radio) = first_of(&app, "radio");
+    let now = std::time::Instant::now();
+    let knob_node = widget_node(&mut app, module, knob);
+    let steps = app.session.edits.history.len();
+
+    // Whichever way the knob can still move.
+    let step = [Action::Increment, Action::Decrement]
+        .into_iter()
+        .find(|action| !events(&app, &request(*action, knob_node, None)).is_empty())
+        .expect("the knob can move one way");
+    let _ = app.a11y_action(&request(step, knob_node, None), now);
+    assert_ne!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    // A node the window does not show leaves the group open.
+    let gone = request(Action::Click, NodeId(u64::MAX), None);
+    assert!(app.a11y_action(&gone, now).is_empty());
+    assert_ne!(app.session.edits.reader_group(), ReaderGroup::Closed);
+
+    let chosen = position(&app, radio_module, radio).round() as usize;
+    let option = piece_node(&mut app, radio_module, radio, tree::Piece::Option(chosen));
+    assert!(app.a11y_action(&request(Action::Click, option, None), now).is_empty());
+    assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    assert_eq!(
+        app.session.edits.history.len(),
+        steps + 1,
+        "the knob's step is recorded"
+    );
+
+    // The next edit on the knob is a step of its own, though it is in time.
+    let _ = app.a11y_action(&request(step, knob_node, None), now);
+    app.reader_event(crate::edits::ReaderEvent::Close);
+    assert_eq!(app.session.edits.history.len(), steps + 2);
+}
+
+/// While an arrow key is held, its group owns the edit in progress, so a
+/// screen reader's action does nothing, as Undo does nothing then.
+#[test]
+fn an_action_waits_while_an_arrow_key_is_held() {
+    use crate::edits::{ArrowEvent, ArrowGroup, ReaderGroup};
+    let (mut app, module, knob) = app_with_filter();
+    let _ = app.a11y_tree(None);
+    let cutoff = widget_node(&mut app, module, knob);
+    let now = std::time::Instant::now();
+    app.arrow_event(ArrowEvent::Step(now));
+    assert_eq!(app.session.edits.arrow_group(), ArrowGroup::Held);
+    let before = position(&app, module, knob);
+
+    assert!(
+        app.a11y_action(&request(Action::Increment, cutoff, None), now)
+            .is_empty()
+    );
+    assert_eq!(position(&app, module, knob), before);
+    assert_eq!(app.session.edits.reader_group(), ReaderGroup::Closed);
+    assert_eq!(
+        app.session.edits.arrow_group(),
+        ArrowGroup::Held,
+        "the key still owns the edit"
+    );
+
+    // The key comes up: the action works again.
+    app.arrow_event(ArrowEvent::Released(now));
+    assert!(
+        !app.a11y_action(&request(Action::Increment, cutoff, None), now)
+            .is_empty()
+    );
+    assert!(position(&app, module, knob) > before);
+}
+
+/// With a text field in focus and a screen reader listening, one message
+/// asks which field has focus once. The layer's own messages do not ask
+/// again, so the tree is not rebuilt in a loop.
+#[test]
+fn a_focused_field_does_not_rebuild_the_tree_in_a_loop() {
+    let (app, _, _) = app_with_filter();
+    let mut ui = crate::ui_test::Ui::with_app(app);
+    let _ = ui.redraw();
+    // A real field with real focus, so each time the app asks, the
+    // answer is that a field has it.
+    ui.focus(crate::patch_info::TAG_INPUT);
+    assert!(ui.text_field_focused(), "the tag field took focus");
+    let _ = ui.app.a11y_event(Event::Activated);
+    ui.app.a11y.locating = false;
+    ui.app.text_focus.any = true;
+
+    let task = ui.app.update(Message::Canvas(CanvasEvent::Select(Vec::new())));
+    let log = ui.run_task(task);
+    let rebuilds = log
+        .iter()
+        .filter(|message| matches!(message, Message::A11y(Event::Located(_))))
+        .count();
+    let asked = log
+        .iter()
+        .filter(|message| matches!(message, Message::TextFocus(_)))
+        .count();
+    assert!(rebuilds <= 2, "{rebuilds} rebuilds for one message");
+    assert!(asked <= 1, "focus was asked {asked} times");
 }

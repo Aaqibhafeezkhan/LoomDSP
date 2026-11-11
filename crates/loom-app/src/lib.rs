@@ -1259,11 +1259,20 @@ impl App {
         if self.overlays.question.is_some() && !message.allowed_during_question() {
             return Task::none();
         }
+        // What this message means for a screen reader's tree.
+        let touch = match (&message, cause) {
+            (Message::A11y(_), _) => a11y::Touch::Own,
+            (_, FrameCause::Tick | FrameCause::Live | FrameCause::Meters | FrameCause::Forced) => a11y::Touch::Live,
+            _ => a11y::Touch::Changed,
+        };
         // A field can go with the view, so any input while one has focus asks
         // again. Live readings and frames do not change what the view holds.
+        // The accessibility layer's own messages change no view either. If
+        // they asked, the answer would ask for a rebuild, and the rebuild's
+        // answer would ask again, for as long as a field has focus.
         let ask_focus = matches!(message, Message::TextFocusCheck)
             || (self.text_focus.any
-                && !matches!(message, Message::TextFocus(_))
+                && !matches!(message, Message::TextFocus(_) | Message::A11y(_))
                 && !matches!(
                     cause,
                     FrameCause::Tick | FrameCause::Live | FrameCause::Meters | FrameCause::Forced
@@ -1354,6 +1363,12 @@ impl App {
                 editing::text_field_focused().map(move |typing| Message::HistoryKey { redo, typing }),
             ]),
             None => task,
+        };
+        // A screen reader's tree follows what this message changed.
+        let task = if self.a11y.is_active() {
+            Task::batch([task, self.a11y_after(touch).map(Message::A11y)])
+        } else {
+            task
         };
         self.drain_idle_engine();
         // The audio callback, or the idle engine above, makes room for the
