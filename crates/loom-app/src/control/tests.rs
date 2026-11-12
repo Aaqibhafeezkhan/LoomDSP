@@ -2415,6 +2415,20 @@ fn locate_takes_an_overlay_ui_id() {
     let cancel = locate(&ui.app, "question/cancel", &found).unwrap();
     let label = ui.text("Cancel").expect("the question shows Cancel");
     assert!(cancel.contains(label.center()), "the answer holds its label");
+
+    // The module browser's parts are found by UI ID too.
+    ui.app.overlays.question = None;
+    ui.send(Message::OpenBrowser);
+    let _ = ui.redraw();
+    let places = ui.places();
+    let found = Found {
+        canvas: places.canvas,
+        text: None,
+        places,
+    };
+    let search = locate(&ui.app, "browser/search", &found).unwrap();
+    let browser = locate(&ui.app, "browser", &found).unwrap();
+    assert!(browser.contains(search.center()), "the field is in the browser");
 }
 
 /// A part that is scrolled out of view is not located: a pointer sent
