@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) mod actions;
+pub(crate) mod items;
 #[cfg(target_os = "macos")]
 mod macos;
 pub(crate) mod tree;
@@ -87,12 +88,22 @@ pub(crate) enum Touch {
 /// What the tree reports that a timer's poll can change, as a key that is
 /// cheap to make and to compare. A poll (the audio device check, the MIDI
 /// port check, autosave, the pickup check, the audio watchers' readings of
-/// load and dropouts) runs several times a second for the whole session, and building the tree for each would be idle work
-/// (NFR-PERF-04).
+/// load and dropouts) runs several times a second for the whole session,
+/// and building the tree for each would be idle work (NFR-PERF-04).
 ///
 /// Every field stands for something the tree reads. When the tree starts
 /// to report something new that a poll can change, add it here, or the
 /// tree goes stale until the next ordinary message.
+///
+/// The inspector's and the matrix's items need no field of their own. They
+/// are built from the selection, the graph, the panel's own state (the
+/// inspector's drafts, the matrix's sort, filter, chosen cell, and Add
+/// form), and the panel values. No poll changes the first three:
+/// selecting, editing, and typing are ordinary messages, classed as a
+/// change. A poll changes the panel values only through their generation,
+/// which `values` holds. So before adding a poll that edits the graph or
+/// the selection, or a panel whose items read something a poll changes,
+/// add that here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PollKey {
     /// The scene's generation: the tiles, their names and places, and the
@@ -386,9 +397,9 @@ impl crate::App {
     pub(crate) fn a11y_changes(&mut self, places: &Places) -> (TreeUpdate, Option<TreeUpdate>) {
         let view = places.canvas.as_ref();
         let snapshot = self.ui_snapshot();
-        let bars = self.bars_model();
+        let frames = self.a11y_frames();
         let ids = self.a11y_widget_ids(&snapshot);
-        let whole = tree::tree(&snapshot, &bars, &ids, places, self.a11y.scale, &mut self.a11y.ids);
+        let whole = tree::tree(&snapshot, &frames, &ids, places, self.a11y.scale, &mut self.a11y.ids);
         let flush = std::mem::take(&mut self.a11y.flush_live);
         if flush {
             self.a11y.live_dirty = false;
@@ -453,10 +464,10 @@ impl crate::App {
     /// changes nothing a screen reader was told.
     pub(crate) fn a11y_bounds(&self, id: &loom_ui_core::UiId, places: &Places) -> Option<loom_ui_core::Rect> {
         let snapshot = self.ui_snapshot();
-        let bars = self.bars_model();
+        let frames = self.a11y_frames();
         let ids = self.a11y_widget_ids(&snapshot);
         let mut table = IdTable::new();
-        let whole = tree::tree(&snapshot, &bars, &ids, places, 1.0, &mut table);
+        let whole = tree::tree(&snapshot, &frames, &ids, places, 1.0, &mut table);
         let node = accesskit::NodeId(table.number(id));
         let bounds = whole.nodes.iter().find(|(found, _)| *found == node)?.1.bounds()?;
         Some(loom_ui_core::Rect::new(
@@ -542,9 +553,81 @@ impl crate::App {
     #[cfg(test)]
     pub(crate) fn a11y_tree(&mut self, places: &Places) -> TreeUpdate {
         let snapshot = self.ui_snapshot();
-        let bars = self.bars_model();
+        let frames = self.a11y_frames();
         let ids = self.a11y_widget_ids(&snapshot);
-        tree::tree(&snapshot, &bars, &ids, places, self.a11y.scale, &mut self.a11y.ids)
+        tree::tree(&snapshot, &frames, &ids, places, self.a11y.scale, &mut self.a11y.ids)
+    }
+
+    /// What the tree reports of the parts around the canvas: the bar, the
+    /// open panel's parts, and what has keyboard focus. The inspector's and
+    /// the matrix's parts come from the same models their views draw.
+    pub(crate) fn a11y_frames(&self) -> tree::Frames {
+        let panel = match self.right_tab {
+            crate::matrix::Tab::Inspector => crate::inspector::access::items(&self.inspector_model()),
+            crate::matrix::Tab::Matrix => self.matrix_items(),
+        };
+        tree::Frames {
+            bars: self.bars_model(),
+            panel,
+            focused_field: self.text_focus.field.clone(),
+            focused_item: self.matrix_focus(),
+        }
+    }
+
+    /// A screen reader's action on a part of the open panel: the messages
+    /// its item says that action sends, or a focus request for a field.
+    /// `None` for a node that is not one of the panel's parts.
+    ///
+    /// SetValue, Increment, and Decrement on a slider join the screen
+    /// reader's undo group, as on the canvas. Any other action ends the
+    /// group first, also when it changes nothing (section 7, rule 6).
+    fn a11y_panel_action(
+        &mut self,
+        request: &ActionRequest,
+        at: std::time::Instant,
+    ) -> Option<Vec<Task<crate::Message>>> {
+        use crate::edits::ReaderEvent;
+        let id = self.a11y.ids.id(request.target_node.0)?.clone();
+        let matrix = id.is_under(&crate::matrix::access::panel());
+        if !matrix && !id.is_under(&loom_ui_core::UiId::panel("inspector")) {
+            return None;
+        }
+        let frames = self.a11y_frames();
+        let item = items::find(&frames.panel, &id)?.clone();
+        if request.action == accesskit::Action::Focus {
+            let Some(field) = item.focus else {
+                return Some(Vec::new());
+            };
+            self.reader_event(ReaderEvent::Close);
+            let task = iced::widget::operation::focus(field)
+                .chain(crate::editing::text_focus().map(crate::Message::TextFocus));
+            return Some(vec![task]);
+        }
+        let messages = items::messages(&item, request.action, request.data.as_ref());
+        let joins = item.groups && actions::joins_group(request.action);
+        if messages.is_empty() {
+            if !joins {
+                self.reader_event(ReaderEvent::Close);
+            }
+            return Some(Vec::new());
+        }
+        self.reader_event(if joins {
+            ReaderEvent::Action {
+                node: request.target_node.0,
+                at,
+            }
+        } else {
+            ReaderEvent::Close
+        });
+        // A matrix cell is chosen first, as a click on it would choose it,
+        // so the keys and the reported focus stay where the screen reader
+        // is, also when a retarget gives the row a new ID.
+        if matrix {
+            self.matrix_reader_select(&id);
+        }
+        let tasks = messages.into_iter().map(|message| self.update(message)).collect();
+        self.reader_event(ReaderEvent::Applied);
+        Some(tasks)
     }
 
     /// The message for a Click on a part of the window outside the canvas:
@@ -597,6 +680,10 @@ impl crate::App {
         }
         let snapshot = self.ui_snapshot();
         let ids = self.a11y_widget_ids(&snapshot);
+        // A part of the open panel acts as its item says.
+        if let Some(tasks) = self.a11y_panel_action(request, at) {
+            return tasks;
+        }
         if request.action == accesskit::Action::Focus {
             // Focus on a control moves the canvas's keyboard focus there.
             // The canvas selects the control's tile as a press on it does.

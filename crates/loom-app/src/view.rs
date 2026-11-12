@@ -250,6 +250,7 @@ impl App {
             &self.session.patch_info.authors,
             self.session.gestures.drop_row(),
             self.session.gestures.assign_drag().is_some() && !self.session.learn.is_on(),
+            self.a11y.is_active(),
         )
     }
 
@@ -281,6 +282,7 @@ impl App {
                     .model(self.session.controller.graph(), &self.session.selection, self.right_tab),
                 &self.session.matrix,
                 self.session.controller.graph(),
+                self.a11y.is_active(),
             ),
         };
         column![tabs, panel].width(280).height(Length::Fill).into()

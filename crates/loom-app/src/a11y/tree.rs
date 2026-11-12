@@ -10,6 +10,7 @@
 //! The toolbar, the inspector, and the overlays come with the later slices
 //! of plan step 1.4.
 
+use super::items;
 use crate::matrix::Tab;
 use crate::places::Places;
 use crate::snapshot::{Rect, UiSnapshot, Widget};
@@ -376,7 +377,7 @@ impl Sent {
 /// the entries of elements this build did not show.
 pub(crate) fn tree(
     snapshot: &UiSnapshot,
-    bars: &bars::Model,
+    frames: &Frames,
     ids: &WidgetIds,
     places: &Places,
     scale: f32,
@@ -396,11 +397,23 @@ pub(crate) fn tree(
         places,
         scale,
         covered: ids.covered,
+        field: frames.focused_field.as_ref(),
+        focused: None,
         table,
         nodes: &mut nodes,
     };
     let mut children = vec![frame.toolbar(&snapshot.toolbar), frame.tabs(snapshot.matrix.tab)];
-    let bar = frame.bar(bars);
+    let bar = frame.bar(&frames.bars);
+    // The open panel, drawn beside the canvas: each of its parts, and the
+    // panel itself marked as cutting off what it scrolls out of view.
+    let panel: Vec<NodeId> = frames.panel.iter().map(|item| frame.panel(item)).collect();
+    let field_focus = frame.focused;
+    // Only a part the panel reports now can have focus.
+    let item_focus = frames
+        .focused_item
+        .as_ref()
+        .filter(|id| items::find(&frames.panel, id).is_some())
+        .map(|id| node_id(table, id));
     // Focus is on the window unless a control on the canvas has it.
     let mut focus = None;
     for tile in &snapshot.tiles {
@@ -464,7 +477,13 @@ pub(crate) fn tree(
         nodes.push((id, node));
     }
 
+    children.extend(panel);
     children.push(bar);
+    // A text field that has keyboard focus has it, whatever the canvas
+    // last said (section 6, rule 5). Then a panel part the keys act on,
+    // such as the matrix's chosen cell, since the panel hears the keys
+    // before the canvas does (section 6, rule 6).
+    let focus = field_focus.or(item_focus).or(focus);
     let root_node = node_id(table, &window_id());
     let mut root = Node::new(Role::Window);
     root.set_label(snapshot.title.clone());
@@ -480,6 +499,22 @@ pub(crate) fn tree(
         tree_id: TreeId::ROOT,
         focus: focus.unwrap_or(root_node),
     }
+}
+
+/// What the tree reports of the parts the toolkit draws around the canvas:
+/// the bar at the bottom, the open panel's parts, and the text field that
+/// has keyboard focus.
+pub(crate) struct Frames {
+    /// The stats bar and the status line.
+    pub bars: bars::Model,
+    /// The open panel's parts: the inspector's or the matrix's, by the tab
+    /// that is open.
+    pub panel: Vec<items::Item>,
+    /// The text field with keyboard focus, as the window last said.
+    pub focused_field: Option<iced::advanced::widget::Id>,
+    /// The panel part the keys act on while no text field has them: the
+    /// matrix's chosen cell while the matrix has the keys.
+    pub focused_item: Option<UiId>,
 }
 
 /// The UI ID a fixed text names. The texts are this app's own constants,
@@ -565,6 +600,10 @@ struct Frame<'a> {
     /// panel or a menu lies over the window: the nodes are then hidden
     /// (ui-layer.md, section 5, rule 3).
     covered: bool,
+    /// The text field that has keyboard focus, as the window last said.
+    field: Option<&'a iced::advanced::widget::Id>,
+    /// The node of that field, once it is built.
+    focused: Option<NodeId>,
     table: &'a mut IdTable,
     nodes: &'a mut Vec<(NodeId, Node)>,
 }
@@ -589,6 +628,127 @@ impl Frame<'_> {
         let node_id = node_id(self.table, id);
         self.nodes.push((node_id, node));
         node_id
+    }
+
+    /// A panel's root item and everything in it. The panel cuts off what
+    /// it scrolls out of view, and says so; those parts stay in the tree
+    /// with their real bounds (ui-layer.md, section 7, rule 7). The panel's
+    /// own bounds are the part of it that shows: its content can be taller
+    /// than the area that scrolls it, and a clipping node larger than what
+    /// it shows would claim rows out of view are visible.
+    fn panel(&mut self, item: &items::Item) -> NodeId {
+        let id = self.item(item);
+        let shown = self.places.of(&item.id).and_then(|place| {
+            let clip = place.clip?;
+            Some(place.rect.intersection(clip).unwrap_or(loom_ui_core::Rect::new(
+                loom_ui_core::Point::new(place.rect.x, place.rect.y),
+                loom_ui_core::Size::new(0.0, 0.0),
+            )))
+        });
+        let s = f64::from(self.scale);
+        if let Some((_, node)) = self.nodes.iter_mut().rev().find(|(node, _)| *node == id) {
+            node.set_clips_children();
+            if let Some(r) = shown {
+                node.set_bounds(accesskit::Rect {
+                    x0: f64::from(r.x) * s,
+                    y0: f64::from(r.y) * s,
+                    x1: f64::from(r.x + r.width) * s,
+                    y1: f64::from(r.y + r.height) * s,
+                });
+            }
+        }
+        id
+    }
+
+    /// The node of one item, after the nodes of what it holds. Its role
+    /// comes from its kind, and its actions from what it does now: a part
+    /// that is disabled offers none (rule 22 for Focus).
+    fn item(&mut self, item: &items::Item) -> NodeId {
+        use items::Kind;
+        // Each child's node, and where it was pushed: a child's own node is
+        // the last one its build pushes.
+        let built: Vec<(NodeId, usize)> = item
+            .children
+            .iter()
+            .map(|child| (self.item(child), self.nodes.len() - 1))
+            .collect();
+        let children: Vec<NodeId> = built.iter().map(|(id, _)| *id).collect();
+        let mut node = Node::new(match item.kind {
+            Kind::Group => Role::Group,
+            Kind::Text => Role::Label,
+            Kind::Button => Role::Button,
+            Kind::Check => Role::CheckBox,
+            Kind::Slider => Role::Slider,
+            Kind::Options => Role::RadioGroup,
+            Kind::Option => Role::RadioButton,
+            Kind::Choice => Role::ComboBox,
+            Kind::Field => Role::TextInput,
+            Kind::List => Role::List,
+            Kind::ListItem => Role::ListItem,
+        });
+        // A list says how many rows it has, and each row its place, so a
+        // screen reader can say "3 of 7". AccessKit puts the size on the
+        // list and counts places from zero.
+        if item.kind == Kind::List {
+            let rows: Vec<usize> = item
+                .children
+                .iter()
+                .zip(&built)
+                .filter(|(child, _)| child.kind == Kind::ListItem)
+                .map(|(_, (_, pushed))| *pushed)
+                .collect();
+            node.set_size_of_set(rows.len());
+            for (at, pushed) in rows.into_iter().enumerate() {
+                self.nodes[pushed].1.set_position_in_set(at);
+            }
+        }
+        if let Some(label) = &item.label {
+            node.set_label(label.clone());
+        }
+        if let Some(value) = &item.value {
+            node.set_value(value.clone());
+        }
+        if let Some(description) = &item.description {
+            node.set_description(description.clone());
+        }
+        if let Some(number) = item.number {
+            node.set_numeric_value(number.value);
+            node.set_min_numeric_value(number.min);
+            node.set_max_numeric_value(number.max);
+            if let Some(step) = number.step {
+                node.set_numeric_value_step(step);
+            }
+        }
+        if let Some(on) = item.on {
+            node.set_toggled(if on { Toggled::True } else { Toggled::False });
+        }
+        if item.enabled {
+            if matches!(item.kind, Kind::Button | Kind::Check | Kind::Option) {
+                node.add_action(Action::Click);
+            }
+            if matches!(item.kind, Kind::Slider | Kind::Choice) {
+                node.add_action(Action::Increment);
+                node.add_action(Action::Decrement);
+            }
+            if item.set_number.is_some() || item.set_text.is_some() {
+                node.add_action(Action::SetValue);
+            }
+            if item.focus.is_some() {
+                node.add_action(Action::Focus);
+            }
+        } else {
+            node.set_disabled();
+        }
+        if !children.is_empty() {
+            node.set_children(children);
+        }
+        let id = self.add(&item.id, node);
+        // A covered field is hidden, so it cannot be focused, even while
+        // the window has not yet said its keys have moved.
+        if !self.covered && item.focus.is_some() && item.focus.as_ref() == self.field {
+            self.focused = Some(id);
+        }
+        id
     }
 
     /// The toolbar: a named group with one button per toolbar button. A
