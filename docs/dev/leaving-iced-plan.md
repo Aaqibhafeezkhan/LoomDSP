@@ -136,8 +136,8 @@ The step lands in four parts, the second as two pull requests:
 2. The canvas tree made correct, in two pull requests, because together they pass the size a review can hold:
    - each tile widget's role and real range, the arrow-key step, the undo group of task 4, task 5, and new bounds for every node when the window's scale factor changes;
    - canvas focus, tiles hidden below a panel that owns the input, and live values off screen.
-3. The toolbar, the status and stats bars, the inspector, and the matrix tab.
-4. The module browser and every overlay, and the tests of task 6 that cover every view.
+3. The toolbar, the status and stats bars, the inspector, and the matrix tab, as three pull requests: the bars with the toolbar and the right panel's tabs, where the bounds of toolkit-drawn parts and `locate` by UI ID also land; the inspector; the matrix.
+4. The module browser and every overlay, and the tests of task 6 that cover every view. Until this part lands, a screen reader finds nothing in the window while a panel or a menu is open: what is below is hidden, as a pointer cannot reach it, and the panel itself has no nodes yet. This part closes that gap.
 
 The tasks:
 
@@ -155,7 +155,7 @@ The tasks:
    - actions round-trip through `App::update` as one undo step;
    - the tree changes when the snapshot changes, and only then.
 
-A known cost, measured in slice 2 with `--measure-tree` (release build, macOS): one build of the tree takes about 3 ms on a 300-module patch and 0.3 ms on `subtractive.ron`. A build is the UI snapshot, the widget IDs, the whole tree, and the comparison with what was sent; how the time splits between them is not measured. There is at most one build per turn of the event loop, so a knob drag builds the tree at up to the pointer's rate. Timers and watchers that change nothing the tree reports build nothing, and moving live values build it 4 times a second. The cost begins when an assistive tool first asks for the tree. On macOS it then stays until the app quits, because `accesskit_macos` 0.27.2 never says that the tool left. Making one build cheaper is not part of step 1.4.
+A known cost, measured in slice 2 with `--measure-tree` (release build, macOS): one build of the tree takes about 3 ms on a 300-module patch and 0.3 ms on `subtractive.ron`. A build is the UI snapshot, the widget IDs, the whole tree, and the comparison with what was sent; how the time splits between them is not measured. There is at most one build per turn of the event loop, so a knob drag builds the tree at up to the pointer's rate. Timers and watchers that change nothing the tree reports build nothing, and moving live values build it 4 times a second. Since the stats bar is reported, its load reading is one of those live values: with audio running, a patch with no meter on screen is still built at the live rate. On the 300-module patch that is about 21 builds in 8 seconds, and 73 frames against 35 with no screen reader. The cost begins when an assistive tool first asks for the tree. On macOS it then stays until the app quits, because `accesskit_macos` 0.27.2 never says that the tool left. Making one build cheaper is not part of step 1.4.
 
 ### 1.5 AccessKit's macOS adapter
 
