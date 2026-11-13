@@ -252,12 +252,12 @@ pub fn run() -> iced::Result {
     let start = move || {
         let mut app = App::new(args.clone());
         app.remember_opened_at_start(&args);
-        iced_bridge::Bridge::start(app)
+        iced_bridge::AppBridge::start(app)
     };
-    let result = iced::application(start, iced_bridge::Bridge::update, iced_bridge::Bridge::view)
-        .title(iced_bridge::Bridge::title)
-        .theme(iced_bridge::Bridge::theme)
-        .subscription(iced_bridge::Bridge::subscription)
+    let result = iced::application(start, iced_bridge::AppBridge::update, iced_bridge::AppBridge::view)
+        .title(iced_bridge::AppBridge::title)
+        .theme(iced_bridge::AppBridge::theme)
+        .subscription(iced_bridge::AppBridge::subscription)
         .exit_on_close_request(false)
         .window_size(WINDOW)
         .antialiasing(false)
@@ -747,7 +747,8 @@ struct App {
     /// (`App::effect`). Empty between updates.
     effects: loom_ui::Effects<Message>,
     /// Messages for the next turn, each its own update, in order
-    /// (`App::post`). Sent through the waker at the end of `update`.
+    /// (`App::post`). Returned at the end of `update` as one next-turn
+    /// effect (`Effects::next_turn`).
     posted: Vec<Message>,
     /// What only the window's widgets can answer, for the bridge to ask
     /// after the turn (`window_question.rs`). Interior, so a call that only
@@ -857,6 +858,13 @@ impl App {
     /// asks the window where focus is.
     pub(crate) fn take_focus_question(&self) -> bool {
         self.focus_question.replace(false)
+    }
+
+    /// True while the window waits to be asked where focus is, for a harness
+    /// that runs a turn so the bridge asks.
+    #[cfg(any(test, feature = "test-ui"))]
+    pub(crate) fn focus_question_waits(&self) -> bool {
+        self.focus_question.get()
     }
 
     fn title(&self) -> String {
@@ -1303,7 +1311,8 @@ impl App {
     ///
     /// One message, from the runtime (`iced_bridge.rs`), and its effects
     /// (ui-layer.md, section 2). Messages the app posts for the next turn
-    /// (`App::post`) go through the waker, in order, once it has run.
+    /// (`App::post`) are returned as one next-turn effect, in order, once it
+    /// has run; the runtime queues them itself.
     pub(crate) fn update(&mut self, message: Message, cx: &loom_ui::Context<'_, Message>) -> loom_ui::Effects<Message> {
         // The copy of focus follows the runtime's; `FocusMoved` is how it
         // catches up, so it alone may arrive with the two apart.
@@ -1315,16 +1324,17 @@ impl App {
             "input is routed before update (iced_bridge.rs)"
         );
         self.apply(message);
-        // Together, so no other thread's message lands between a command's
-        // steps and its reply, or a step and its release.
-        if !self.posted.is_empty() {
-            cx.waker().send_all(std::mem::take(&mut self.posted));
-        }
+        // As one batch for the next turn, which the runtime queues itself,
+        // so no other thread's message lands between a command's steps and
+        // its reply, or a step and its release.
+        let posted = std::mem::take(&mut self.posted);
+        self.effect(loom_ui::Effects::next_turn(posted));
         std::mem::take(&mut self.effects)
     }
 
     /// Queues `message` for the next turn, as its own update, after the
-    /// messages posted before it (ui-layer.md, section 2, rule 5). For what
+    /// messages posted before it (ui-layer.md, section 2, rule 5), through
+    /// the next-turn effect `update` returns. For what
     /// the player does through another part: an open menu's Enter, a
     /// screen reader's action, a control command.
     pub(crate) fn post(&mut self, message: Message) {

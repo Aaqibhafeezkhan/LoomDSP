@@ -159,7 +159,7 @@ fn the_list_scrolls_just_enough_and_the_browser_knows_where() {
         }
         let _ = ui.redraw();
         let list = ui.scroll_translation(LIST).expect("the list scrolls").y;
-        let browser = ui.app.overlays.browser().expect("the browser is open");
+        let browser = ui.app().overlays.browser().expect("the browser is open");
         assert!((browser.scroll - list).abs() < 0.5, "{} and {list}", browser.scroll);
         (browser.highlight(), list)
     };
@@ -168,7 +168,7 @@ fn the_list_scrolls_just_enough_and_the_browser_knows_where() {
     assert_eq!(row, ROWS, "the first row past the view");
     assert!((below - ROW_HEIGHT).abs() < 0.5, "its bottom shows: {below}");
     assert_eq!(press(&mut ui, Named::ArrowUp, ROWS), (0, 0.0), "above: back to its top");
-    let rows = ui.app.overlays.browser().unwrap().model().rows.len();
+    let rows = ui.app().overlays.browser().unwrap().model().rows.len();
     let (last, end) = press(&mut ui, Named::PageDown, rows);
     assert_eq!(last, rows - 1, "the last row");
     let most = rows as f32 * ROW_HEIGHT - LIST_HEIGHT;
@@ -195,10 +195,10 @@ fn the_first_row_shows_after_a_short_list_grows_again() {
         let _ = ui.redraw();
     };
     query(&mut ui, "saw");
-    let rows = ui.app.overlays.browser().unwrap().model().rows.len();
+    let rows = ui.app().overlays.browser().unwrap().model().rows.len();
     assert!(rows < ROWS, "a list short enough to fit: {rows} rows");
     query(&mut ui, "");
-    let browser = ui.app.overlays.browser().unwrap();
+    let browser = ui.app().overlays.browser().unwrap();
     assert_eq!(browser.highlight(), 0);
     let first = browser.model().rows[0].id.clone();
     let place = ui.places().of(&first).expect("the window drew the first row");
@@ -209,7 +209,7 @@ fn the_first_row_shows_after_a_short_list_grows_again() {
         place.rect
     );
     let shown = ui.scroll_translation(LIST).unwrap().y;
-    let ours = ui.app.overlays.browser().unwrap().scroll;
+    let ours = ui.app().overlays.browser().unwrap().scroll;
     assert!(
         (shown - ours).abs() < 0.5,
         "the browser's offset {ours} is the list's {shown}"
@@ -226,10 +226,10 @@ fn an_offset_past_a_short_list_is_clamped_to_it() {
     ui.send(crate::Message::OpenBrowser);
     let _ = ui.redraw();
     ui.send(crate::Message::Browser(Message::Query("saw".into())));
-    let rows = ui.app.overlays.browser().unwrap().model().rows.len();
+    let rows = ui.app().overlays.browser().unwrap().model().rows.len();
     assert!(rows < ROWS, "a list short enough to fit: {rows} rows");
     ui.send(crate::Message::Browser(Message::Scrolled(500.0)));
-    assert_eq!(ui.app.overlays.browser().unwrap().scroll, 0.0);
+    assert_eq!(ui.app().overlays.browser().unwrap().scroll, 0.0);
 }
 
 /// `count` library items, named so a search for "zz-lib" finds only them.
@@ -289,7 +289,7 @@ fn offsets_after_regrowing(back_to: usize) -> (f32, f32) {
     library(&mut ui, 12);
     ui.send(crate::Message::Browser(Message::Query("zz-lib".into())));
     let _ = ui.redraw();
-    assert_eq!(ui.app.overlays.browser().unwrap().model().rows.len(), 12);
+    assert_eq!(ui.app().overlays.browser().unwrap().model().rows.len(), 12);
     for _ in 0..11 {
         let _ = ui.tap(Key::Named(Named::ArrowDown), Modifiers::empty());
     }
@@ -299,7 +299,7 @@ fn offsets_after_regrowing(back_to: usize) -> (f32, f32) {
     library(&mut ui, back_to);
     let _ = ui.redraw();
     let shown = ui.scroll_translation(LIST).unwrap().y;
-    (shown, ui.app.overlays.browser().unwrap().scroll)
+    (shown, ui.app().overlays.browser().unwrap().scroll)
 }
 
 /// Grown back to a length the list has not reported before, the list
