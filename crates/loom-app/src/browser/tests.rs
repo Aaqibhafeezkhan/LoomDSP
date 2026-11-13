@@ -141,3 +141,77 @@ fn the_panel_stays_inside_the_canvas() {
     let corner = inside(Point::new(990.0, 730.0), area);
     assert_eq!(corner, Point::new(1000.0 - WIDTH, 740.0 - HEIGHT));
 }
+
+/// The list scrolls by the highlighted row's UI ID, just enough: not at
+/// all while the row is in view, down until its bottom shows, back up to
+/// its top, and to the end for the last row. Each time, the browser's own
+/// offset, which places a row's menu, is the one the list reports: the
+/// list does not tell the browser after the app scrolls it.
+#[test]
+fn the_list_scrolls_just_enough_and_the_browser_knows_where() {
+    use iced::keyboard::{Key, Modifiers, key::Named};
+    let mut ui = crate::ui_test::Ui::open("subtractive.ron");
+    ui.send(crate::Message::OpenBrowser);
+    let _ = ui.redraw();
+    let press = |ui: &mut crate::ui_test::Ui, key: Named, times: usize| {
+        for _ in 0..times {
+            let _ = ui.tap(Key::Named(key), Modifiers::empty());
+        }
+        let _ = ui.redraw();
+        let list = ui.scroll_translation(LIST).expect("the list scrolls").y;
+        let browser = ui.app.overlays.browser().expect("the browser is open");
+        assert!((browser.scroll - list).abs() < 0.5, "{} and {list}", browser.scroll);
+        (browser.highlight(), list)
+    };
+    assert_eq!(press(&mut ui, Named::ArrowDown, 1), (1, 0.0), "in view: no scroll");
+    let (row, below) = press(&mut ui, Named::ArrowDown, ROWS - 1);
+    assert_eq!(row, ROWS, "the first row past the view");
+    assert!((below - ROW_HEIGHT).abs() < 0.5, "its bottom shows: {below}");
+    assert_eq!(press(&mut ui, Named::ArrowUp, ROWS), (0, 0.0), "above: back to its top");
+    let rows = ui.app.overlays.browser().unwrap().model().rows.len();
+    let (last, end) = press(&mut ui, Named::PageDown, rows);
+    assert_eq!(last, rows - 1, "the last row");
+    let most = rows as f32 * ROW_HEIGHT - LIST_HEIGHT;
+    assert!((end - most).abs() < 0.5, "the end of the list: {end}, not {most}");
+}
+
+/// After a scroll down, a search that makes the list short, and the search
+/// cleared again, the first row shows. The toolkit keeps its own offset
+/// while the short list shows it clamped, so the browser always asks the
+/// window to show the row, even when its own offset says it shows.
+#[test]
+fn the_first_row_shows_after_a_short_list_grows_again() {
+    use iced::keyboard::{Key, Modifiers, key::Named};
+    let mut ui = crate::ui_test::Ui::open("subtractive.ron");
+    ui.send(crate::Message::OpenBrowser);
+    let _ = ui.redraw();
+    for _ in 0..ROWS + 4 {
+        let _ = ui.tap(Key::Named(Named::ArrowDown), Modifiers::empty());
+    }
+    let _ = ui.redraw();
+    assert!(ui.scroll_translation(LIST).unwrap().y > 0.0, "the list scrolled down");
+    let query = |ui: &mut crate::ui_test::Ui, text: &str| {
+        ui.send(crate::Message::Browser(Message::Query(text.into())));
+        let _ = ui.redraw();
+    };
+    query(&mut ui, "saw");
+    let rows = ui.app.overlays.browser().unwrap().model().rows.len();
+    assert!(rows < ROWS, "a list short enough to fit: {rows} rows");
+    query(&mut ui, "");
+    let browser = ui.app.overlays.browser().unwrap();
+    assert_eq!(browser.highlight(), 0);
+    let first = browser.model().rows[0].id.clone();
+    let place = ui.places().of(&first).expect("the window drew the first row");
+    let list = place.clip.expect("it is in the list");
+    assert!(
+        place.rect.y >= list.y - 0.5,
+        "the first row shows: {:?} in {list:?}",
+        place.rect
+    );
+    let shown = ui.scroll_translation(LIST).unwrap().y;
+    let ours = ui.app.overlays.browser().unwrap().scroll;
+    assert!(
+        (shown - ours).abs() < 0.5,
+        "the browser's offset {ours} is the list's {shown}"
+    );
+}

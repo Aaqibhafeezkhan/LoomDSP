@@ -264,10 +264,12 @@ impl Ui {
     /// messages effects send back (a dialog's answer, work's results) are
     /// returned, for the caller to apply.
     ///
-    /// Work runs inline, the clipboard is the harness's own, and Quit marks
-    /// it exited. A dialog is answered from the fake dialogs in a unit test;
-    /// in a test under `tests/`, where they are off, it panics, naming it
-    /// (ui-layer.md, section 2, rule 3), as an effect it cannot run does.
+    /// Work runs inline, the clipboard is the harness's own, a scroll runs
+    /// the bridge's scroll on the harness's window, a capture answers that
+    /// there is nothing to draw with, and Quit marks it exited. A dialog is
+    /// answered from the fake dialogs in a unit test; in a test under
+    /// `tests/`, where they are off, it panics, naming it (ui-layer.md,
+    /// section 2, rule 3), as an effect it cannot run does.
     fn turn(&mut self, message: Message, queue: &mut VecDeque<Message>, log: &mut Vec<Message>) -> Vec<Message> {
         let (sender, inbox) = std::sync::mpsc::channel();
         let waker = loom_ui::Waker::new(sender, std::sync::Arc::new(|| {}));
@@ -298,6 +300,16 @@ impl Ui {
                 loom_ui::Effect::Focus { target, select } => {
                     self.run(crate::iced_bridge::focus_moves(&target, select), queue, log);
                     moved_focus = true;
+                }
+                // The bridge's own scroll, run on the harness's window.
+                loom_ui::Effect::ScrollIntoView(id) => {
+                    self.run(crate::iced_bridge::scroll_into_view(&id), queue, log);
+                }
+                // The effects table (ui-layer.md, section 2) says the harness
+                // draws offscreen when a GPU adapter exists. That is not built
+                // yet, so until part (d) it answers NoGpu, GPU or not.
+                loom_ui::Effect::Capture(reply) => {
+                    waker.send(reply.give(Err(loom_ui::effect::NoGpu)));
                 }
                 other => panic!("Ui: the harness cannot run the effect `{}`", other.name()),
             }

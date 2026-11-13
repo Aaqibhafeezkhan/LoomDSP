@@ -302,7 +302,7 @@ impl Bridge {
         let now = Instant::now();
         let next = run(&mut self.runtime, now, &mut driver);
         let mut tasks = driver.tasks;
-        tasks.append(&mut self.runtime.target_mut().tasks);
+        tasks.extend(self.runtime.target_mut().take_tasks());
         tasks.extend(
             self.runtime
                 .app()
@@ -376,8 +376,22 @@ fn wake_stream(source: &WakeSource) -> impl Stream<Item = ()> + use<> {
 #[derive(Default)]
 pub(crate) struct IcedTarget {
     tasks: Vec<Task<Bridged>>,
+    /// This turn's scrolls, one after another. Each finds its part after
+    /// the scroll before it has moved the window, so two scrolls in a turn
+    /// (a matrix card, then its cell) never both work from the old offsets
+    /// and add up; Iced would run batched tasks side by side.
+    scrolls: Option<Task<Bridged>>,
     /// The part with focus, from Iced's last answer.
     focused: Option<UiId>,
+}
+
+impl IcedTarget {
+    /// This turn's tasks for Iced, the scrolls last and in order.
+    fn take_tasks(&mut self) -> Vec<Task<Bridged>> {
+        let mut tasks = std::mem::take(&mut self.tasks);
+        tasks.extend(self.scrolls.take());
+        tasks
+    }
 }
 
 impl loom_ui::Target<Message> for IcedTarget {
@@ -388,9 +402,13 @@ impl loom_ui::Target<Message> for IcedTarget {
         self.tasks.push(focus_task(target, select, Bridged::Focus));
     }
 
-    /// Nothing scrolls by UI ID until plan step 2.1b's focus and scroll
-    /// pull request; until then the views scroll by Iced task.
-    fn scroll_into_view(&mut self, _id: &UiId) {}
+    fn scroll_into_view(&mut self, id: &UiId) {
+        let next = scroll_into_view(id);
+        self.scrolls = Some(match self.scrolls.take() {
+            Some(before) => before.chain(next),
+            None => next,
+        });
+    }
 
     /// Iced keeps focus inside its widgets, so this is its last answer to
     /// the focus question.
@@ -402,6 +420,124 @@ impl loom_ui::Target<Message> for IcedTarget {
     /// 10: the bridge's habit, deleted with it).
     fn needs_redraw(&mut self, updates: usize) -> bool {
         updates > 0
+    }
+}
+
+/// Scrolls the part named `id` into view: the nearest scrolling area
+/// around it moves just enough, on both axes (`Rect::reveal`). A part the
+/// window does not show, or that is in no scrolling area, scrolls nothing.
+///
+/// One Iced action with two walks of the window: [`Reveal`] finds the part
+/// and its area with `places::Collect`, the walk the accessibility tree and
+/// `locate` read, and its `finish` chains [`ScrollBy`], which counts the
+/// scrolling areas to the same one and scrolls it. Iced runs a chained
+/// operation at once, on the same window, before any message or rebuild,
+/// so both walks meet the same areas in the same order and the move is
+/// worked out from the layout it is applied to. Joined by `Task::then`
+/// instead, the second walk would be a new action, and the window could
+/// change between them.
+pub(crate) fn scroll_into_view<T: Send + 'static>(id: &UiId) -> Task<T> {
+    iced::advanced::widget::operate(Reveal {
+        target: id.clone(),
+        parts: crate::places::Collect::default(),
+    })
+    .discard()
+}
+
+/// Finds a part and its nearest scrolling area, then chains the scroll
+/// that brings the part into view.
+struct Reveal {
+    /// The part to show.
+    target: UiId,
+    /// The walk that finds it.
+    parts: crate::places::Collect,
+}
+
+impl Reveal {
+    /// The scroll that shows the part, or `None` when there is nothing to
+    /// move: the window does not show it, it is in no scrolling area, or
+    /// it is in view already.
+    fn scroll(&self) -> Option<ScrollBy> {
+        let place = self.parts.places().of(&self.target)?;
+        let area = place.area?;
+        let by = area.bounds.reveal(place.rect);
+        (by != loom_ui_core::Vector::new(0.0, 0.0)).then_some(ScrollBy {
+            area: area.index,
+            met: 0,
+            by,
+        })
+    }
+}
+
+impl iced::advanced::widget::Operation<()> for Reveal {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>)) {
+        let outside = self.parts.enter();
+        operate(self);
+        self.parts.leave(outside);
+    }
+
+    fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
+        iced::advanced::widget::Operation::<crate::places::Places>::container(&mut self.parts, id, bounds);
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&iced::advanced::widget::Id>,
+        bounds: iced::Rectangle,
+        content_bounds: iced::Rectangle,
+        translation: iced::Vector,
+        state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        iced::advanced::widget::Operation::<crate::places::Places>::scrollable(
+            &mut self.parts,
+            id,
+            bounds,
+            content_bounds,
+            translation,
+            state,
+        );
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        use iced::advanced::widget::operation::Outcome;
+        match self.scroll() {
+            Some(scroll) => Outcome::Chain(Box::new(scroll)),
+            None => Outcome::None,
+        }
+    }
+}
+
+/// Scrolls the scrolling area a walk meets in place `area` by `by`.
+struct ScrollBy {
+    /// Which area, in the order the walk meets them.
+    area: usize,
+    /// How many the walk has met so far.
+    met: usize,
+    /// How far, in logical pixels.
+    by: loom_ui_core::Vector,
+}
+
+impl iced::advanced::widget::Operation<()> for ScrollBy {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>)) {
+        operate(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        bounds: iced::Rectangle,
+        content_bounds: iced::Rectangle,
+        _translation: iced::Vector,
+        state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if self.met == self.area {
+            let by = iced::widget::scrollable::AbsoluteOffset {
+                x: self.by.x,
+                y: self.by.y,
+            };
+            state.scroll_by(by, bounds, content_bounds);
+        }
+        self.met += 1;
     }
 }
 
@@ -440,10 +576,28 @@ impl loom_ui::Driver<Message> for IcedDriver {
         waker.send(reply.give(show_question(&question)));
     }
 
-    /// Nothing captures through the bridge until the control channel's
-    /// screenshot is ported; the answer says there is nothing to draw with.
-    fn capture(&mut self, reply: Reply<Result<Image, NoGpu>, Message>, waker: &Waker<Message>) {
-        waker.send(reply.give(Err(NoGpu)));
+    /// Captures the window as Iced last drew it. With no window open, the
+    /// answer says there is nothing to draw with.
+    fn capture(&mut self, reply: Reply<Result<Image, NoGpu>, Message>, _waker: &Waker<Message>) {
+        let mut reply = Some(reply);
+        self.tasks.push(
+            iced::window::latest()
+                .then(|id| match id {
+                    Some(id) => iced::window::screenshot(id).map(Some),
+                    None => Task::done(None),
+                })
+                .then(move |shot| {
+                    let image = shot
+                        .and_then(|shot| {
+                            Image::new(shot.size.width, shot.size.height, shot.scale_factor, shot.rgba.to_vec())
+                        })
+                        .ok_or(NoGpu);
+                    match reply.take() {
+                        Some(reply) => Task::done(Bridged::App(reply.give(image))),
+                        None => Task::none(),
+                    }
+                }),
+        );
     }
 
     fn work(&mut self, job: Job<Message>, waker: &Waker<Message>) {
