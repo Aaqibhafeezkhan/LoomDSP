@@ -445,17 +445,12 @@ impl Ui {
         messages
     }
 
-    /// Sends one message and applies everything that comes of it, as the
-    /// runtime and the bridge would on the next turns: what the update
-    /// posted and what its effects send back (a dialog's answer, work's
-    /// results), then the answers from widget operations (window questions,
-    /// focus and scroll), then the focus answer, each in turn. Unlike
-    /// [`Ui::deliver`], it returns nothing.
+    /// Sends one message and applies everything that comes of it, in the
+    /// runtime's order: [`Ui::deliver`], through the same queue, with no
+    /// log. A message one reply posts waits behind the replies already
+    /// queued, and an input event is routed first.
     pub(crate) fn send(&mut self, message: Message) {
-        let replies = self.turn(message);
-        for reply in replies {
-            self.send(reply);
-        }
+        let _ = self.deliver(message);
     }
 
     /// Gives keyboard focus to the text field of `part`, as a click on it
