@@ -445,9 +445,12 @@ impl Ui {
         messages
     }
 
-    /// Sends one message and runs its widget operations as the runtime does.
-    /// A dialog's answer and the results of work are applied too, as the
-    /// runtime would on the next turns; messages from tasks are not.
+    /// Sends one message and applies everything that comes of it, as the
+    /// runtime and the bridge would on the next turns: what the update
+    /// posted and what its effects send back (a dialog's answer, work's
+    /// results), then the answers from widget operations (window questions,
+    /// focus and scroll), then the focus answer, each in turn. Unlike
+    /// [`Ui::deliver`], it returns nothing.
     pub(crate) fn send(&mut self, message: Message) {
         let replies = self.turn(message);
         for reply in replies {
