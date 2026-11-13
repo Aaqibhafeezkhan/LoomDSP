@@ -242,15 +242,16 @@ impl Ui {
     /// messages an input message routes to.
     fn drain(&mut self, mut queue: VecDeque<Message>, log: &mut Vec<Message>) {
         while let Some(message) = queue.pop_front() {
-            if let Message::Input {
-                event,
-                status,
-                listening,
-            } = &message
-            {
-                // Logged for the test to read. `update` applies them all, and
-                // only then do their tasks run, as in the app.
-                log.extend(listening.route(event.clone(), *status));
+            // An input event is routed before `update`, as the bridge
+            // routes it: each message it becomes is its own update, and the
+            // test reads them in the log.
+            if matches!(message, Message::Input { .. }) {
+                let routed = crate::input_owner::route(message);
+                log.extend(routed.iter().cloned());
+                for (at, message) in routed.into_iter().enumerate() {
+                    queue.insert(at, message);
+                }
+                continue;
             }
             let replies = self.turn(message, &mut queue, log);
             log.extend(replies.iter().cloned());
@@ -281,8 +282,10 @@ impl Ui {
         }
         let cx = loom_ui::Context::new(Instant::now(), &waker, self.focused.clone(), window);
         let effects = self.app.update(message, &cx);
-        for task in self.app.outbox.take() {
-            self.run(task, queue, log);
+        // What only the widgets know, asked as the bridge asks Iced, in
+        // order, on the view as this update left it.
+        for question in self.app.take_window_questions() {
+            self.run(crate::iced_bridge::question_task(question), queue, log);
         }
         let mut moved_focus = false;
         for effect in effects {
