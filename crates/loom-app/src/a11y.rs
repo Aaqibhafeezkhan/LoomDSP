@@ -676,16 +676,14 @@ impl crate::App {
         }
     }
 
-    /// Applies a screen reader's request that arrived at `at`, and gives
-    /// the tasks its messages made.
+    /// The messages a screen reader's request that arrived at `at` sends,
+    /// for `a11y_act` to post: each is its own update, on the next turn, and
+    /// a step's release follows them ([`Event::Applied`]), so its edit joins
+    /// the open group. It applies none of them itself.
     ///
     /// A SetValue, Increment, or Decrement joins the screen reader's undo
     /// group, or opens one. Any other action that changes something ends
     /// the group first and is a step of its own.
-    ///
-    /// Gives the messages it sends, for `a11y_event` to post: each is its own
-    /// update, on the next turn. A step's release follows them
-    /// ([`Event::Applied`]), so its edit joins the open group.
     pub(crate) fn a11y_action(&mut self, request: &ActionRequest, at: std::time::Instant) -> Vec<crate::Message> {
         use crate::edits::ReaderEvent;
         // A held arrow key owns the edit in progress, and may step again.

@@ -4,6 +4,13 @@
 use super::tree::{WidgetIds, WidgetKey, canvas_id, tile_id, window_id};
 use super::*;
 
+use crate::places::Places;
+use crate::{App, Message};
+use accesskit::{Action, ActionData, Node, NodeId, Role, TreeId};
+use loom_canvas::{Camera, CanvasEvent, CanvasView, ControlPart};
+use loom_core::ModuleNames as _;
+use loom_ui_core::{Point, Rect, Size, UiId};
+
 /// A screen reader's action at `at`, and the turn after it, where its
 /// messages run. True when it sent any.
 fn act(app: &mut App, request: &ActionRequest, at: std::time::Instant) -> bool {
@@ -20,12 +27,6 @@ fn ui_act(ui: &mut crate::ui_test::Ui, request: &ActionRequest, at: std::time::I
     }
     sent
 }
-use crate::places::Places;
-use crate::{App, Message};
-use accesskit::{Action, ActionData, Node, NodeId, Role, TreeId};
-use loom_canvas::{Camera, CanvasEvent, CanvasView, ControlPart};
-use loom_core::ModuleNames as _;
-use loom_ui_core::{Point, Rect, Size, UiId};
 
 /// An app with one filter, its module ID, and the panel index of its Cutoff knob.
 fn app_with_filter() -> (App, u32, usize) {
@@ -4666,5 +4667,44 @@ fn one_change_in_preferences_sends_only_what_changed() {
     assert_eq!(
         sent, expected,
         "the check box, and the status line that says what changed"
+    );
+}
+
+/// The harness answers a window question after what the same update
+/// posted, as the bridge does: Enter on a menu item, with a screen reader
+/// listening, posts the item's message and asks where the parts are; the
+/// item's message runs first, then the tree reads the window.
+#[test]
+fn a_posted_message_runs_before_the_window_answers() {
+    let mut ui = crate::ui_test::Ui::open("subtractive.ron");
+    let area = Rect::new(Point::new(0.0, 0.0), Size::new(800.0, 600.0));
+    ui.send(Message::Canvas(CanvasEvent::TileMenu {
+        module: 4,
+        at: Point::new(100.0, 100.0),
+        area,
+        by_key: true,
+    }));
+    ui.send(Message::A11y(Event::Activated));
+    ui.app.overlays.set_menu_highlight(Some(0));
+    let item = ui.app.menu_model().expect("the tile menu is open").items[0]
+        .message
+        .clone();
+    let log = ui.deliver(Message::Key(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+        physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    let item = format!("{item:?}");
+    let posted = log.iter().position(|message| format!("{message:?}") == item);
+    let located = log
+        .iter()
+        .position(|message| matches!(message, Message::A11y(Event::Located(_))));
+    assert!(
+        matches!((posted, located), (Some(posted), Some(located)) if posted < located),
+        "the item's message, then the answer: {posted:?}, {located:?}"
     );
 }

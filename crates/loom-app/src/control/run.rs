@@ -327,14 +327,13 @@ impl App {
         {
             return (Then::Now(Err(question_open_error(question))), Vec::new());
         }
-        let mut tasks = Vec::new();
+        let mut sent = Vec::new();
         // An answer that reads what the sent messages changed, read once
         // they have run.
         let mut later: Option<Later> = None;
-        let mut send = |_: &mut App, message: Message| tasks.push(message);
         let answer = match call.command.clone() {
             Command::Select { modules, .. } => self.check_modules(&modules).map(|()| {
-                send(self, Message::Canvas(CanvasEvent::Select(modules)));
+                sent.push(Message::Canvas(CanvasEvent::Select(modules)));
                 Map::new()
             }),
             Command::Set {
@@ -344,14 +343,14 @@ impl App {
                 position,
                 ..
             } => self
-                .set_command(module, &param, value, position, &mut send)
+                .set_command(module, &param, value, position, &mut sent)
                 .map(|read| {
                     later = Some(read);
                     Map::new()
                 }),
             Command::Add { kind, at, .. } => self.add_command(&kind, at),
             Command::Remove { modules, .. } => self.check_modules(&modules).map(|()| {
-                send(self, Message::Canvas(CanvasEvent::Delete(modules)));
+                sent.push(Message::Canvas(CanvasEvent::Delete(modules)));
                 Map::new()
             }),
             Command::Connect { from, to, .. } => port(self, &from, true)
@@ -366,24 +365,24 @@ impl App {
                     }) {
                         return Err("Cannot connect to an unknown module".into());
                     }
-                    send(self, Message::Canvas(CanvasEvent::Connect { from, to }));
+                    sent.push(Message::Canvas(CanvasEvent::Connect { from, to }));
                     Ok(Map::new())
                 }),
-            Command::Probe { from, kind, .. } => self.probe_command(&from, &kind, &mut send).map(|read| {
+            Command::Probe { from, kind, .. } => self.probe_command(&from, &kind, &mut sent).map(|read| {
                 later = Some(read);
                 Map::new()
             }),
             Command::Disconnect { to, .. } => port(self, &to, false).map(|to| {
-                send(self, Message::Canvas(CanvasEvent::Disconnect(to)));
+                sent.push(Message::Canvas(CanvasEvent::Disconnect(to)));
                 Map::new()
             }),
             Command::Panic => {
-                send(self, Message::Panic);
+                sent.push(Message::Panic);
                 Ok(Map::new())
             }
             Command::Undo | Command::Redo => {
                 let undo = matches!(call.command, Command::Undo);
-                send(self, if undo { Message::Undo } else { Message::Redo });
+                sent.push(if undo { Message::Undo } else { Message::Redo });
                 later = Some(Box::new(|app: &mut App| {
                     let snapshot = app.ui_snapshot();
                     Ok(fields(json!({ "undo": snapshot.undo, "redo": snapshot.redo })))
@@ -432,8 +431,8 @@ impl App {
                     frames_left: FRAMES_FOR_ENGINE,
                 };
                 return match self.send_midi(MidiEvent::control_change(0, control.channel, control.controller, value)) {
-                    Ok(_) => (Then::AfterDraw(step), tasks),
-                    Err(error) => (Then::Now(Err(error)), tasks),
+                    Ok(_) => (Then::AfterDraw(step), sent),
+                    Err(error) => (Then::Now(Err(error)), sent),
                 };
             }
             Command::Key {
@@ -455,14 +454,14 @@ impl App {
                     }
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::Type { text } => {
                 let then = match type_events(&text) {
                     Ok(_) => Then::AfterDraw(Step::Type(text)),
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::Toolbar { button } => press_message(self, &button).and_then(|message| {
                 // An answer that wrote nothing is an error, because the step
@@ -474,7 +473,7 @@ impl App {
                         return Err(self.alerts.status().to_string());
                     }
                 } else {
-                    send(self, message);
+                    sent.push(message);
                 }
                 Ok(Map::new())
             }),
@@ -559,7 +558,7 @@ impl App {
                 return (self.pointer_command(steps), Vec::new());
             }
             Command::Arm { target } => self.arm_command(&target).map(|message| {
-                send(self, message);
+                sent.push(message);
                 Map::new()
             }),
             Command::MidiOptions {
@@ -572,10 +571,10 @@ impl App {
             } => self
                 .midi_options_command(&target, mode.as_deref(), encoding.as_deref(), (low, high), invert)
                 .map(|message| {
-                    send(self, message);
+                    sent.push(message);
                     Map::new()
                 }),
-            Command::Locate { target } => return (Then::AfterDraw(Step::Locate(target)), tasks),
+            Command::Locate { target } => return (Then::AfterDraw(Step::Locate(target)), sent),
             Command::Screenshot {
                 path,
                 target,
@@ -602,19 +601,19 @@ impl App {
                     Ok(area) => Then::AfterDraw(Step::Screenshot(path, area)),
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::Sample { target, ms } => {
                 let then = match self.sample_command(&target, ms) {
                     Ok(sampling) => Then::AfterDraw(Step::Sample(sampling)),
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::Wait { .. } => Ok(Map::new()),
             Command::Quit => {
                 self.quit = true;
-                return (Then::Now(Ok(Map::new())), tasks);
+                return (Then::Now(Ok(Map::new())), sent);
             }
             Command::Snapshot => {
                 let answer = serde_json::to_value(self.ui_snapshot())
@@ -635,8 +634,8 @@ impl App {
                         return (Then::Now(Err(error)), Vec::new());
                     }
                 };
-                send(self, Message::Preferences(settings::Message::Safety(mode)));
-                return (Then::AfterDraw(Step::Report(Report::Safety)), tasks);
+                sent.push(Message::Preferences(settings::Message::Safety(mode)));
+                return (Then::AfterDraw(Step::Report(Report::Safety)), sent);
             }
             Command::Audio { device, rate, buffer } => {
                 let choice = |value: Option<Value>, what: &str| match value {
@@ -654,7 +653,7 @@ impl App {
                     self.control_audio_change(device.as_deref(), rate, buffer)
                 });
                 if let Ok(change) = &change {
-                    send(self, Message::Preferences(settings::Message::Audio(change.clone())));
+                    sent.push(Message::Preferences(settings::Message::Audio(change.clone())));
                 }
                 if read {
                     self.forget_device_lists();
@@ -663,17 +662,17 @@ impl App {
                     Ok(_) => Then::AfterDraw(Step::Report(Report::Audio)),
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::Midi { input, on } => {
                 let then = match self.control_midi_input(&input) {
                     Ok(name) => {
-                        send(self, Message::Preferences(settings::Message::Midi(name, on)));
+                        sent.push(Message::Preferences(settings::Message::Midi(name, on)));
                         Then::AfterDraw(Step::Report(Report::Midi))
                     }
                     Err(error) => Then::Now(Err(error)),
                 };
-                return (then, tasks);
+                return (then, sent);
             }
             Command::New => {
                 if self.replace(crate::Source::Empty) {
@@ -689,7 +688,7 @@ impl App {
             (Ok(answer), None) => Then::AfterDraw(Step::Answer(Ok(answer))),
             (Err(error), _) => Then::Now(Err(error)),
         };
-        (then, tasks)
+        (then, sent)
     }
 
     /// Queues a pointer command's events, or refuses it.
@@ -781,7 +780,7 @@ impl App {
         param: &str,
         value: Option<f32>,
         position: Option<f32>,
-        send: &mut impl FnMut(&mut App, Message),
+        sent: &mut Vec<Message>,
     ) -> Result<Later, String> {
         let node = self
             .session
@@ -804,8 +803,8 @@ impl App {
             }),
             _ => return Err("give `value` or `position`, not both".to_string()),
         };
-        send(self, message);
-        send(self, Message::SliderReleased);
+        sent.push(message);
+        sent.push(Message::SliderReleased);
         Ok(Box::new(move |app: &mut App| {
             let stored = app
                 .session
@@ -1001,12 +1000,7 @@ impl App {
     }
 
     /// Adds a scope or a meter fed by an output, as the probe menu does.
-    pub(super) fn probe_command(
-        &mut self,
-        from: &str,
-        kind: &str,
-        send: &mut impl FnMut(&mut App, Message),
-    ) -> Result<Later, String> {
+    pub(super) fn probe_command(&mut self, from: &str, kind: &str, sent: &mut Vec<Message>) -> Result<Later, String> {
         let output = port(self, from, true)?;
         let probe = match kind {
             "scope" => crate::probe_menu::Probe::Scope,
@@ -1019,7 +1013,7 @@ impl App {
             .port_position(output)
             .ok_or_else(|| format!("`{from}` is not on the canvas"))?;
         let before: Vec<u32> = self.session.controller.graph().nodes().map(|(id, _)| id.0).collect();
-        send(self, Message::AddProbe { probe, output, world });
+        sent.push(Message::AddProbe { probe, output, world });
         Ok(Box::new(move |app: &mut App| {
             let added = app
                 .session

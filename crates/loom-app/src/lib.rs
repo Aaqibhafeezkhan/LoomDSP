@@ -1680,11 +1680,11 @@ impl App {
         self.session.step_name = None;
     }
 
-    /// The messages that return no task. Called from [`update`](Self::update),
+    /// The messages with no handler of their own. Called from `apply`,
     /// which has done the shared work first.
     fn handle(&mut self, message: Message) {
         match message {
-            // `update` runs these: they return tasks.
+            // `apply` gives these to their own handlers.
             Message::Dialog(_)
             | Message::AskRecovery
             | Message::Browser(_)

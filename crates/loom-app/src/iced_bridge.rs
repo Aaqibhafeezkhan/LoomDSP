@@ -252,10 +252,9 @@ impl Bridge {
             // already waiting (ui-layer.md, section 2, rule 5).
             Bridged::App(message) => {
                 self.quiet.store(true, Ordering::SeqCst);
-                let waker = self.runtime.waker();
-                for message in crate::input_owner::route(message) {
-                    waker.send(message);
-                }
+                // One batch, so no watcher thread's message lands between
+                // the messages of one event.
+                self.runtime.waker().send_all(crate::input_owner::route(message));
                 self.quiet.store(false, Ordering::SeqCst);
                 self.turn(DriverEvent::Woken)
             }
